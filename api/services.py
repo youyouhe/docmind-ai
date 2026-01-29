@@ -1,0 +1,806 @@
+"""
+Business logic layer for PageIndex API.
+
+This module provides:
+- LLM provider abstraction (gemini, deepseek, openrouter)
+- Tree search service using LLM reasoning
+- Document parsing service (PDF and Markdown)
+"""
+
+import asyncio
+import json
+import os
+import tempfile
+import logging
+import random
+import time
+from typing import Optional, List, Dict, Any, Literal
+from pathlib import Path
+
+import aiofiles
+from openai import AsyncOpenAI
+
+# Configure logging
+logger = logging.getLogger("pageindex.api.services")
+
+
+# =============================================================================
+# LLM Provider Factory
+# =============================================================================
+
+class LLMProvider:
+    """
+    Support multiple LLM providers: gemini, deepseek, openrouter.
+
+    All providers use OpenAI-compatible API except Gemini.
+    """
+
+    SUPPORTED_PROVIDERS = ["deepseek", "gemini", "openrouter", "openai", "zhipu"]
+
+    def __init__(self, provider: str, api_key: Optional[str] = None, model: Optional[str] = None):
+        """
+        Initialize LLM provider.
+
+        Args:
+            provider: Provider name (deepseek, gemini, openrouter, openai, zhipu)
+            api_key: API key (if None, reads from environment)
+            model: Model name (if None, uses default for provider)
+        """
+        if provider not in self.SUPPORTED_PROVIDERS:
+            raise ValueError(f"Unsupported provider: {provider}. Use one of: {self.SUPPORTED_PROVIDERS}")
+
+        self.provider = provider
+        self.api_key = api_key or self._get_api_key_from_env(provider)
+        self.model = model or self._get_default_model(provider)
+
+        # Initialize OpenAI client (for compatible APIs)
+        if provider != "gemini":
+            base_url = self._get_base_url(provider)
+            self.client = AsyncOpenAI(
+                api_key=self.api_key,
+                base_url=base_url,
+            )
+
+    def _get_api_key_from_env(self, provider: str) -> str:
+        """Get API key from environment variable."""
+        key_map = {
+            "deepseek": "DEEPSEEK_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "openai": "OPENAI_API_KEY",
+            "zhipu": "ZHIPU_API_KEY",
+        }
+        env_key = key_map.get(provider, f"{provider.upper()}_API_KEY")
+        key = os.getenv(env_key)
+        if not key:
+            raise ValueError(f"API key not found. Set {env_key} environment variable.")
+        return key
+
+    def _get_default_model(self, provider: str) -> str:
+        """Get default model for provider."""
+        model_map = {
+            "deepseek": "deepseek-reasoner",
+            "gemini": "gemini-1.5-flash",
+            "openrouter": "deepseek/deepseek-chat",
+            "openai": "gpt-4o-mini",
+            "zhipu": "glm-4.7",
+        }
+        return model_map.get(provider, "default")
+
+    def _get_base_url(self, provider: str) -> Optional[str]:
+        """Get base URL for OpenAI-compatible APIs."""
+        url_map = {
+            "deepseek": "https://api.deepseek.com/v1",  # Use /v1 for OpenAI compatibility
+            "openrouter": "https://openrouter.ai/api/v1",
+            "zhipu": "https://open.bigmodel.cn/api/coding/paas/v4",
+            "openai": None,  # Default OpenAI URL
+        }
+        return url_map.get(provider)
+
+    async def chat(self, prompt: str, model: Optional[str] = None, max_retries: int = 3) -> str:
+        """
+        Send chat request to LLM with automatic retry on failure.
+
+        Args:
+            prompt: The prompt to send
+            model: Override model name
+            max_retries: Maximum number of retry attempts
+
+        Returns:
+            LLM response text
+
+        Raises:
+            Exception: If all retries are exhausted
+        """
+        model = model or self.model
+        last_error = None
+
+        for attempt in range(max_retries):
+            try:
+                if self.provider == "gemini":
+                    return await self._chat_gemini(prompt, model)
+                else:
+                    return await self._chat_openai_compat(prompt, model)
+
+            except Exception as e:
+                last_error = e
+                # Don't retry on certain errors
+                error_msg = str(e).lower()
+                if any(x in error_msg for x in [
+                    "authentication", "unauthorized", "invalid_api_key",
+                    "permission", "quota", "limit", "401", "403", "429"
+                ]):
+                    logger.error(f"Non-retryable error in LLM chat: {e}")
+                    raise
+
+                if attempt < max_retries - 1:
+                    # Exponential backoff: 1s, 2s, 4s...
+                    wait_time = (2 ** attempt) + random.uniform(0, 0.5)
+                    logger.warning(f"LLM chat failed (attempt {attempt + 1}/{max_retries}), "
+                                    f"retrying in {wait_time:.1f}s. Error: {e}")
+                    await asyncio.sleep(wait_time)
+                else:
+                    logger.error(f"LLM chat failed after {max_retries} attempts. Last error: {e}")
+
+        # All retries exhausted
+        raise Exception(f"LLM chat failed after {max_retries} attempts. Last error: {last_error}")
+
+    async def _chat_openai_compat(self, prompt: str, model: str) -> str:
+        """Chat using OpenAI-compatible API."""
+        response = await self.client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+        )
+        return response.choices[0].message.content
+
+    async def _chat_gemini(self, prompt: str, model: str) -> str:
+        """Chat using Google Gemini API."""
+        try:
+            import google.generativeai as genai
+        except ImportError:
+            raise ImportError("Install google-generativeai: pip install google-generativeai")
+
+        genai.configure(api_key=self.api_key)
+        client = genai.GenerativeModel(model)
+
+        # Run in executor to avoid blocking
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.generate_content(prompt)
+        )
+        return response.text
+
+
+# =============================================================================
+# Tree Search Service
+# =============================================================================
+
+class TreeSearchService:
+    """
+    Tree search using LLM reasoning.
+    Finds relevant nodes in a document tree based on user questions.
+    """
+
+    def __init__(self, llm_provider: LLMProvider):
+        """
+        Initialize tree search service.
+
+        Args:
+            llm_provider: Configured LLM provider
+        """
+        self.llm = llm_provider
+
+    def _flatten_tree_for_search(self, tree: dict) -> List[dict]:
+        """
+        Flatten tree structure for LLM search.
+        Only includes id, title, and summary for brevity.
+        """
+        result = []
+
+        def traverse(node: dict, level: int = 0):
+            node_info = {
+                "id": node.get("id", ""),
+                "title": node.get("title", ""),
+                "level": level
+            }
+            # Include summary if available
+            if summary := node.get("summary"):
+                node_info["summary"] = summary
+
+            result.append(node_info)
+
+            # Recursively process children
+            for child in node.get("children", []):
+                traverse(child, level + 1)
+
+        traverse(tree)
+        return result
+
+    async def search_nodes(
+        self,
+        question: str,
+        tree: dict,
+        max_nodes: int = 5
+    ) -> Dict[str, Any]:
+        """
+        Search for relevant nodes based on question.
+
+        Args:
+            question: User's question
+            tree: Document tree structure
+            max_nodes: Maximum number of nodes to return
+
+        Returns:
+            Dictionary with thinking, node_ids, and path information
+        """
+        # Flatten tree for search
+        flat_tree = self._flatten_tree_for_search(tree)
+
+        # Build LLM prompt
+        prompt = f"""You are a document search assistant. Your task is to find the most relevant sections in a document tree based on a user's question.
+
+User Question: {question}
+
+Document Tree Structure:
+{json.dumps(flat_tree, ensure_ascii=False, indent=2)}
+
+Instructions:
+1. Analyze the question and understand what information is being sought
+2. Examine the document tree structure (titles and summaries)
+3. Select the most relevant node IDs (maximum {max_nodes})
+4. Return your reasoning and the selected node IDs
+
+Response Format (JSON):
+{{
+    "thinking": "Your thought process explaining why you selected these nodes",
+    "node_ids": ["id1", "id2", ...]
+}}
+
+Respond only with valid JSON, no additional text."""
+
+        # Call LLM
+        response = await self.llm.chat(prompt)
+
+        # Parse response
+        return self._parse_search_response(response, tree)
+
+    def _parse_search_response(self, response: str, tree: dict) -> Dict[str, Any]:
+        """
+        Parse LLM search response and extract node paths.
+
+        Args:
+            response: LLM JSON response
+            tree: Original tree for path extraction
+
+        Returns:
+            Parsed search results with paths
+        """
+        try:
+            # Extract JSON from response (handle markdown code blocks)
+            response = response.strip()
+            if response.startswith("```"):
+                response = response.split("```")[1]
+                if response.startswith("json"):
+                    response = response[4:]
+
+            data = json.loads(response.strip())
+            node_ids = data.get("node_ids", [])
+            thinking = data.get("thinking", "")
+
+            # Build path information
+            paths = []
+            for node_id in node_ids:
+                path = self._find_path_to_node(tree, node_id)
+                if path:
+                    paths.append(path)
+
+            return {
+                "thinking": thinking,
+                "node_ids": node_ids,
+                "paths": paths
+            }
+
+        except json.JSONDecodeError as e:
+            return {
+                "thinking": f"Failed to parse LLM response: {e}",
+                "node_ids": [],
+                "paths": [],
+                "error": str(e)
+            }
+
+    def _find_path_to_node(self, tree: dict, target_id: str, current_path: Optional[List[str]] = None) -> Optional[List[str]]:
+        """
+        Find path to a node by ID.
+
+        Args:
+            tree: Tree structure
+            target_id: Target node ID
+            current_path: Current path during recursion
+
+        Returns:
+            List of node IDs from root to target, or None if not found
+        """
+        if current_path is None:
+            current_path = []
+
+        node_id = tree.get("id", "")
+
+        # Check if this is the target
+        if node_id == target_id:
+            return current_path + [node_id]
+
+        # Search in children
+        for child in tree.get("children", []):
+            result = self._find_path_to_node(child, target_id, current_path + [node_id])
+            if result:
+                return result
+
+        return None
+
+
+# =============================================================================
+# Document Parse Service
+# =============================================================================
+
+class ParseService:
+    """
+    Document parsing service for PDF and Markdown files.
+    """
+
+    # Class variable to store performance data from last PDF parse
+    _last_pdf_performance = {}
+
+    @staticmethod
+    def get_last_pdf_performance() -> dict:
+        """Get performance data from the last PDF parse."""
+        return ParseService._last_pdf_performance.copy()
+
+    @staticmethod
+    def clear_last_pdf_performance() -> None:
+        """Clear stored PDF performance data."""
+        ParseService._last_pdf_performance = {}
+
+    @staticmethod
+    def _calculate_level(tree: dict, current_level: int = 0) -> int:
+        """Calculate maximum depth of tree."""
+        max_depth = current_level
+        for child in tree.get("children", []):
+            child_depth = ParseService._calculate_level(child, current_level + 1)
+            max_depth = max(max_depth, child_depth)
+        return max_depth
+
+    @staticmethod
+    def _count_total_characters(tree: dict) -> int:
+        """Count total characters in tree content."""
+        count = 0
+        if content := tree.get("content"):
+            count += len(content)
+        for child in tree.get("children", []):
+            count += ParseService._count_total_characters(child)
+        return count
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimation (approximately 4 chars per token)."""
+        return len(text) // 4
+
+    @staticmethod
+    def _check_has_summaries(tree: dict) -> bool:
+        """Check if any node has a summary."""
+        if tree.get("summary"):
+            return True
+        for child in tree.get("children", []):
+            if ParseService._check_has_summaries(child):
+                return True
+        return False
+
+    @staticmethod
+    def _check_has_content(tree: dict) -> bool:
+        """Check if any node has content."""
+        if tree.get("content"):
+            return True
+        for child in tree.get("children", []):
+            if ParseService._check_has_content(child):
+                return True
+        return False
+
+    @staticmethod
+    def _count_nodes(tree: dict) -> int:
+        """Count total nodes in tree."""
+        count = 1
+        for child in tree.get("children", []):
+            count += ParseService._count_nodes(child)
+        return count
+
+    @staticmethod
+    def convert_page_index_to_api_format(page_index_tree: dict) -> dict:
+        """
+        Convert PageIndex internal format to API format.
+
+        PageIndex format -> API format:
+        - title -> title
+        - node_id -> id
+        - text -> content
+        - summary -> summary
+        - nodes -> children
+        - (derived) -> level (based on nesting)
+        - start_index -> page_start (PDF only)
+        - end_index -> page_end (PDF only)
+        - line_num -> line_start (Markdown only)
+        """
+        def convert_node(node: dict, level: int = 0) -> dict:
+            api_node = {
+                "id": node.get("node_id", ""),
+                "title": node.get("title", ""),
+                "level": level,
+                "children": []
+            }
+
+            # Optional fields
+            if "text" in node:
+                api_node["content"] = node["text"]
+            if "summary" in node:
+                api_node["summary"] = node["summary"]
+
+            # PDF-specific fields
+            if "start_index" in node:
+                api_node["page_start"] = node["start_index"] + 1  # Convert to 1-based
+            if "end_index" in node:
+                api_node["page_end"] = node["end_index"] + 1  # Convert to 1-based
+
+            # Markdown-specific fields
+            if "line_num" in node:
+                api_node["line_start"] = node["line_num"]
+
+            # Recursively convert children
+            for child in node.get("nodes", []):
+                api_node["children"].append(convert_node(child, level + 1))
+
+            return api_node
+
+        # PageIndex output wraps in "structure" array
+        # For documents with TOC, there may be multiple root-level sections
+        # We'll create a virtual root node
+        structure = page_index_tree.get("structure", [])
+
+        if len(structure) == 0:
+            # Empty document
+            return {
+                "id": "root",
+                "title": page_index_tree.get("doc_name", "Document"),
+                "level": 0,
+                "children": []
+            }
+
+        if len(structure) == 1:
+            # Single root section - convert it directly
+            return convert_node(structure[0], 0)
+        else:
+            # Multiple root sections - create virtual root
+            return {
+                "id": "root",
+                "title": page_index_tree.get("doc_name", "Document"),
+                "level": 0,
+                "children": [convert_node(s, 1) for s in structure]
+            }
+
+    @staticmethod
+    def calculate_tree_stats(tree: dict) -> dict:
+        """
+        Calculate statistics for a tree.
+
+        Returns:
+            Dictionary with tree statistics
+        """
+        total_nodes = ParseService._count_nodes(tree)
+        max_depth = ParseService._calculate_level(tree)
+        total_characters = ParseService._count_total_characters(tree)
+        total_tokens = ParseService._estimate_tokens(str(tree))
+        has_summaries = ParseService._check_has_summaries(tree)
+        has_content = ParseService._check_has_content(tree)
+
+        return {
+            "total_nodes": total_nodes,
+            "max_depth": max_depth,
+            "total_characters": total_characters,
+            "total_tokens": total_tokens,
+            "has_summaries": has_summaries,
+            "has_content": has_content
+        }
+
+    @staticmethod
+    async def parse_markdown(
+        file_path: str,
+        model: Optional[str] = None,
+        if_add_node_summary: bool = True,
+        if_add_node_text: bool = True,
+        llm_provider: Optional["LLMProvider"] = None,
+        max_concurrent: int = 10
+    ) -> dict:
+        """
+        Parse Markdown file to tree structure.
+
+        Args:
+            file_path: Path to Markdown file
+            model: LLM model to use (default: uses llm_provider.model if not specified)
+            if_add_node_summary: Whether to add node summaries
+            if_add_node_text: Whether to add full text content
+            llm_provider: LLM provider instance for API calls
+            max_concurrent: Maximum concurrent LLM calls for summary generation
+
+        Returns:
+            PageIndex format tree structure
+        """
+        from pageindex.page_index_md import md_to_tree
+
+        # Use provider's configured model if not specified
+        if model is None and llm_provider is not None:
+            model = llm_provider.model
+
+        result = await md_to_tree(
+            md_path=file_path,
+            model=model,
+            if_add_node_summary="yes" if if_add_node_summary else "no",
+            if_add_node_text="yes" if if_add_node_text else "no",
+            llm_provider=llm_provider,
+            max_concurrent=max_concurrent
+        )
+
+        return result
+
+    @staticmethod
+    async def parse_pdf(
+        file_path: str,
+        model: Optional[str] = None,
+        toc_check_pages: int = 20,
+        max_pages_per_node: int = 10,
+        max_tokens_per_node: int = 20000,
+        if_add_node_summary: bool = True,
+        if_add_node_id: bool = True,
+        if_add_node_text: bool = False,
+        llm_provider: Optional["LLMProvider"] = None
+    ) -> dict:
+        """
+        Parse PDF file to tree structure.
+
+        Args:
+            file_path: Path to PDF file
+            model: LLM model to use (default: uses llm_provider.model if not specified)
+            toc_check_pages: Number of pages to check for TOC
+            max_pages_per_node: Maximum pages per node
+            max_tokens_per_node: Maximum tokens per node
+            if_add_node_summary: Whether to add node summaries
+            if_add_node_id: Whether to add node IDs
+            if_add_node_text: Whether to add full text content
+            llm_provider: LLM provider instance (for future use with PDF parsing)
+
+        Returns:
+            PageIndex format tree structure
+        """
+        from pageindex import page_index_main
+        from pageindex.utils import ConfigLoader
+
+        # Use provider's configured model if not specified
+        if model is None and llm_provider is not None:
+            model = llm_provider.model
+
+        # Build options dict
+        user_opt = {
+            "model": model,
+            "toc_check_page_num": toc_check_pages,
+            "max_page_num_each_node": max_pages_per_node,
+            "max_token_num_each_node": max_tokens_per_node,
+            "if_add_node_id": "yes" if if_add_node_id else "no",
+            "if_add_node_summary": "yes" if if_add_node_summary else "no",
+            "if_add_node_text": "yes" if if_add_node_text else "no",
+            "if_add_doc_description": "no"
+        }
+
+        # Load config using ConfigLoader
+        opt = ConfigLoader().load(user_opt)
+
+        # Run the synchronous page_index_main in a thread to avoid event loop conflicts
+        # page_index_main uses asyncio.run() internally which conflicts with FastAPI
+        import asyncio
+        loop = asyncio.get_event_loop()
+        parsed_data = await loop.run_in_executor(None, lambda: page_index_main(file_path, opt=opt))
+
+        # Extract result and performance data
+        # page_index_main now returns {"result": ..., "performance": ...}
+        if isinstance(parsed_data, dict) and "result" in parsed_data:
+            result = parsed_data["result"]
+            # Store performance data for later retrieval
+            ParseService._last_pdf_performance = parsed_data.get("performance", {})
+        else:
+            # Backward compatibility for old return format
+            result = parsed_data
+            ParseService._last_pdf_performance = {}
+
+        return result
+
+
+# =============================================================================
+# Chat Service
+# =============================================================================
+
+class ChatService:
+    """
+    Chat/Q&A service using tree search and LLM generation.
+    """
+
+    def __init__(self, llm_provider: LLMProvider):
+        """
+        Initialize chat service.
+
+        Args:
+            llm_provider: Configured LLM provider
+        """
+        self.llm = llm_provider
+        self.search_service = TreeSearchService(llm_provider)
+
+    def _get_node_by_id(self, tree: dict, node_id: str) -> Optional[dict]:
+        """Find a node by its ID."""
+        if tree.get("id") == node_id:
+            return tree
+        for child in tree.get("children", []):
+            result = self._get_node_by_id(child, node_id)
+            if result:
+                return result
+        return None
+
+    def _build_context_from_nodes(self, tree: dict, node_ids: List[str]) -> str:
+        """Build context string from relevant nodes."""
+        context_parts = []
+
+        for node_id in node_ids:
+            node = self._get_node_by_id(tree, node_id)
+            if node:
+                title = node.get("title", "")
+                content = node.get("content") or node.get("summary", "")
+                context_parts.append(f"# {title}\n\n{content}")
+
+        return "\n\n---\n\n".join(context_parts)
+
+    async def answer_question(
+        self,
+        question: str,
+        tree: dict,
+        history: Optional[List[dict]] = None,
+        max_source_nodes: int = 3
+    ) -> dict:
+        """
+        Answer a question based on document tree.
+
+        Args:
+            question: User's question
+            tree: Document tree structure
+            history: Conversation history (list of {role, content} dicts)
+            max_source_nodes: Maximum number of source nodes to use
+
+        Returns:
+            Dictionary with answer, sources, and debug info
+        """
+        history = history or []
+
+        # Search for relevant nodes
+        search_result = await self.search_service.search_nodes(
+            question=question,
+            tree=tree,
+            max_nodes=max_source_nodes
+        )
+
+        node_ids = search_result.get("node_ids", [])
+
+        # Build context from relevant nodes
+        context = self._build_context_from_nodes(tree, node_ids)
+
+        # Build conversation history text
+        history_text = self._build_history_text(history)
+
+        # Generate answer with history awareness
+        prompt = self._build_chat_prompt(question, context, history_text)
+
+        answer = await self.llm.chat(prompt)
+
+        # Build source nodes with relevance info
+        sources = []
+        for node_id in node_ids:
+            node = self._get_node_by_id(tree, node_id)
+            if node:
+                sources.append({
+                    "id": node_id,
+                    "title": node.get("title", ""),
+                    "relevance": 0.8  # Default relevance (could be refined)
+                })
+
+        # Build debug path
+        debug_path = []
+        for path in search_result.get("paths", []):
+            debug_path.extend(path)
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "debug_path": debug_path,
+            "provider": self.llm.provider,
+            "model": self.llm.model
+        }
+
+    def _build_history_text(self, history: List[dict]) -> str:
+        """
+        Build conversation history text for the prompt.
+
+        Args:
+            history: List of {role, content} dicts
+
+        Returns:
+            Formatted history text
+        """
+        if not history:
+            return ""
+
+        history_lines = []
+        for msg in history:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "user":
+                history_lines.append(f"User: {content}")
+            elif role == "assistant":
+                history_lines.append(f"Assistant: {content}")
+
+        return "\n".join(history_lines)
+
+    def _build_chat_prompt(self, question: str, context: str, history_text: str) -> str:
+        """
+        Build the chat prompt with history and context.
+
+        Args:
+            question: Current user question
+            context: Document context
+            history_text: Formatted conversation history
+
+        Returns:
+            Complete prompt for the LLM
+        """
+        if history_text:
+            prompt = f"""You are a helpful assistant that answers questions based on the provided document content. The user may ask follow-up questions that reference previous parts of the conversation.
+
+Conversation History:
+{history_text}
+
+Current User Question: {question}
+
+Relevant Document Content:
+{context}
+
+Instructions:
+1. Answer the question using ONLY the provided document content
+2. Consider the conversation history for context and pronoun references
+3. If the answer cannot be found in the content, say so clearly
+4. Be concise but thorough
+5. Reference specific sections when relevant
+6. For follow-up questions, maintain continuity with previous answers
+
+Answer:"""
+        else:
+            prompt = f"""You are a helpful assistant that answers questions based on the provided document content.
+
+User Question: {question}
+
+Relevant Document Content:
+{context}
+
+Instructions:
+1. Answer the question using ONLY the provided document content
+2. If the answer cannot be found in the content, say so clearly
+3. Be concise but thorough
+4. Reference specific sections when relevant
+
+Answer:"""
+
+        return prompt

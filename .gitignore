@@ -1,15 +1,48 @@
-.ipynb_checkpoints
-__pycache__
-files
-index
-temp/*
-chroma-collections.parquet
-chroma-embeddings.parquet
+# Data and results
+data/
+results/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+.venv
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
 .DS_Store
-.env*
-notebook
-SDK/*
-log/*
-logs/
-parts/*
-json_results/*
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Logs
+*.log

@@ -7,25 +7,61 @@ try:
 except:
     from utils import *
 
-async def get_node_summary(node, summary_token_threshold=200, model=None):
+
+async def get_node_summary(node, summary_token_threshold=200, model=None, llm_provider=None):
+    """Get summary for a node. If llm_provider is provided, use it; otherwise fall back to model param."""
     node_text = node.get('text')
     num_tokens = count_tokens(node_text, model=model)
-    if num_tokens < summary_token_threshold:
+    # Use default threshold if None is provided
+    threshold = summary_token_threshold if summary_token_threshold is not None else 200
+    if num_tokens < threshold:
         return node_text
     else:
-        return await generate_node_summary(node, model=model)
+        return await generate_node_summary(node, model=model, llm_provider=llm_provider)
 
 
-async def generate_summaries_for_structure_md(structure, summary_token_threshold, model=None):
+async def generate_summaries_for_structure_md(structure, summary_token_threshold, model=None, llm_provider=None, max_concurrent=10):
+    """
+    Generate summaries for all nodes in structure with concurrency control.
+
+    Args:
+        structure: The tree structure to generate summaries for
+        summary_token_threshold: Minimum token count to trigger summary generation
+        model: LLM model to use
+        llm_provider: Optional LLM provider instance
+        max_concurrent: Maximum concurrent LLM calls (default: 10)
+    """
     nodes = structure_to_list(structure)
-    tasks = [get_node_summary(node, summary_token_threshold=summary_token_threshold, model=model) for node in nodes]
+    total_nodes = len(nodes)
+
+    print(f"[DEBUG] MD: Generating summaries for {total_nodes} nodes with max_concurrent={max_concurrent}")
+
+    if total_nodes == 0:
+        return structure
+
+    # Create semaphore to limit concurrent LLM calls
+    semaphore = asyncio.Semaphore(max_concurrent)
+
+    async def process_with_limit(node):
+        async with semaphore:
+            return await get_node_summary(
+                node,
+                summary_token_threshold=summary_token_threshold,
+                model=model,
+                llm_provider=llm_provider
+            )
+
+    # Process all nodes with concurrency limit
+    tasks = [process_with_limit(node) for node in nodes]
     summaries = await asyncio.gather(*tasks)
-    
+
     for node, summary in zip(nodes, summaries):
         if not node.get('nodes'):
             node['summary'] = summary
         else:
             node['prefix_summary'] = summary
+
+    print(f"[DEBUG] MD: Summary generation completed for {total_nodes} nodes")
     return structure
 
 
@@ -155,10 +191,11 @@ def tree_thinning_for_index(node_list, min_node_token=None, model=None):
             
         current_node = result_list[i]
         current_level = current_node['level']
-        
+
         total_tokens = current_node.get('text_token_count', 0)
-        
-        if total_tokens < min_node_token:
+
+        # Only merge if min_node_token is specified and threshold is met
+        if min_node_token is not None and total_tokens < min_node_token:
             children_indices = find_all_children(i, current_level, result_list)
             
             children_texts = []
@@ -240,7 +277,23 @@ def clean_tree_for_output(tree_nodes):
     return cleaned_nodes
 
 
-async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_add_node_summary='no', summary_token_threshold=None, model=None, if_add_doc_description='no', if_add_node_text='no', if_add_node_id='yes'):
+async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_add_node_summary='no', summary_token_threshold=None, model=None, if_add_doc_description='no', if_add_node_text='no', if_add_node_id='yes', llm_provider=None, max_concurrent=10):
+    """
+    Parse Markdown file to tree structure with concurrency control.
+
+    Args:
+        md_path: Path to Markdown file
+        if_thinning: Enable tree thinning to remove small nodes
+        min_token_threshold: Minimum token threshold for thinning
+        if_add_node_summary: Add node summaries
+        summary_token_threshold: Token threshold for summary generation
+        model: LLM model to use
+        if_add_doc_description: Add document description
+        if_add_node_text: Include full text content
+        if_add_node_id: Add node IDs
+        llm_provider: LLM provider instance
+        max_concurrent: Max concurrent LLM calls for summary generation (default: 10)
+    """
     with open(md_path, 'r', encoding='utf-8') as f:
         markdown_content = f.read()
     
@@ -268,7 +321,13 @@ async def md_to_tree(md_path, if_thinning=False, min_token_threshold=None, if_ad
         tree_structure = format_structure(tree_structure, order = ['title', 'node_id', 'summary', 'prefix_summary', 'text', 'line_num', 'nodes'])
         
         print(f"Generating summaries for each node...")
-        tree_structure = await generate_summaries_for_structure_md(tree_structure, summary_token_threshold=summary_token_threshold, model=model)
+        tree_structure = await generate_summaries_for_structure_md(
+            tree_structure,
+            summary_token_threshold=summary_token_threshold,
+            model=model,
+            llm_provider=llm_provider,
+            max_concurrent=max_concurrent
+        )
         
         if if_add_node_text == 'no':
             # Remove text after summary generation if not requested
