@@ -2,9 +2,11 @@ import tiktoken
 import openai
 import logging
 import os
+import random
 from datetime import datetime
 import time
 import json
+from typing import Optional, List
 import PyPDF2
 import copy
 import asyncio
@@ -17,96 +19,307 @@ import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
 
-CHATGPT_API_KEY = os.getenv("CHATGPT_API_KEY")
+# Unified LLM configuration (same as API service)
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
+
+# Provider configuration (matches api/services.py)
+PROVIDER_CONFIG = {
+    "deepseek": {
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "base_url": "https://api.deepseek.com",
+        "default_model": "deepseek-chat",
+        "max_tokens": 8192  # DeepSeek limit
+    },
+    "openai": {
+        "api_key_env": "OPENAI_API_KEY",
+        "base_url": None,  # Use default OpenAI URL
+        "default_model": "gpt-4o-mini",
+        "max_tokens": 16384  # Safe limit for most OpenAI models
+    },
+    "gemini": {
+        "api_key_env": "GEMINI_API_KEY",
+        "base_url": None,  # Gemini uses different API
+        "default_model": "gemini-1.5-flash",
+        "max_tokens": 8192  # Gemini flash limit
+    },
+    "openrouter": {
+        "api_key_env": "OPENROUTER_API_KEY",
+        "base_url": "https://openrouter.ai/api/v1",
+        "default_model": "deepseek/deepseek-chat",
+        "max_tokens": 8192  # Conservative limit, varies by model
+    },
+    "zhipu": {
+        "api_key_env": "ZHIPU_API_KEY",
+        "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+        "default_model": "glm-4.7",
+        "max_tokens": 8192  # Zhipu limit
+    }
+}
+
+def get_llm_config():
+    """Get LLM config based on LLM_PROVIDER environment variable."""
+    provider = LLM_PROVIDER
+    if provider not in PROVIDER_CONFIG:
+        raise ValueError(f"Unsupported provider: {provider}. Use one of: {list(PROVIDER_CONFIG.keys())}")
+
+    config = PROVIDER_CONFIG[provider]
+    api_key = os.getenv(config["api_key_env"])
+    if not api_key:
+        raise ValueError(f"API key not found. Set {config['api_key_env']} environment variable.")
+
+    return {
+        "api_key": api_key,
+        "base_url": config["base_url"],
+        "model": config["default_model"],
+        "max_tokens": config.get("max_tokens", 8192)  # Default to 8192 if not specified
+   }
+
+# Get LLM config at module load time
+_llm_config = get_llm_config()
+CHATGPT_API_KEY = _llm_config["api_key"]
+OPENAI_BASE_URL = _llm_config["base_url"]
+MAX_TOKENS = _llm_config["max_tokens"]
 
 def count_tokens(text, model=None):
     if not text:
         return 0
-    enc = tiktoken.encoding_for_model(model)
+    try:
+        enc = tiktoken.encoding_for_model(model)
+    except KeyError:
+        # For DeepSeek and other OpenAI-compatible models, use cl100k_base encoding
+        enc = tiktoken.get_encoding("cl100k_base")
     tokens = enc.encode(text)
     return len(tokens)
 
-def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None, base_url=OPENAI_BASE_URL):
+    """
+    Send chat request to OpenAI-compatible API with retry and exponential backoff.
+    Returns (response_content, finish_reason).
+    """
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    # Import monitor lazily to avoid circular imports
+    try:
+        from .performance_monitor import get_monitor
+        monitor = get_monitor()
+        stage = monitor._current_stage or "unknown"
+    except Exception:
+        stage = "unknown"
+
     for i in range(max_retries):
+        start_time = time.time()
         try:
             if chat_history:
                 messages = chat_history
                 messages.append({"role": "user", "content": prompt})
             else:
                 messages = [{"role": "user", "content": prompt}]
-            
+
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0,
+                max_tokens=MAX_TOKENS,
             )
+
+            # Track LLM call with performance monitoring
+            try:
+                input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
+                output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
+                duration = time.time() - start_time
+
+                # Debug: Log token usage
+                print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
+
+                monitor = get_monitor()
+                monitor.track_llm_call(
+                    stage=stage,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    success=(i == 0),
+                    retry=(i > 0)
+                )
+            except Exception:
+                pass  # Silently fail if monitor not available
+
             if response.choices[0].finish_reason == "length":
                 return response.choices[0].message.content, "max_output_reached"
             else:
                 return response.choices[0].message.content, "finished"
 
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            error_msg = str(e).lower()
+
+            # Don't retry on certain errors
+            if any(x in error_msg for x in [
+                "authentication", "unauthorized", "invalid_api_key",
+                "permission", "quota", "insufficient_quota", "401", "403", "429"
+            ]):
+                logging.error(f"Non-retryable error in ChatGPT_API_with_finish_reason: {e}")
+                return "Error", "error"
+
+            # Log retry attempt
             if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
+                # Exponential backoff: 1s, 2s, 4s, 8s...
+                wait_time = min(2 ** i, 8) + random.uniform(0, 0.5)
+                logging.warning(f"ChatGPT_API_with_finish_reason failed (attempt {i + 1}/{max_retries}), "
+                                f"retrying in {wait_time:.1f}s. Error: {e}")
+                time.sleep(wait_time)
             else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"
+                logging.error(f"ChatGPT_API_with_finish_reason failed after {max_retries} attempts. Error: {e}")
+                return "Error", "error"
 
 
 
-def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None):
+def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None, base_url=OPENAI_BASE_URL):
+    """
+    Send chat request to OpenAI-compatible API with retry and exponential backoff.
+    """
     max_retries = 10
-    client = openai.OpenAI(api_key=api_key)
+    client = openai.OpenAI(api_key=api_key, base_url=base_url)
+
+    # Import monitor lazily to avoid circular imports
+    try:
+        from .performance_monitor import get_monitor
+        monitor = get_monitor()
+        stage = monitor._current_stage or "unknown"
+    except Exception:
+        stage = "unknown"
+
     for i in range(max_retries):
+        start_time = time.time()
         try:
             if chat_history:
                 messages = chat_history
                 messages.append({"role": "user", "content": prompt})
             else:
                 messages = [{"role": "user", "content": prompt}]
-            
+
             response = client.chat.completions.create(
                 model=model,
                 messages=messages,
                 temperature=0,
+                max_tokens=MAX_TOKENS,
             )
-   
+
+            # Track LLM call with performance monitoring
+            try:
+                input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
+                output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
+                duration = time.time() - start_time
+
+                # Debug: Log token usage
+                print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
+
+                monitor = get_monitor()
+                monitor.track_llm_call(
+                    stage=stage,
+                    model=model,
+                    input_tokens=input_tokens,
+                    output_tokens=output_tokens,
+                    success=(i == 0),
+                    retry=(i > 0)
+                )
+            except Exception:
+                pass  # Silently fail if monitor not available
+
             return response.choices[0].message.content
+
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            error_msg = str(e).lower()
+
+            # Don't retry on certain errors
+            if any(x in error_msg for x in [
+                "authentication", "unauthorized", "invalid_api_key",
+                "permission", "quota", "insufficient_quota", "401", "403", "429"
+            ]):
+                logging.error(f"Non-retryable error in ChatGPT_API: {e}")
+                return "Error"
+
+            # Log retry attempt
             if i < max_retries - 1:
-                time.sleep(1)  # Wait for 1秒 before retrying
+                # Exponential backoff: 1s, 2s, 4s, 8s...
+                wait_time = min(2 ** i, 8) + random.uniform(0, 0.5)
+                logging.warning(f"ChatGPT_API failed (attempt {i + 1}/{max_retries}), "
+                                f"retrying in {wait_time:.1f}s. Error: {e}")
+                time.sleep(wait_time)
             else:
-                logging.error('Max retries reached for prompt: ' + prompt)
+                logging.error(f"ChatGPT_API failed after {max_retries} attempts. Error: {e}")
                 return "Error"
             
 
-async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY):
+async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY, base_url=OPENAI_BASE_URL):
+    """
+    Send async chat request to OpenAI-compatible API with retry and exponential backoff.
+    """
     max_retries = 10
     messages = [{"role": "user", "content": prompt}]
+
+    # Import monitor lazily to avoid circular imports
+    try:
+        from .performance_monitor import get_monitor
+        monitor = get_monitor()
+        stage = monitor._current_stage or "unknown"
+    except Exception:
+        stage = "unknown"
+
     for i in range(max_retries):
+        start_time = time.time()
         try:
-            async with openai.AsyncOpenAI(api_key=api_key) as client:
+            async with openai.AsyncOpenAI(api_key=api_key, base_url=base_url) as client:
                 response = await client.chat.completions.create(
                     model=model,
                     messages=messages,
                     temperature=0,
+                    max_tokens=MAX_TOKENS,
                 )
+
+                # Track LLM call with performance monitoring
+                try:
+                    input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
+                    output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
+                    duration = time.time() - start_time
+
+                    # Debug: Log token usage
+                    print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
+
+                    monitor = get_monitor()
+                    monitor.track_llm_call(
+                        stage=stage,
+                        model=model,
+                        input_tokens=input_tokens,
+                        output_tokens=output_tokens,
+                        success=(i == 0),
+                        retry=(i > 0)
+                    )
+                except Exception:
+                    pass  # Silently fail if monitor not available
+
                 return response.choices[0].message.content
+
         except Exception as e:
-            print('************* Retrying *************')
-            logging.error(f"Error: {e}")
+            error_msg = str(e).lower()
+
+            # Don't retry on certain errors
+            if any(x in error_msg for x in [
+                "authentication", "unauthorized", "invalid_api_key",
+                "permission", "quota", "insufficient_quota", "401", "403", "429"
+            ]):
+                logging.error(f"Non-retryable error in ChatGPT_API_async: {e}")
+                return "Error"
+
+            # Log retry attempt
             if i < max_retries - 1:
-                await asyncio.sleep(1)  # Wait for 1s before retrying
+                # Exponential backoff: 1s, 2s, 4s, 8s...
+                wait_time = min(2 ** i, 8) + random.uniform(0, 0.5)
+                logging.warning(f"ChatGPT_API_async failed (attempt {i + 1}/{max_retries}), "
+                                f"retrying in {wait_time:.1f}s. Error: {e}")
+                await asyncio.sleep(wait_time)
             else:
-                logging.error('Max retries reached for prompt: ' + prompt)
-                return "Error"  
-            
+                logging.error(f"ChatGPT_API_async failed after {max_retries} attempts. Error: {e}")
+                return "Error"
             
 def get_json_content(response):
     start_idx = response.find("```json")
@@ -123,6 +336,9 @@ def get_json_content(response):
          
 
 def extract_json(content):
+    """
+    Extract JSON from content, handling markdown code blocks and extra text.
+    """
     try:
         # First, try to extract JSON enclosed within ```json and ```
         start_idx = content.find("```json")
@@ -136,13 +352,47 @@ def extract_json(content):
 
         # Clean up common issues that might cause parsing errors
         json_content = json_content.replace('None', 'null')  # Replace Python None with JSON null
-        json_content = json_content.replace('\n', ' ').replace('\r', ' ')  # Remove newlines
         json_content = ' '.join(json_content.split())  # Normalize whitespace
 
         # Attempt to parse and return the JSON object
         return json.loads(json_content)
     except json.JSONDecodeError as e:
         logging.error(f"Failed to extract JSON: {e}")
+        # If "Extra data" error, try to find the end of valid JSON
+        if "Extra data" in str(e):
+            try:
+                # Find the end of the JSON by matching brackets
+                content_stripped = json_content.strip()
+                if content_stripped.startswith('{'):
+                    # Find matching closing brace
+                    brace_count = 0
+                    in_string = False
+                    escape_next = False
+                    end_pos = 0
+                    for i, char in enumerate(content_stripped):
+                        if escape_next:
+                            escape_next = False
+                            continue
+                        if char == '\\':
+                            escape_next = True
+                            continue
+                        if char == '"' and not escape_next:
+                            in_string = not in_string
+                            continue
+                        if not in_string:
+                            if char == '{':
+                                brace_count += 1
+                            elif char == '}':
+                                brace_count -= 1
+                                if brace_count == 0:
+                                    end_pos = i + 1
+                                    break
+                    if end_pos > 0:
+                        json_content = content_stripped[:end_pos]
+                        return json.loads(json_content)
+            except Exception as e2:
+                logging.error(f"Failed to extract JSON by bracket matching: {e2}")
+
         # Try to clean up the content further if initial parsing fails
         try:
             # Remove any trailing commas before closing brackets/braces
@@ -150,10 +400,76 @@ def extract_json(content):
             return json.loads(json_content)
         except:
             logging.error("Failed to parse JSON even after cleanup")
-            return {}
+            return None
     except Exception as e:
         logging.error(f"Unexpected error while extracting JSON: {e}")
-        return {}
+        return None
+
+
+async def extract_json_with_retry(
+    llm_provider,  # LLMProvider instance
+    prompt: str,
+    model: Optional[str] = None,
+    max_retries: int = 2,
+    expected_keys: Optional[List[str]] = None
+) -> Optional[dict]:
+    """
+    Extract JSON from LLM response with retry mechanism.
+
+    Args:
+        llm_provider: LLMProvider instance for retry
+        prompt: The prompt to send
+        model: Model override
+        max_retries: Maximum retry attempts
+        expected_keys: Expected keys in JSON for validation
+
+    Returns:
+        Parsed JSON dict or None if all retries fail
+    """
+    last_error = None
+
+    for attempt in range(max_retries):
+        try:
+            response = await llm_provider.chat(prompt, model=model)
+            json_content = extract_json(response)
+
+            # Validate expected keys if provided
+            if json_content is not None:
+                if isinstance(json_content, dict):
+                    if expected_keys:
+                        missing_keys = [k for k in expected_keys if k not in json_content]
+                        if missing_keys:
+                            raise ValueError(f"Missing expected keys: {missing_keys}")
+                    return json_content
+                else:
+                    # Not a dict as expected
+                    raise ValueError(f"Expected dict but got {type(json_content)}")
+
+            # JSON extraction failed
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 0.5)
+                logging.warning(f"JSON extraction failed (attempt {attempt + 1}/{max_retries}), "
+                                f"retrying in {wait_time:.1f}s. Response preview: {response[:200]}...")
+                await asyncio.sleep(wait_time)
+            else:
+                logging.error(f"JSON extraction failed after {max_retries} attempts")
+
+        except ValueError as e:
+            last_error = e
+            if attempt < max_retries - 1:
+                wait_time = (2 ** attempt) + random.uniform(0, 0.5)
+                logging.warning(f"JSON validation failed (attempt {attempt + 1}/{max_retries}): {e}")
+                await asyncio.sleep(wait_time)
+            else:
+                logging.error(f"JSON validation failed after {max_retries} attempts: {e}")
+
+        except Exception as e:
+            last_error = e
+            logging.error(f"Unexpected error in extract_json_with_retry: {e}")
+            break
+
+    logging.error(f"All retry attempts failed. Last error: {last_error}")
+    return None
 
 def write_node_id(data, node_id=0):
     if isinstance(data, dict):
@@ -331,6 +647,9 @@ class JsonLogger:
     def info(self, message, **kwargs):
         self.log("INFO", message, **kwargs)
 
+    def warning(self, message, **kwargs):
+        self.log("WARNING", message, **kwargs)
+
     def error(self, message, **kwargs):
         self.log("ERROR", message, **kwargs)
 
@@ -411,7 +730,21 @@ def add_preface_if_needed(data):
 
 
 def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
-    enc = tiktoken.encoding_for_model(model)
+    # Handle OpenRouter format (provider/model) by extracting the model part
+    # For token counting, we use a compatible encoding
+    tiktoken_model = model
+    if "/" in model:
+        # Extract the model name from OpenRouter format (e.g., "google/gemini-2.5-flash-lite" -> "gemini-2.5-flash-lite")
+        # Fall back to a default encoding if the model is not directly supported
+        try:
+            tiktoken_model = model.split("/")[-1]
+            enc = tiktoken.encoding_for_model(tiktoken_model)
+        except KeyError:
+            # If not supported, use cl100k_base (GPT-4 encoding) as a reasonable default
+            enc = tiktoken.get_encoding("cl100k_base")
+    else:
+        enc = tiktoken.encoding_for_model(tiktoken_model)
+
     if pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
         page_list = []
@@ -429,7 +762,7 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
             doc = pymupdf.open(pdf_path)
         page_list = []
         for page in doc:
-            page_text = page.get_text()
+            page_text = page.get_text("markdown")
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
         return page_list
@@ -462,17 +795,23 @@ def post_processing(structure, end_physical_index):
     for i, item in enumerate(structure):
         item['start_index'] = item.get('physical_index')
         if i < len(structure) - 1:
-            if structure[i + 1].get('appear_start') == 'yes':
-                item['end_index'] = structure[i + 1]['physical_index']-1
+            next_physical_index = structure[i + 1].get('physical_index')
+            # Only set end_index if next_physical_index exists and is valid
+            if next_physical_index is not None and isinstance(next_physical_index, int):
+                if structure[i + 1].get('appear_start') == 'yes':
+                    item['end_index'] = next_physical_index - 1
+                else:
+                    item['end_index'] = next_physical_index
             else:
-                item['end_index'] = structure[i + 1]['physical_index']
+                # Fallback to end_physical_index if next physical_index is invalid
+                item['end_index'] = end_physical_index
         else:
             item['end_index'] = end_physical_index
     tree = list_to_tree(structure)
     if len(tree)!=0:
         return tree
     else:
-        ### remove appear_start 
+        ### remove appear_start
         for node in structure:
             node.pop('appear_start', None)
             node.pop('physical_index', None)
@@ -547,20 +886,31 @@ def convert_physical_index_to_int(data):
         for i in range(len(data)):
             # Check if item is a dictionary and has 'physical_index' key
             if isinstance(data[i], dict) and 'physical_index' in data[i]:
-                if isinstance(data[i]['physical_index'], str):
-                    if data[i]['physical_index'].startswith('<physical_index_'):
-                        data[i]['physical_index'] = int(data[i]['physical_index'].split('_')[-1].rstrip('>').strip())
-                    elif data[i]['physical_index'].startswith('physical_index_'):
-                        data[i]['physical_index'] = int(data[i]['physical_index'].split('_')[-1].strip())
+                physical_index = data[i]['physical_index']
+                # Skip if None or already an int
+                if physical_index is None or isinstance(physical_index, int):
+                    continue
+                if isinstance(physical_index, str):
+                    try:
+                        if physical_index.startswith('<physical_index_'):
+                            data[i]['physical_index'] = int(physical_index.split('_')[-1].rstrip('>').strip())
+                        elif physical_index.startswith('physical_index_'):
+                            data[i]['physical_index'] = int(physical_index.split('_')[-1].strip())
+                    except (ValueError, IndexError, AttributeError):
+                        # If conversion fails, set to None
+                        data[i]['physical_index'] = None
     elif isinstance(data, str):
-        if data.startswith('<physical_index_'):
-            data = int(data.split('_')[-1].rstrip('>').strip())
-        elif data.startswith('physical_index_'):
-            data = int(data.split('_')[-1].strip())
-        # Check data is int
-        if isinstance(data, int):
-            return data
-        else:
+        try:
+            if data.startswith('<physical_index_'):
+                data = int(data.split('_')[-1].rstrip('>').strip())
+            elif data.startswith('physical_index_'):
+                data = int(data.split('_')[-1].strip())
+            # Check data is int
+            if isinstance(data, int):
+                return data
+            else:
+                return None
+        except (ValueError, IndexError, AttributeError):
             return None
     return data
 
@@ -602,20 +952,27 @@ def add_node_text_with_labels(node, pdf_pages):
     return
 
 
-async def generate_node_summary(node, model=None):
+async def generate_node_summary(node, model=None, llm_provider=None):
+    """Generate a summary for a node. If llm_provider is provided, use its chat method; otherwise fall back to ChatGPT_API_async."""
     prompt = f"""You are given a part of a document, your task is to generate a description of the partial document about what are main points covered in the partial document.
 
     Partial Document Text: {node['text']}
-    
+
     Directly return the description, do not include any other text.
     """
-    response = await ChatGPT_API_async(model, prompt)
+    if llm_provider is not None:
+        # Use the API's llm_provider
+        response = await llm_provider.chat(prompt, model=model)
+    else:
+        # Fall back to legacy ChatGPT_API_async
+        response = await ChatGPT_API_async(model, prompt)
     return response
 
 
-async def generate_summaries_for_structure(structure, model=None):
+async def generate_summaries_for_structure(structure, model=None, llm_provider=None):
+    """Generate summaries for all nodes in structure. Uses llm_provider if provided."""
     nodes = structure_to_list(structure)
-    tasks = [generate_node_summary(node, model=model) for node in nodes]
+    tasks = [generate_node_summary(node, model=model, llm_provider=llm_provider) for node in nodes]
     summaries = await asyncio.gather(*tasks)
     
     for node, summary in zip(nodes, summaries):
