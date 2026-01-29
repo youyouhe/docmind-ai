@@ -762,7 +762,7 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
             doc = pymupdf.open(pdf_path)
         page_list = []
         for page in doc:
-            page_text = page.get_text("markdown")
+            page_text = page.get_text()
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
         return page_list
