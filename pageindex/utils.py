@@ -13,6 +13,7 @@ import asyncio
 import pymupdf
 from io import BytesIO
 from dotenv import load_dotenv
+from markitdown import MarkItDown
 load_dotenv()
 import logging
 import yaml
@@ -702,15 +703,32 @@ def list_to_tree(data):
             # No parent, this is a root node
             root_nodes.append(node)
     
-    # Helper function to clean empty children arrays
-    def clean_node(node):
+    # Helper function to clean empty children arrays and validate page ranges
+    def clean_node(node, parent_start=None, parent_end=None):
+        # Validate and clamp child's page range to parent's range
+        if parent_start is not None and parent_end is not None:
+            # Ensure child's start_index is within parent's range
+            if node['start_index'] < parent_start:
+                node['start_index'] = parent_start
+            if node['start_index'] > parent_end:
+                node['start_index'] = parent_end
+            # Ensure child's end_index is within parent's range
+            if node['end_index'] < parent_start:
+                node['end_index'] = parent_start
+            if node['end_index'] > parent_end:
+                node['end_index'] = parent_end
+            # Ensure start_index <= end_index
+            if node['start_index'] > node['end_index']:
+                node['start_index'] = node['end_index']
+
         if not node['nodes']:
             del node['nodes']
         else:
             for child in node['nodes']:
-                clean_node(child)
+                # Pass parent's range to children
+                clean_node(child, node['start_index'], node['end_index'])
         return node
-    
+
     # Clean and return the tree
     return [clean_node(node) for node in root_nodes]
 
@@ -729,7 +747,8 @@ def add_preface_if_needed(data):
 
 
 
-def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
+def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyMuPDF"):
+    import os
     # Handle OpenRouter format (provider/model) by extracting the model part
     # For token counting, we use a compatible encoding
     tiktoken_model = model
@@ -745,7 +764,41 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
     else:
         enc = tiktoken.encoding_for_model(tiktoken_model)
 
-    if pdf_parser == "PyPDF2":
+    if pdf_parser == "markitdown":
+        # Use Microsoft's markitdown library for better PDF table support
+        md = MarkItDown()
+        if isinstance(pdf_path, BytesIO):
+            # For BytesIO, write to temp file first
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(pdf_path.getvalue())
+                tmp_path = tmp.name
+            try:
+                result = md.convert(tmp_path)
+                markdown_text = result.text_content
+            finally:
+                os.unlink(tmp_path)
+        elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
+            result = md.convert(pdf_path)
+            markdown_text = result.text_content
+        else:
+            raise ValueError(f"Invalid pdf_path for markitdown parser: {pdf_path}")
+
+        # Split markdown into pages (markitdown doesn't preserve page boundaries by default)
+        # We'll use page separators if present, otherwise treat as single page
+        page_separator = "\n\n---\n\n"  # Common markdown page separator
+        if page_separator in markdown_text:
+            pages = markdown_text.split(page_separator)
+        else:
+            # If no page separator, treat entire document as one page
+            pages = [markdown_text]
+
+        page_list = []
+        for page_text in pages:
+            token_length = len(enc.encode(page_text))
+            page_list.append((page_text, token_length))
+        return page_list
+    elif pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
         page_list = []
         for page_num in range(len(pdf_reader.pages)):
@@ -760,11 +813,25 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
         elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
             doc = pymupdf.open(pdf_path)
+
+        # Debug: save parsed content to temp directory
+        temp_dir = "temp_pdf_parse_debug"
+        os.makedirs(temp_dir, exist_ok=True)
+
         page_list = []
-        for page in doc:
-            page_text = page.get_text("markdown")
+        for i, page in enumerate(doc):
+            page_text = page.get_text("text")
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
+
+            # Save each page to temp file for debugging
+            with open(f"{temp_dir}/page_{i+1}.txt", "w", encoding="utf-8") as f:
+                f.write(f"=== Page {i+1} ===\n")
+                f.write(f"Tokens: {token_length}\n")
+                f.write(f"{'='*60}\n\n")
+                f.write(page_text)
+
+        doc.close()
         return page_list
     else:
         raise ValueError(f"Unsupported PDF parser: {pdf_parser}")
@@ -793,20 +860,36 @@ def get_number_of_pages(pdf_path):
 def post_processing(structure, end_physical_index):
     # First convert page_number to start_index in flat list
     for i, item in enumerate(structure):
-        item['start_index'] = item.get('physical_index')
+        start_idx = item.get('physical_index')
+
+        # Validate and set start_index
+        if start_idx is None or not isinstance(start_idx, int) or start_idx < 1:
+            # Fallback: use previous item's end_index + 1, or 1 if first item
+            if i > 0:
+                prev_end = structure[i - 1].get('end_index', end_physical_index)
+                start_idx = min(prev_end + 1, end_physical_index)
+            else:
+                start_idx = 1
+        # Ensure start_index doesn't exceed end_physical_index
+        start_idx = min(start_idx, end_physical_index)
+        item['start_index'] = start_idx
+
         if i < len(structure) - 1:
             next_physical_index = structure[i + 1].get('physical_index')
             # Only set end_index if next_physical_index exists and is valid
             if next_physical_index is not None and isinstance(next_physical_index, int):
                 if structure[i + 1].get('appear_start') == 'yes':
-                    item['end_index'] = next_physical_index - 1
+                    end_idx = next_physical_index - 1
                 else:
-                    item['end_index'] = next_physical_index
+                    end_idx = next_physical_index
+                # Ensure end_index is at least start_index
+                end_idx = max(end_idx, start_idx)
+                item['end_index'] = min(end_idx, end_physical_index)
             else:
                 # Fallback to end_physical_index if next physical_index is invalid
-                item['end_index'] = end_physical_index
+                item['end_index'] = max(start_idx, end_physical_index)
         else:
-            item['end_index'] = end_physical_index
+            item['end_index'] = max(start_idx, end_physical_index)
     tree = list_to_tree(structure)
     if len(tree)!=0:
         return tree
@@ -889,15 +972,29 @@ def convert_physical_index_to_int(data):
                 physical_index = data[i]['physical_index']
                 # Skip if None or already an int
                 if physical_index is None or isinstance(physical_index, int):
+                    # Additional validation for int values: must be positive
+                    if isinstance(physical_index, int) and physical_index <= 0:
+                        logging.warning(f"Invalid physical_index (non-positive) for '{data[i].get('title', 'Unknown')}': {physical_index}")
+                        data[i]['physical_index'] = None
                     continue
                 if isinstance(physical_index, str):
                     try:
                         if physical_index.startswith('<physical_index_'):
-                            data[i]['physical_index'] = int(physical_index.split('_')[-1].rstrip('>').strip())
+                            converted = int(physical_index.split('_')[-1].rstrip('>').strip())
                         elif physical_index.startswith('physical_index_'):
-                            data[i]['physical_index'] = int(physical_index.split('_')[-1].strip())
+                            converted = int(physical_index.split('_')[-1].strip())
+                        else:
+                            continue
+
+                        # Validate converted value is positive
+                        if converted <= 0:
+                            logging.warning(f"Invalid physical_index (non-positive) for '{data[i].get('title', 'Unknown')}': {converted}")
+                            data[i]['physical_index'] = None
+                        else:
+                            data[i]['physical_index'] = converted
                     except (ValueError, IndexError, AttributeError):
                         # If conversion fails, set to None
+                        logging.warning(f"Failed to convert physical_index for '{data[i].get('title', 'Unknown')}': {physical_index}")
                         data[i]['physical_index'] = None
     elif isinstance(data, str):
         try:
@@ -927,10 +1024,31 @@ def convert_page_to_int(data):
 
 
 def add_node_text(node, pdf_pages):
+    """
+    Add text content to nodes.
+
+    Strategy:
+    - Leaf nodes (no children): Add truncated content
+    - Parent nodes (with children): No content added (will use summary instead)
+
+    This makes the tree structure lightweight - content is only stored
+    at the leaf level as a cache. Parent nodes rely on summaries.
+    """
     if isinstance(node, dict):
-        start_page = node.get('start_index')
-        end_page = node.get('end_index')
-        node['text'] = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
+        has_children = 'nodes' in node and node['nodes']
+
+        if not has_children:
+            # Leaf node: add content (truncated)
+            start_page = node.get('start_index')
+            end_page = node.get('end_index')
+            full_text = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
+            # Truncate to max 5000 characters for leaf nodes
+            node['text'] = full_text[:5000] if len(full_text) > 5000 else full_text
+        else:
+            # Parent node: no content, will use summary instead
+            node['text'] = ""
+
+        # Recursively process children
         if 'nodes' in node:
             add_node_text(node['nodes'], pdf_pages)
     elif isinstance(node, list):

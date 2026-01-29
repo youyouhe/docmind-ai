@@ -35,6 +35,7 @@ from api.models import (
     TreeParseResponse,
     TreeStats,
 )
+from api.websocket_manager import manager
 
 
 # =============================================================================
@@ -93,10 +94,21 @@ async def parse_document_background(
         # Update status to processing
         db.update_document_status(document_id, "processing")
 
+        # Broadcast status update via WebSocket
+        await manager.broadcast_status_update(document_id, "processing", progress=0.0)
+
         start_time = time.time()
 
         # Parse the document
         if file_type == "pdf":
+            # Stage 1: Analyzing document structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=10.0,
+                metadata={"stage": "Analyzing document structure..."}
+            )
+
             page_index_tree = await ParseService.parse_pdf(
                 file_path=file_path,
                 model=model,
@@ -106,8 +118,24 @@ async def parse_document_background(
                 if_add_node_summary=parse_config.get("if_add_node_summary", True),
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
+                custom_prompt=parse_config.get("custom_prompt"),
+            )
+
+            # Stage 2: Building tree structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=60.0,
+                metadata={"stage": "Building tree structure..."}
             )
         else:  # markdown
+            # Stage 1: Analyzing markdown structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=10.0,
+                metadata={"stage": "Analyzing markdown structure..."}
+            )
             # Initialize performance monitor for markdown (which uses LLM calls directly)
             reset_monitor()
             monitor = get_monitor()
@@ -120,8 +148,24 @@ async def parse_document_background(
                     if_add_node_text=parse_config.get("if_add_node_text", True),
                 )
 
+            # Stage 2: Building tree structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=60.0,
+                metadata={"stage": "Building tree structure..."}
+            )
+
         # Convert to API format
         api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+
+        # Stage 3: Saving results
+        await manager.broadcast_status_update(
+            document_id,
+            "processing",
+            progress=80.0,
+            metadata={"stage": "Saving results..."}
+        )
 
         # Calculate statistics
         stats_dict = ParseService.calculate_tree_stats(api_tree)
@@ -168,11 +212,26 @@ async def parse_document_background(
         # Update document status to completed
         db.update_document_status(document_id, "completed")
 
+        # Broadcast completion status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "completed",
+            progress=100.0,
+            metadata={"duration_ms": duration_ms}
+        )
+
     except Exception as e:
         # Update document status to failed
         error_msg = f"Parse failed: {str(e)}"
         db.update_document_status(document_id, "failed", error_message=error_msg)
         traceback.print_exc()
+
+        # Broadcast failed status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "failed",
+            error_message=error_msg
+        )
 
 
 def get_llm_provider() -> LLMProvider:
@@ -210,6 +269,8 @@ async def upload_document(
     if_add_node_summary: bool = Form(default=True, description="Add node summaries"),
     if_add_node_text: bool = Form(default=False, description="Add full text content"),
     auto_parse: bool = Form(default=True, description="Automatically parse after upload"),
+    # Custom prompt for TOC extraction
+    custom_prompt: Optional[str] = Form(default=None, description="Custom prompt to guide TOC extraction (helps LLM better identify document structure)"),
 ):
     """
     Upload a new document.
@@ -249,6 +310,7 @@ async def upload_document(
         "if_add_node_id": if_add_node_id,
         "if_add_node_summary": if_add_node_summary,
         "if_add_node_text": if_add_node_text,
+        "custom_prompt": custom_prompt,
     }
 
     # Create document record
@@ -431,6 +493,7 @@ async def delete_document(document_id: str):
 async def reparse_document(
     document_id: str,
     model: str = Form(default=None, description="Override model (optional)"),
+    custom_prompt: Optional[str] = Form(default=None, description="Custom prompt to guide TOC extraction"),
 ):
     """
     Manually trigger re-parsing of a document.
@@ -472,6 +535,9 @@ async def reparse_document(
     # Update status to processing
     db.update_document_status(document_id, "processing")
 
+    # Broadcast status update via WebSocket
+    await manager.broadcast_status_update(document_id, "processing")
+
     try:
         start_time = time.time()
 
@@ -486,6 +552,7 @@ async def reparse_document(
                 if_add_node_summary=parse_config.get("if_add_node_summary", True),
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
+                custom_prompt=custom_prompt,
             )
         else:  # markdown
             page_index_tree = await ParseService.parse_markdown(
@@ -529,6 +596,14 @@ async def reparse_document(
         # Update document status
         db.update_document_status(document_id, "completed")
 
+        # Broadcast completion status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "completed",
+            progress=100.0,
+            metadata={"duration_ms": duration_ms, "is_reparse": True}
+        )
+
         return TreeParseResponse(
             success=True,
             message=f"Successfully re-parsed document: {doc.filename}",
@@ -539,6 +614,14 @@ async def reparse_document(
     except Exception as e:
         traceback.print_exc()
         db.update_document_status(document_id, "failed", error_message=str(e))
+
+        # Broadcast failed status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "failed",
+            error_message=str(e)
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Failed to parse document: {str(e)}"
@@ -661,3 +744,66 @@ async def get_document_stats(document_id: str):
         )
 
     return stats_data
+
+
+@router.get("/{document_id}/pages")
+async def get_document_pages(
+    document_id: str,
+    page_start: int = Query(..., ge=1, description="Starting page number (1-based)"),
+    page_end: int = Query(..., ge=1, description="Ending page number (1-based, inclusive)")
+):
+    """
+    Get text content from specific pages of a PDF document.
+
+    This endpoint is used by the chat service to dynamically load
+    page content instead of storing it in the tree structure.
+
+    - **document_id**: Document ID
+    - **page_start**: Starting page number (1-based)
+    - **page_end**: Ending page number (1-based, inclusive)
+
+    Returns:
+        List of pages with their text content
+    """
+    storage = get_storage()
+    db = get_db()
+
+    # Get document
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Only PDF documents support page extraction
+    if doc.file_type != "pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Page content extraction is only supported for PDF documents"
+        )
+
+    # Check if file exists
+    if not storage.file_exists(doc.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Uploaded file not found: {doc.file_path}"
+        )
+
+    # Get absolute file path
+    file_path = str(storage.get_upload_path(doc.file_path))
+
+    # Extract pages
+    try:
+        pages = storage.get_pdf_pages(file_path, page_start, page_end)
+        return {
+            "document_id": document_id,
+            "page_start": page_start,
+            "page_end": page_end,
+            "pages": [{"page_num": p[0], "text": p[1]} for p in pages]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract pages: {str(e)}"
+        )
