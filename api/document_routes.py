@@ -1028,3 +1028,149 @@ async def delete_conversation_history(document_id: str):
         "deleted": count,
         "message": f"Deleted {count} message(s)"
     }
+
+
+@router.post("/{document_id}/categorize")
+async def categorize_document(
+    document_id: str,
+    force: bool = False
+):
+    """
+    Analyze document using LLM to determine category and tags.
+    Uses only the first page for analysis.
+
+    Query Parameters:
+    - force: Re-categorize even if already has category (default: false)
+    """
+    from api.services import get_llm_provider
+    from api.database import get_db
+    from api.storage import get_storage
+
+    llm = get_llm_provider()
+    storage = get_storage()
+    db = get_db()
+
+    # Get document
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Check if already categorized (unless force=True)
+    if doc.category and not force:
+        import json
+        return {
+            "document_id": document_id,
+            "category": doc.category,
+            "tags": json.loads(doc.tags) if doc.tags else [],
+            "message": "Already categorized"
+        }
+
+    # Check if file exists
+    if not storage.file_exists(doc.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"File not found: {doc.file_path}"
+        )
+
+    # Get absolute file path
+    file_path = str(storage.get_upload_path(doc.file_path))
+
+    # Extract first page content
+    try:
+        if doc.file_type == "pdf":
+            pages = storage.get_pdf_pages(file_path, 1, 1)  # Get page 1 only
+            first_page_text = pages[0][1] if pages else ""
+        elif doc.file_type == "markdown":
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+                first_page_text = content[:3000]  # First ~3000 chars
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unsupported file type: {doc.file_type}"
+            )
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract first page: {str(e)}"
+        )
+
+    # Truncate first page if too long
+    first_page_text = first_page_text[:4000]
+
+    # Build categorization prompt
+    categorization_prompt = f"""请分析这份文档并确定其分类和标签。
+
+文档名称: {doc.filename}
+
+文档首页内容:
+{first_page_text}
+
+请返回JSON格式的分析结果:
+{{
+    "category": "简短的分类名称（2-6个汉字）",
+    "tags": ["标签1", "标签2", "标签3"],
+    "confidence": 0.95,
+    "reasoning": "分类依据的简要说明"
+}}
+
+分类示例:
+- 教育类文档: "教育招标" 或 "学术采购", tags: ["教育", "大学", "招标"]
+- 政府类文档: "政府采购" 或 "政府公告", tags: ["政府", "采购", "公告"]
+- 企业类文档: "企业招标" 或 "商业采购", tags: ["企业", "商业", "采购"]
+- 如果无法确定分类: "其他", tags: []
+
+只返回JSON，不要有其他文字。"""
+
+    # Call LLM
+    try:
+        import json
+
+        response = await llm.chat(categorization_prompt)
+
+        # Parse JSON response
+        if "```" in response:
+            response = response.split("```")[1]
+            if response.startswith("json"):
+                response = response[4:]
+
+        result = json.loads(response.strip())
+        category = result.get("category", "").strip()
+        tags = result.get("tags", [])
+        confidence = result.get("confidence", 0.0)
+        reasoning = result.get("reasoning", "")
+
+        # Validate category
+        if not category:
+            category = "其他"
+        if not isinstance(tags, list):
+            tags = []
+
+    except json.JSONDecodeError as e:
+        # Fallback if JSON parsing fails
+        category = "其他"
+        tags = []
+        confidence = 0.0
+        reasoning = f"JSON解析失败: {str(e)}"
+    except Exception as e:
+        # Fallback if LLM fails
+        category = "其他"
+        tags = []
+        confidence = 0.0
+        reasoning = f"LLM调用失败: {str(e)}"
+
+    # Update document in database
+    db.update_document_category_tags(document_id, category=category, tags=tags)
+
+    return {
+        "document_id": document_id,
+        "category": category,
+        "tags": tags,
+        "confidence": confidence,
+        "reasoning": reasoning,
+        "provider": llm.provider,
+        "model": llm.model
+    }

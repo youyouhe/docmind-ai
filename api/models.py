@@ -235,6 +235,8 @@ class DocumentItem(BaseModel):
     error_message: Optional[str] = Field(None, description="Error message if failed")
     created_at: str = Field(..., description="Creation timestamp (ISO 8601)")
     updated_at: str = Field(..., description="Last update timestamp (ISO 8601)")
+    category: Optional[str] = Field(None, description="Document category")
+    tags: Optional[List[str]] = Field(None, description="Document tags")
 
 
 class DocumentListResponse(BaseModel):
@@ -274,6 +276,8 @@ class DocumentDetail(BaseModel):
     updated_at: str = Field(..., description="Last update timestamp (ISO 8601)")
     parse_result: Optional[ParseResultInfo] = Field(None, description="Parse result info if available")
     performance: Optional[Dict[str, Any]] = Field(None, description="Performance statistics from latest parse")
+    category: Optional[str] = Field(None, description="Document category")
+    tags: Optional[List[str]] = Field(None, description="Document tags")
 
 
 class DocumentDeleteResponse(BaseModel):
@@ -282,3 +286,20 @@ class DocumentDeleteResponse(BaseModel):
     id: str = Field(..., description="Deleted document ID")
     deleted: bool = Field(..., description="Whether deletion was successful")
     files_deleted: dict = Field(..., description="File deletion status details")
+
+
+# =============================================================================
+# Document Categorization Models
+# =============================================================================
+
+class DocumentCategorizationResponse(BaseModel):
+    """Response model for document categorization."""
+
+    document_id: str = Field(..., description="Document ID")
+    category: str = Field(..., description="Document category")
+    tags: List[str] = Field(default_factory=list, description="Suggested tags")
+    confidence: float = Field(..., description="Classification confidence (0-1)")
+    reasoning: str = Field(..., description="LLM reasoning for classification")
+    provider: str = Field(..., description="LLM provider used")
+    model: str = Field(..., description="Model used")
+    message: Optional[str] = Field(None, description="Optional message")

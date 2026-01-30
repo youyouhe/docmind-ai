@@ -67,12 +67,23 @@ class Document(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
     parse_config = Column(Text, nullable=True)  # JSON string
+    category = Column(String, nullable=True)  # Document category (e.g., "教育招标")
+    tags = Column(Text, nullable=True)  # Document tags as JSON string (e.g., '["教育", "大学"]')
 
     # Relationship to parse results
     parse_results = relationship("ParseResult", back_populates="document", cascade="all, delete-orphan")
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert model to dictionary."""
+        import json
+
+        tags_list = []
+        if self.tags:
+            try:
+                tags_list = json.loads(self.tags)
+            except:
+                tags_list = []
+
         return {
             "id": self.id,
             "filename": self.filename,
@@ -84,6 +95,8 @@ class Document(Base):
             "error_message": self.error_message,
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+            "category": self.category,
+            "tags": tags_list,
         }
 
 
@@ -211,11 +224,28 @@ class DatabaseManager:
         from sqlalchemy import inspect, text
 
         with self.engine.connect() as conn:
-            inspector = inspect(conn)
-            columns = [col['name'] for col in inspector.get_columns('parse_results')]
+            # Migration for documents table
+            doc_columns = [col['name'] for col in inspector.get_columns('documents')]
 
-            # Migration 1: Add performance_stats column if missing
-            if 'performance_stats' not in columns:
+            # Migration 1: Add category column if missing
+            if 'category' not in doc_columns:
+                print("[Migration] Adding category column to documents table...")
+                conn.execute(text("ALTER TABLE documents ADD COLUMN category TEXT"))
+                conn.commit()
+                print("[Migration] Done: category column added")
+
+            # Migration 2: Add tags column if missing
+            if 'tags' not in doc_columns:
+                print("[Migration] Adding tags column to documents table...")
+                conn.execute(text("ALTER TABLE documents ADD COLUMN tags TEXT"))
+                conn.commit()
+                print("[Migration] Done: tags column added")
+
+            # Migration for parse_results table
+            result_columns = [col['name'] for col in inspector.get_columns('parse_results')]
+
+            # Migration 3: Add performance_stats column if missing
+            if 'performance_stats' not in result_columns:
                 print("[Migration] Adding performance_stats column to parse_results table...")
                 conn.execute(text("ALTER TABLE parse_results ADD COLUMN performance_stats TEXT"))
                 conn.commit()
@@ -350,6 +380,8 @@ class DatabaseManager:
             created_at=doc.created_at,
             updated_at=doc.updated_at,
             parse_config=doc.parse_config,
+            category=doc.category,
+            tags=doc.tags,
         )
 
     def update_document_status(
@@ -375,6 +407,38 @@ class DatabaseManager:
                 doc.parse_status = parse_status
                 if error_message:
                     doc.error_message = error_message
+                doc.updated_at = datetime.utcnow()
+                session.commit()
+                session.refresh(doc)
+                return doc
+            return None
+
+    def update_document_category_tags(
+        self,
+        document_id: str,
+        category: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+    ) -> Optional[Document]:
+        """
+        Update document category and tags.
+
+        Args:
+            document_id: Document ID
+            category: Category name (e.g., "教育招标")
+            tags: List of tags (e.g., ["教育", "大学"])
+
+        Returns:
+            Updated Document instance or None
+        """
+        import json
+
+        with self.get_session() as session:
+            doc = session.query(Document).filter(Document.id == document_id).first()
+            if doc:
+                if category is not None:
+                    doc.category = category
+                if tags is not None:
+                    doc.tags = json.dumps(tags, ensure_ascii=False)
                 doc.updated_at = datetime.utcnow()
                 session.commit()
                 session.refresh(doc)
