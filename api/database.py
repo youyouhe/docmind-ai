@@ -120,6 +120,39 @@ class ParseResult(Base):
         }
 
 
+class Conversation(Base):
+    """
+    Conversation history table - stores chat messages for documents.
+
+    Each message is stored as a separate row with document_id reference.
+    """
+    __tablename__ = "conversations"
+
+    id = Column(String, primary_key=True)  # UUID v4
+    document_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    role = Column(String, nullable=False)  # 'user' or 'assistant'
+    content = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    # Optional metadata
+    sources = Column(Text, nullable=True)  # JSON: source information
+    debug_path = Column(Text, nullable=True)  # JSON: debug path for highlighting
+
+    # Relationship to document
+    document = relationship("Document")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "document_id": self.document_id,
+            "role": self.role,
+            "content": self.content,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "sources": self.sources,
+            "debug_path": self.debug_path,
+        }
+
+
 # =============================================================================
 # Database Manager
 # =============================================================================
@@ -491,6 +524,96 @@ class DatabaseManager:
             except json.JSONDecodeError:
                 return {"error": "Failed to parse performance stats"}
         return None
+
+    # -------------------------------------------------------------------------
+    # Conversation Operations
+    # -------------------------------------------------------------------------
+
+    def save_conversation_message(
+        self,
+        message_id: str,
+        document_id: str,
+        role: str,
+        content: str,
+        sources: Optional[List[Dict[str, Any]]] = None,
+        debug_path: Optional[List[str]] = None,
+    ) -> Conversation:
+        """
+        Save a conversation message.
+
+        Args:
+            message_id: Unique message ID (UUID)
+            document_id: Document ID
+            role: Message role ('user' or 'assistant')
+            content: Message content
+            sources: Optional source information
+            debug_path: Optional debug path for highlighting
+
+        Returns:
+            Created Conversation instance
+        """
+        import json
+
+        with self.get_session() as session:
+            message = Conversation(
+                id=message_id,
+                document_id=document_id,
+                role=role,
+                content=content,
+                sources=json.dumps(sources) if sources else None,
+                debug_path=json.dumps(debug_path) if debug_path else None,
+            )
+            session.add(message)
+            session.commit()
+            session.refresh(message)
+            return message
+
+    def get_conversation_history(self, document_id: str, limit: int = 100) -> List[Conversation]:
+        """
+        Get conversation history for a document.
+
+        Args:
+            document_id: Document ID
+            limit: Maximum number of messages to return
+
+        Returns:
+            List of Conversation instances, ordered by creation time
+        """
+        with self.get_session() as session:
+            messages = session.query(Conversation).filter(
+                Conversation.document_id == document_id
+            ).order_by(Conversation.created_at.asc()).limit(limit).all()
+
+            # Return detached copies
+            return [
+                Conversation(
+                    id=m.id,
+                    document_id=m.document_id,
+                    role=m.role,
+                    content=m.content,
+                    created_at=m.created_at,
+                    sources=m.sources,
+                    debug_path=m.debug_path,
+                )
+                for m in messages
+            ]
+
+    def delete_conversation_history(self, document_id: str) -> int:
+        """
+        Delete all conversation history for a document.
+
+        Args:
+            document_id: Document ID
+
+        Returns:
+            Number of messages deleted
+        """
+        with self.get_session() as session:
+            count = session.query(Conversation).filter(
+                Conversation.document_id == document_id
+            ).delete()
+            session.commit()
+            return count
 
 
 # =============================================================================

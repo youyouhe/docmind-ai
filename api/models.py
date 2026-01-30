@@ -130,6 +130,10 @@ class ChatRequest(BaseModel):
         default_factory=list,
         description="Conversation history (list of previous messages)"
     )
+    document_id: Optional[str] = Field(
+        default=None,
+        description="Document ID for loading PDF page content dynamically"
+    )
 
     class Config:
         json_schema_extra = {

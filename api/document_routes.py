@@ -16,10 +16,11 @@ import json
 import time
 import traceback
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 # Configure logging
 logger = logging.getLogger("pageindex.api.documents")
@@ -35,6 +36,14 @@ from api.models import (
     TreeParseResponse,
     TreeStats,
 )
+from api.websocket_manager import manager
+
+# Import progress callback for real-time updates
+try:
+    from pageindex.progress_callback import ProgressCallback, set_document_id
+except ImportError:
+    ProgressCallback = None
+    set_document_id = None
 
 
 # =============================================================================
@@ -86,6 +95,21 @@ async def parse_document_background(
     # Import performance monitor
     from pageindex.performance_monitor import reset_monitor, get_monitor
 
+    # Create async callback for WebSocket updates
+    async def ws_callback(doc_id: str, stage: str, progress: float, metadata: dict):
+        """Async callback to send WebSocket updates."""
+        message = metadata.get("message", f"Processing: {stage}")
+        await manager.broadcast_status_update(
+            doc_id,
+            "processing",
+            progress=progress,
+            metadata={
+                "stage": stage,
+                "message": message,
+                **metadata
+            }
+        )
+
     try:
         # Clear any previous PDF performance data
         ParseService.clear_last_pdf_performance()
@@ -93,10 +117,30 @@ async def parse_document_background(
         # Update status to processing
         db.update_document_status(document_id, "processing")
 
+        # Broadcast status update via WebSocket
+        await manager.broadcast_status_update(document_id, "processing", progress=0.0)
+
+        # Set document_id for progress callbacks
+        if set_document_id:
+            set_document_id(document_id)
+
         start_time = time.time()
+
+        # Create progress callback for real-time updates
+        progress_callback = None
+        if ProgressCallback and file_type == "pdf":
+            progress_callback = ProgressCallback(document_id, ws_callback)
 
         # Parse the document
         if file_type == "pdf":
+            # Stage 1: Analyzing document structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=10.0,
+                metadata={"stage": "Analyzing document structure..."}
+            )
+
             page_index_tree = await ParseService.parse_pdf(
                 file_path=file_path,
                 model=model,
@@ -106,8 +150,25 @@ async def parse_document_background(
                 if_add_node_summary=parse_config.get("if_add_node_summary", True),
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
+                custom_prompt=parse_config.get("custom_prompt"),
+                progress_callback=progress_callback,
+            )
+
+            # Stage 2: Building tree structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=96.0,
+                metadata={"stage": "Finalizing tree structure..."}
             )
         else:  # markdown
+            # Stage 1: Analyzing markdown structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=10.0,
+                metadata={"stage": "Analyzing markdown structure..."}
+            )
             # Initialize performance monitor for markdown (which uses LLM calls directly)
             reset_monitor()
             monitor = get_monitor()
@@ -120,8 +181,24 @@ async def parse_document_background(
                     if_add_node_text=parse_config.get("if_add_node_text", True),
                 )
 
+            # Stage 2: Building tree structure
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=60.0,
+                metadata={"stage": "Building tree structure..."}
+            )
+
         # Convert to API format
         api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+
+        # Stage 3: Saving results
+        await manager.broadcast_status_update(
+            document_id,
+            "processing",
+            progress=97.0,
+            metadata={"stage": "Saving results..."}
+        )
 
         # Calculate statistics
         stats_dict = ParseService.calculate_tree_stats(api_tree)
@@ -168,11 +245,26 @@ async def parse_document_background(
         # Update document status to completed
         db.update_document_status(document_id, "completed")
 
+        # Broadcast completion status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "completed",
+            progress=100.0,
+            metadata={"duration_ms": duration_ms}
+        )
+
     except Exception as e:
         # Update document status to failed
         error_msg = f"Parse failed: {str(e)}"
         db.update_document_status(document_id, "failed", error_message=error_msg)
         traceback.print_exc()
+
+        # Broadcast failed status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "failed",
+            error_message=error_msg
+        )
 
 
 def get_llm_provider() -> LLMProvider:
@@ -210,6 +302,8 @@ async def upload_document(
     if_add_node_summary: bool = Form(default=True, description="Add node summaries"),
     if_add_node_text: bool = Form(default=False, description="Add full text content"),
     auto_parse: bool = Form(default=True, description="Automatically parse after upload"),
+    # Custom prompt for TOC extraction
+    custom_prompt: Optional[str] = Form(default=None, description="Custom prompt to guide TOC extraction (helps LLM better identify document structure)"),
 ):
     """
     Upload a new document.
@@ -249,6 +343,7 @@ async def upload_document(
         "if_add_node_id": if_add_node_id,
         "if_add_node_summary": if_add_node_summary,
         "if_add_node_text": if_add_node_text,
+        "custom_prompt": custom_prompt,
     }
 
     # Create document record
@@ -431,6 +526,7 @@ async def delete_document(document_id: str):
 async def reparse_document(
     document_id: str,
     model: str = Form(default=None, description="Override model (optional)"),
+    custom_prompt: Optional[str] = Form(default=None, description="Custom prompt to guide TOC extraction"),
 ):
     """
     Manually trigger re-parsing of a document.
@@ -472,6 +568,34 @@ async def reparse_document(
     # Update status to processing
     db.update_document_status(document_id, "processing")
 
+    # Broadcast status update via WebSocket
+    await manager.broadcast_status_update(document_id, "processing")
+
+    # Set document_id for progress callbacks
+    if set_document_id:
+        set_document_id(document_id)
+
+    # Create progress callback for real-time updates
+    progress_callback = None
+
+    # Create async callback for WebSocket updates
+    async def ws_callback(doc_id: str, stage: str, progress: float, metadata: dict):
+        """Async callback to send WebSocket updates."""
+        message = metadata.get("message", f"Processing: {stage}")
+        await manager.broadcast_status_update(
+            doc_id,
+            "processing",
+            progress=progress,
+            metadata={
+                "stage": stage,
+                "message": message,
+                **metadata
+            }
+        )
+
+    if ProgressCallback and doc.file_type == "pdf":
+        progress_callback = ProgressCallback(document_id, ws_callback)
+
     try:
         start_time = time.time()
 
@@ -486,6 +610,8 @@ async def reparse_document(
                 if_add_node_summary=parse_config.get("if_add_node_summary", True),
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
+                custom_prompt=custom_prompt,
+                progress_callback=progress_callback,
             )
         else:  # markdown
             page_index_tree = await ParseService.parse_markdown(
@@ -529,6 +655,14 @@ async def reparse_document(
         # Update document status
         db.update_document_status(document_id, "completed")
 
+        # Broadcast completion status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "completed",
+            progress=100.0,
+            metadata={"duration_ms": duration_ms, "is_reparse": True}
+        )
+
         return TreeParseResponse(
             success=True,
             message=f"Successfully re-parsed document: {doc.filename}",
@@ -539,6 +673,14 @@ async def reparse_document(
     except Exception as e:
         traceback.print_exc()
         db.update_document_status(document_id, "failed", error_message=str(e))
+
+        # Broadcast failed status via WebSocket
+        await manager.broadcast_status_update(
+            document_id,
+            "failed",
+            error_message=str(e)
+        )
+
         raise HTTPException(
             status_code=500,
             detail=f"Failed to parse document: {str(e)}"
@@ -661,3 +803,228 @@ async def get_document_stats(document_id: str):
         )
 
     return stats_data
+
+
+@router.get("/{document_id}/pages")
+async def get_document_pages(
+    document_id: str,
+    page_start: int = Query(..., ge=1, description="Starting page number (1-based)"),
+    page_end: int = Query(..., ge=1, description="Ending page number (1-based, inclusive)")
+):
+    """
+    Get text content from specific pages of a PDF document.
+
+    This endpoint is used by the chat service to dynamically load
+    page content instead of storing it in the tree structure.
+
+    - **document_id**: Document ID
+    - **page_start**: Starting page number (1-based)
+    - **page_end**: Ending page number (1-based, inclusive)
+
+    Returns:
+        List of pages with their text content
+    """
+    storage = get_storage()
+    db = get_db()
+
+    # Get document
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Only PDF documents support page extraction
+    if doc.file_type != "pdf":
+        raise HTTPException(
+            status_code=400,
+            detail="Page content extraction is only supported for PDF documents"
+        )
+
+    # Check if file exists
+    if not storage.file_exists(doc.file_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Uploaded file not found: {doc.file_path}"
+        )
+
+    # Get absolute file path
+    file_path = str(storage.get_upload_path(doc.file_path))
+
+    # Extract pages
+    try:
+        pages = storage.get_pdf_pages(file_path, page_start, page_end)
+        return {
+            "document_id": document_id,
+            "page_start": page_start,
+            "page_end": page_end,
+            "pages": [{"page_num": p[0], "text": p[1]} for p in pages]
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to extract pages: {str(e)}"
+        )
+
+
+# =============================================================================
+# Conversation History Endpoints
+# =============================================================================
+
+class ConversationMessage(BaseModel):
+    """Model for a conversation message."""
+    id: str
+    document_id: str
+    role: str  # 'user' or 'assistant'
+    content: str
+    created_at: str
+    sources: Optional[str] = None  # JSON string
+    debug_path: Optional[str] = None  # JSON string
+
+
+class ConversationHistory(BaseModel):
+    """Model for conversation history response."""
+    document_id: str
+    messages: List[ConversationMessage]
+    count: int
+
+
+class SaveConversationRequest(BaseModel):
+    """Model for saving a conversation message."""
+    role: str  # 'user' or 'assistant'
+    content: str
+    sources: Optional[List[Dict[str, Any]]] = None
+    debug_path: Optional[List[str]] = None
+
+
+@router.get("/{document_id}/conversations", response_model=ConversationHistory)
+async def get_conversation_history(
+    document_id: str,
+    limit: int = Query(100, description="Maximum number of messages", ge=1, le=1000)
+):
+    """
+    Get conversation history for a document.
+
+    Returns all chat messages associated with the document,
+    ordered by creation time (oldest first).
+
+    - **document_id**: Document ID
+    - **limit**: Maximum number of messages to return (default: 100)
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Get conversation history
+    messages = db.get_conversation_history(document_id, limit=limit)
+
+    return ConversationHistory(
+        document_id=document_id,
+        messages=[
+            ConversationMessage(
+                id=m.id,
+                document_id=m.document_id,
+                role=m.role,
+                content=m.content,
+                created_at=m.created_at.isoformat() if m.created_at else "",
+                sources=m.sources,
+                debug_path=m.debug_path,
+            )
+            for m in messages
+        ],
+        count=len(messages),
+    )
+
+
+@router.post("/{document_id}/conversations")
+async def save_conversation_message(
+    document_id: str,
+    request: SaveConversationRequest
+):
+    """
+    Save a conversation message for a document.
+
+    This endpoint is called after each user message or AI response
+    to maintain conversation history.
+
+    - **document_id**: Document ID
+    - **role**: Message role ('user' or 'assistant')
+    - **content**: Message content
+    - **sources**: Optional source information (for assistant messages)
+    - **debug_path**: Optional debug path for highlighting (for assistant messages)
+    """
+    import uuid
+    import json
+
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Validate role
+    if request.role not in ("user", "assistant"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role: {request.role}. Use 'user' or 'assistant'."
+        )
+
+    # Generate message ID
+    message_id = str(uuid.uuid4())
+
+    # Save message
+    db.save_conversation_message(
+        message_id=message_id,
+        document_id=document_id,
+        role=request.role,
+        content=request.content,
+        sources=request.sources,
+        debug_path=request.debug_path,
+    )
+
+    return {
+        "id": message_id,
+        "document_id": document_id,
+        "role": request.role,
+        "created": True
+    }
+
+
+@router.delete("/{document_id}/conversations")
+async def delete_conversation_history(document_id: str):
+    """
+    Delete all conversation history for a document.
+
+    Use this endpoint to clear the chat history for a document.
+
+    **This action cannot be undone.**
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Delete conversation history
+    count = db.delete_conversation_history(document_id)
+
+    return {
+        "document_id": document_id,
+        "deleted": count,
+        "message": f"Deleted {count} message(s)"
+    }

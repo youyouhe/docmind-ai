@@ -13,6 +13,7 @@ import asyncio
 import pymupdf
 from io import BytesIO
 from dotenv import load_dotenv
+from markitdown import MarkItDown
 load_dotenv()
 import logging
 import yaml
@@ -667,52 +668,112 @@ class JsonLogger:
 
 
 def list_to_tree(data):
+    import logging
+    logger = logging.getLogger("pageindex.utils")
+    logger.info(f"[LIST_TO_TREE] Converting {len(data)} flat items to tree structure")
+
     def get_parent_structure(structure):
         """Helper function to get the parent structure code"""
         if not structure:
             return None
         parts = str(structure).split('.')
         return '.'.join(parts[:-1]) if len(parts) > 1 else None
-    
+
     # First pass: Create nodes and track parent-child relationships
     nodes = {}
     root_nodes = []
-    
+
     for item in data:
         structure = item.get('structure')
+        title = item.get('title', '')[:50]
         node = {
             'title': item.get('title'),
             'start_index': item.get('start_index'),
             'end_index': item.get('end_index'),
             'nodes': []
         }
-        
+
+        logger.info(f"[LIST_TO_TREE] Creating node '{title}' (structure={structure}, pages={node['start_index']}-{node['end_index']})")
+
         nodes[structure] = node
-        
+
         # Find parent
         parent_structure = get_parent_structure(structure)
-        
+
         if parent_structure:
             # Add as child to parent if parent exists
             if parent_structure in nodes:
                 nodes[parent_structure]['nodes'].append(node)
+                logger.info(f"[LIST_TO_TREE] Added '{title}' as child of '{parent_structure}'")
             else:
                 root_nodes.append(node)
+                logger.info(f"[LIST_TO_TREE] Parent '{parent_structure}' not found yet, '{title}' is root node")
         else:
             # No parent, this is a root node
             root_nodes.append(node)
+            logger.info(f"[LIST_TO_TREE] '{title}' is root node (no parent)")
+
+    logger.info(f"[LIST_TO_TREE] Tree built with {len(root_nodes)} root nodes, starting clean_node phase...")
     
-    # Helper function to clean empty children arrays
-    def clean_node(node):
-        if not node['nodes']:
-            del node['nodes']
-        else:
+    # Helper function to clean empty children arrays and validate page ranges
+    def clean_node(node, parent_start=None, parent_end=None, depth=0):
+        import logging
+        logger = logging.getLogger("pageindex.utils")
+        title = node.get('title', '')[:50]
+        original_start = node['start_index']
+        original_end = node['end_index']
+        indent = "  " * depth
+
+        logger.info(f"{indent}[CLEAN_NODE] '{title}': BEFORE start={original_start}, end={original_end}, parent_range=({parent_start},{parent_end})")
+
+        # First, recursively process all children
+        if node.get('nodes'):
+            logger.info(f"{indent}[CLEAN_NODE] '{title}': processing {len(node['nodes'])} children...")
             for child in node['nodes']:
-                clean_node(child)
+                clean_node(child, node['start_index'], node['end_index'], depth + 1)
+
+            # After processing children, expand parent's range to cover all children
+            # This ensures: parent.start_index <= all children.start_index
+            #           parent.end_index >= all children.end_index
+            child_min_start = min(child['start_index'] for child in node['nodes'])
+            child_max_end = max(child['end_index'] for child in node['nodes'])
+
+            logger.info(f"{indent}[CLEAN_NODE] '{title}': children range = [{child_min_start}, {child_max_end}]")
+
+            node['start_index'] = min(node['start_index'], child_min_start)
+            node['end_index'] = max(node['end_index'], child_max_end)
+
+            if node['start_index'] != original_start or node['end_index'] != original_end:
+                logger.info(f"{indent}[CLEAN_NODE] '{title}': EXPANDED to cover children: [{original_start},{original_end}] -> [{node['start_index']},{node['end_index']}]")
+
+        # Option A: Parent nodes align to children (per ALGORITHM_PAGE_INDEX.md section 4)
+        # Parent nodes will expand to cover all children's ranges
+        # Children keep their original calculated ranges without clamping
+        # This prevents data loss when a child's content extends beyond parent's original range
+        if parent_start is not None and parent_end is not None:
+            # Only log if child's range exceeds parent's original range
+            # Parent will expand to cover it in the parent's own expansion step
+            if node['start_index'] < parent_start or node['end_index'] > parent_end:
+                logger.info(f"{indent}[CLEAN_NODE] '{title}': Child range [{node['start_index']},{node['end_index']}] exceeds parent's original range [{parent_start},{parent_end}]")
+                logger.info(f"{indent}[CLEAN_NODE] '{title}': Parent will expand to cover this range (Option A)")
+
+            # Ensure start_index <= end_index (basic validation)
+            if node['start_index'] > node['end_index']:
+                logger.warning(f"{indent}[CLEAN_NODE] '{title}': INVALID start > end ({node['start_index']} > {node['end_index']}), setting start to end")
+                node['start_index'] = node['end_index']
+
+        # Remove empty nodes array for leaf nodes
+        if not node.get('nodes'):
+            node.pop('nodes', None)
+
+        logger.info(f"{indent}[CLEAN_NODE] '{title}': FINAL start={node['start_index']}, end={node['end_index']}")
         return node
-    
+
     # Clean and return the tree
-    return [clean_node(node) for node in root_nodes]
+    logger.info(f"[LIST_TO_TREE] Starting clean_node phase for {len(root_nodes)} root nodes...")
+    result = [clean_node(node) for node in root_nodes]
+    logger.info(f"[LIST_TO_TREE] Tree conversion complete")
+    return result
 
 def add_preface_if_needed(data):
     if not isinstance(data, list) or not data:
@@ -729,7 +790,8 @@ def add_preface_if_needed(data):
 
 
 
-def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
+def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyMuPDF"):
+    import os
     # Handle OpenRouter format (provider/model) by extracting the model part
     # For token counting, we use a compatible encoding
     tiktoken_model = model
@@ -745,7 +807,41 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
     else:
         enc = tiktoken.encoding_for_model(tiktoken_model)
 
-    if pdf_parser == "PyPDF2":
+    if pdf_parser == "markitdown":
+        # Use Microsoft's markitdown library for better PDF table support
+        md = MarkItDown()
+        if isinstance(pdf_path, BytesIO):
+            # For BytesIO, write to temp file first
+            import tempfile
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+                tmp.write(pdf_path.getvalue())
+                tmp_path = tmp.name
+            try:
+                result = md.convert(tmp_path)
+                markdown_text = result.text_content
+            finally:
+                os.unlink(tmp_path)
+        elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
+            result = md.convert(pdf_path)
+            markdown_text = result.text_content
+        else:
+            raise ValueError(f"Invalid pdf_path for markitdown parser: {pdf_path}")
+
+        # Split markdown into pages (markitdown doesn't preserve page boundaries by default)
+        # We'll use page separators if present, otherwise treat as single page
+        page_separator = "\n\n---\n\n"  # Common markdown page separator
+        if page_separator in markdown_text:
+            pages = markdown_text.split(page_separator)
+        else:
+            # If no page separator, treat entire document as one page
+            pages = [markdown_text]
+
+        page_list = []
+        for page_text in pages:
+            token_length = len(enc.encode(page_text))
+            page_list.append((page_text, token_length))
+        return page_list
+    elif pdf_parser == "PyPDF2":
         pdf_reader = PyPDF2.PdfReader(pdf_path)
         page_list = []
         for page_num in range(len(pdf_reader.pages)):
@@ -760,11 +856,25 @@ def get_page_tokens(pdf_path, model="gpt-4o-2024-11-20", pdf_parser="PyPDF2"):
             doc = pymupdf.open(stream=pdf_stream, filetype="pdf")
         elif isinstance(pdf_path, str) and os.path.isfile(pdf_path) and pdf_path.lower().endswith(".pdf"):
             doc = pymupdf.open(pdf_path)
+
+        # Debug: save parsed content to temp directory
+        temp_dir = "temp_pdf_parse_debug"
+        os.makedirs(temp_dir, exist_ok=True)
+
         page_list = []
-        for page in doc:
-            page_text = page.get_text()
+        for i, page in enumerate(doc):
+            page_text = page.get_text("text")
             token_length = len(enc.encode(page_text))
             page_list.append((page_text, token_length))
+
+            # Save each page to temp file for debugging
+            with open(f"{temp_dir}/page_{i+1}.txt", "w", encoding="utf-8") as f:
+                f.write(f"=== Page {i+1} ===\n")
+                f.write(f"Tokens: {token_length}\n")
+                f.write(f"{'='*60}\n\n")
+                f.write(page_text)
+
+        doc.close()
         return page_list
     else:
         raise ValueError(f"Unsupported PDF parser: {pdf_parser}")
@@ -791,22 +901,78 @@ def get_number_of_pages(pdf_path):
 
 
 def post_processing(structure, end_physical_index):
-    # First convert page_number to start_index in flat list
+    """
+    Convert TOC structure to tree with proper page ranges.
+
+    Page calculation logic:
+    - start_index: Direct from TOC's physical_index (the page where chapter starts)
+    - end_index: Next chapter's start page (minus 1 if next chapter appears mid-page)
+    - If multiple chapters start on same page, they share that page range
+    """
+    import logging
+    logger = logging.getLogger("pageindex.utils")
+
+    logger.info(f"[PAGE_INDEX] post_processing: {len(structure)} items, document end page: {end_physical_index}")
+
     for i, item in enumerate(structure):
-        item['start_index'] = item.get('physical_index')
-        if i < len(structure) - 1:
-            next_physical_index = structure[i + 1].get('physical_index')
-            # Only set end_index if next_physical_index exists and is valid
-            if next_physical_index is not None and isinstance(next_physical_index, int):
-                if structure[i + 1].get('appear_start') == 'yes':
-                    item['end_index'] = next_physical_index - 1
-                else:
-                    item['end_index'] = next_physical_index
+        title = item.get('title', '')[:50]
+        physical_idx = item.get('physical_index')
+
+        # --- Calculate start_index ---
+        start_idx = physical_idx
+
+        # Validate and set start_index
+        if start_idx is None or not isinstance(start_idx, int) or start_idx < 1:
+            # Fallback: use previous item's end_index + 1, or 1 if first item
+            if i > 0:
+                prev_end = structure[i - 1].get('end_index', end_physical_index)
+                start_idx = min(prev_end + 1, end_physical_index)
+                logger.info(f"[PAGE_INDEX] Item {i} '{title}': invalid physical_index={physical_idx}, using prev_end+1={start_idx}")
             else:
-                # Fallback to end_physical_index if next physical_index is invalid
-                item['end_index'] = end_physical_index
+                start_idx = 1
+                logger.info(f"[PAGE_INDEX] Item {i} '{title}': invalid physical_index={physical_idx}, using default=1")
+        # Ensure start_index doesn't exceed end_physical_index
+        original_start = start_idx
+        start_idx = min(start_idx, end_physical_index)
+        if start_idx != original_start:
+            logger.info(f"[PAGE_INDEX] Item {i} '{title}': start_idx clamped from {original_start} to {start_idx}")
+
+        item['start_index'] = start_idx
+
+        # --- Calculate end_index ---
+        if i < len(structure) - 1:
+            next_item = structure[i + 1]
+            next_start_idx = next_item.get('physical_index')
+            next_title = next_item.get('title', '')[:50]
+
+            if next_start_idx is not None and isinstance(next_start_idx, int):
+                # Next chapter has a valid start page
+                if next_item.get('appear_start') == 'yes':
+                    # Next chapter appears mid-page, so current chapter ends before that page
+                    end_idx = next_start_idx - 1
+                    logger.info(f"[PAGE_INDEX] Item {i} '{title}': next chapter '{next_title}' appears mid-page, end_idx = next_start-1 = {end_idx}")
+                else:
+                    # Next chapter starts at the beginning of next_start_idx page
+                    end_idx = next_start_idx
+                    logger.info(f"[PAGE_INDEX] Item {i} '{title}': next chapter '{next_title}' starts at page {next_start_idx}, end_idx = {end_idx}")
+
+                # Ensure end_index >= start_index (chapters with same start page share that page)
+                if end_idx < start_idx:
+                    logger.info(f"[PAGE_INDEX] Item {i} '{title}': end_idx {end_idx} < start_idx {start_idx}, adjusting to start_idx")
+                    end_idx = start_idx
+
+                item['end_index'] = min(end_idx, end_physical_index)
+            else:
+                # Next item has invalid start page, use document end
+                item['end_index'] = max(start_idx, end_physical_index)
+                logger.info(f"[PAGE_INDEX] Item {i} '{title}': next chapter has invalid page, extending to document end {end_physical_index}")
         else:
-            item['end_index'] = end_physical_index
+            # Last item, use document end
+            item['end_index'] = max(start_idx, end_physical_index)
+            logger.info(f"[PAGE_INDEX] Item {i} '{title}': last item, extending to document end {end_physical_index}")
+
+        logger.info(f"[PAGE_INDEX] Item {i} '{title}': FINAL start={item['start_index']}, end={item['end_index']}")
+
     tree = list_to_tree(structure)
     if len(tree)!=0:
         return tree
@@ -889,15 +1055,29 @@ def convert_physical_index_to_int(data):
                 physical_index = data[i]['physical_index']
                 # Skip if None or already an int
                 if physical_index is None or isinstance(physical_index, int):
+                    # Additional validation for int values: must be positive
+                    if isinstance(physical_index, int) and physical_index <= 0:
+                        logging.warning(f"Invalid physical_index (non-positive) for '{data[i].get('title', 'Unknown')}': {physical_index}")
+                        data[i]['physical_index'] = None
                     continue
                 if isinstance(physical_index, str):
                     try:
                         if physical_index.startswith('<physical_index_'):
-                            data[i]['physical_index'] = int(physical_index.split('_')[-1].rstrip('>').strip())
+                            converted = int(physical_index.split('_')[-1].rstrip('>').strip())
                         elif physical_index.startswith('physical_index_'):
-                            data[i]['physical_index'] = int(physical_index.split('_')[-1].strip())
+                            converted = int(physical_index.split('_')[-1].strip())
+                        else:
+                            continue
+
+                        # Validate converted value is positive
+                        if converted <= 0:
+                            logging.warning(f"Invalid physical_index (non-positive) for '{data[i].get('title', 'Unknown')}': {converted}")
+                            data[i]['physical_index'] = None
+                        else:
+                            data[i]['physical_index'] = converted
                     except (ValueError, IndexError, AttributeError):
                         # If conversion fails, set to None
+                        logging.warning(f"Failed to convert physical_index for '{data[i].get('title', 'Unknown')}': {physical_index}")
                         data[i]['physical_index'] = None
     elif isinstance(data, str):
         try:
@@ -927,10 +1107,31 @@ def convert_page_to_int(data):
 
 
 def add_node_text(node, pdf_pages):
+    """
+    Add text content to nodes.
+
+    Strategy:
+    - Leaf nodes (no children): Add truncated content
+    - Parent nodes (with children): No content added (will use summary instead)
+
+    This makes the tree structure lightweight - content is only stored
+    at the leaf level as a cache. Parent nodes rely on summaries.
+    """
     if isinstance(node, dict):
-        start_page = node.get('start_index')
-        end_page = node.get('end_index')
-        node['text'] = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
+        has_children = 'nodes' in node and node['nodes']
+
+        if not has_children:
+            # Leaf node: add content (truncated)
+            start_page = node.get('start_index')
+            end_page = node.get('end_index')
+            full_text = get_text_of_pdf_pages(pdf_pages, start_page, end_page)
+            # Truncate to max 500 characters for leaf nodes
+            node['text'] = full_text[:500] if len(full_text) > 500 else full_text
+        else:
+            # Parent node: no content, will use summary instead
+            node['text'] = ""
+
+        # Recursively process children
         if 'nodes' in node:
             add_node_text(node['nodes'], pdf_pages)
     elif isinstance(node, list):

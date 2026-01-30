@@ -10,6 +10,28 @@ from .performance_monitor import get_monitor, reset_monitor
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+# Import progress callback for WebSocket updates
+try:
+    from .progress_callback import report_progress, set_document_id, get_document_id
+    PROGRESS_CALLBACK_AVAILABLE = True
+except ImportError:
+    PROGRESS_CALLBACK_AVAILABLE = False
+    # Fallback if progress_callback is not available
+    def set_document_id(document_id: str):
+        pass
+    def get_document_id() -> str:
+        return None
+
+def _report(stage: str, progress: float = None, message: str = None, metadata: dict = None):
+    """Helper function to report progress if callback is available."""
+    if PROGRESS_CALLBACK_AVAILABLE:
+        doc_id = get_document_id()
+        if doc_id:
+            try:
+                report_progress(doc_id, stage, progress, message, metadata)
+            except Exception:
+                pass  # Silently fail to avoid interrupting parsing
+
 
 ################### check title in page #########################################################
 async def check_title_appearance(item, page_list, start_index=1, model=None):
@@ -117,6 +139,7 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     # Count items to validate
     items_to_check = sum(1 for item in structure if item.get('physical_index') is not None)
     print(f"[DEBUG] check_title_appearance: Validating {items_to_check} titles...")
+    _report("toc_postprocessing", progress=50, message=f"Validating {items_to_check} section titles...")
 
     # skip items without physical_index
     for item in structure:
@@ -144,6 +167,8 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     # Debug: Show validation results
     confirmed = sum(1 for r in results if not isinstance(r, Exception) and r == 'yes')
     print(f"[DEBUG] check_title_appearance: {confirmed}/{len(results)} titles confirmed")
+    _report("toc_postprocessing", progress=55,
+           message=f"Validated {confirmed}/{len(results)} section titles")
 
     return structure
 
@@ -154,28 +179,68 @@ def toc_detector_single_page(content, model=None):
 
     Uses simplified prompt to avoid truncation issues.
     Falls back to keyword detection if LLM fails.
+    Now requires page citations for TOC detection to reduce false positives.
     """
+    import re
+
     # First, try keyword-based detection (faster and more reliable)
-    toc_keywords = ['table of contents', 'contents', 'chapter', 'section']
+    # Remove 'section' as it's too generic and causes false positives
+    # Add Chinese TOC keywords
+    toc_keywords = ['table of contents', 'contents', 'chapter', '目录', '目　录']
     content_lower = content.lower()
 
     # Check for TOC indicators
     has_multiple_headings = sum(1 for line in content_lower.split('\n') if line.strip())
     has_toc_keywords = any(keyword in content_lower for keyword in toc_keywords)
 
-    # Quick check: if we see clear TOC patterns
-    if has_toc_keywords and has_multiple_headings > 3:
+    # NEW: Also check for page citations
+    # English page references
+    english_page_pattern = r'\b(?:p|page|pp)\.?\s*\d+|\d+\s*(?:p|page|pp)\.?'
+    # Chinese page references
+    chinese_page_pattern = r'第\s*\d+\s*页|\d+\s*页'
+
+    has_page_citations = (
+        re.search(english_page_pattern, content, re.IGNORECASE) or
+        re.search(chinese_page_pattern, content)
+    )
+
+    # Quick check: if we see clear TOC patterns WITH page citations
+    if has_toc_keywords and has_multiple_headings > 3 and has_page_citations:
         return "yes"
 
-    # For ambiguous cases, use LLM with simplified prompt
-    prompt = f"""Does this page contain a table of contents?
+    # If we have TOC keywords but NO page citations, be more cautious
+    # Use LLM to verify
+    if has_toc_keywords and has_multiple_headings > 3 and not has_page_citations:
+        # Prompt that emphasizes page citations are required
+        prompt = f"""Does this page contain a table of contents with explicit page number references?
 
 Text (first 400 chars):
 {content[:400]}
 
 Answer ONLY with "yes" or "no". No explanation.
 
-Note: Abstracts, summaries, notation lists, figure lists, table lists are NOT table of contents."""
+Important: A table of contents MUST have page number references (like "Page 5", "p.12", "第3页", etc.).
+Documents with just numbered sections (1., 2., 3.) are NOT table of contents.
+Abstracts, summaries, notation lists, figure lists, table lists are NOT table of contents."""
+
+        try:
+            response = ChatGPT_API(model=model, prompt=prompt)
+            if response and isinstance(response, str):
+                response_clean = response.strip().lower()
+                if "yes" in response_clean:
+                    return "yes"
+        except Exception as e:
+            logging.warning(f"LLM toc_detector failed: {e}")
+
+    # For ambiguous cases, use LLM with simplified prompt
+    prompt = f"""Does this page contain a table of contents with explicit page number references?
+
+Text (first 400 chars):
+{content[:400]}
+
+Answer ONLY with "yes" or "no". No explanation.
+
+Note: A table of contents MUST have page number references. Abstracts, summaries, notation lists, figure lists, table lists are NOT table of contents."""
 
     try:
         response = ChatGPT_API(model=model, prompt=prompt)
@@ -338,47 +403,54 @@ def extract_toc_content(content, model=None):
 def detect_page_index(toc_content, model=None):
     print('start detect_page_index')
 
-    # First, try simple regex-based detection (faster and more reliable)
+    # Stricter detection: require explicit page reference patterns
     import re
-    page_number_pattern = r'\b(?:p|page|pp)\.?\s*\d+|\d+\s*(?:p|page|pp)\.?'
 
-    # Look for common page number patterns in TOC
-    if re.search(page_number_pattern, toc_content, re.IGNORECASE):
-        return "yes"
+    # Pattern 1: English page references (p., page, pp.) with numbers
+    english_pattern = r'\b(?:p|page|pp)\.?\s*\d+|\d+\s*(?:p|page|pp)\.?'
 
-    # Try numeric patterns like "1.", "12", etc. at end of lines
+    # Pattern 2: Chinese page references (第X页, 第X节, etc.)
+    chinese_pattern = r'第\s*\d+\s*[页章节节]|页\s*\d+|\d+\s*页'
+
+    # Pattern 3: Standard TOC format - numbers/dots at end of lines MUST have explicit indicators
+    # Count lines with explicit page references
     lines = toc_content.split('\n')
-    page_at_end_count = 0
+    lines_with_page_refs = 0
+
     for line in lines:
         line = line.strip()
-        if line:
-            # Check if line ends with a number
-            match = re.search(r'\s+(\d+|\.{3,})\s*$', line)
-            if match:
-                page_at_end_count += 1
+        if not line:
+            continue
 
-    # If more than 30% of lines end with numbers, likely has page indices
-    if page_at_end_count > len(lines) * 0.3:
+        # Check for English page reference
+        if re.search(english_pattern, line, re.IGNORECASE):
+            lines_with_page_refs += 1
+            continue
+
+        # Check for Chinese page reference
+        if re.search(chinese_pattern, line):
+            lines_with_page_refs += 1
+            continue
+
+        # Check for dots followed by number (traditional TOC format: "Title ..... 5")
+        # But ONLY if there are clear dot leaders (.....)
+        if re.search(r'\.{5,}\s*\d+\s*$', line):
+            lines_with_page_refs += 1
+            continue
+
+    # Require at least 3 lines with explicit page references AND at least 20% of non-empty lines
+    non_empty_lines = [l for l in lines if l.strip()]
+    if len(non_empty_lines) > 0:
+        page_ref_ratio = lines_with_page_refs / len(non_empty_lines)
+    else:
+        page_ref_ratio = 0
+
+    # Stricter threshold: need at least 3 explicit page references AND 20% ratio
+    if lines_with_page_refs >= 3 and page_ref_ratio >= 0.2:
+        logging.info(f"Found {lines_with_page_refs} lines with explicit page references ({page_ref_ratio*100:.1f}%)")
         return "yes"
 
-    # Fallback to LLM for ambiguous cases
-    prompt = f"""Does this table of contents contain page numbers?
-
-TOC (first 300 chars):
-{toc_content[:300]}
-
-Answer ONLY with "yes" or "no". No explanation."""
-
-    try:
-        response = ChatGPT_API(model=model, prompt=prompt)
-        if response and isinstance(response, str):
-            response_clean = response.strip().lower()
-            if "yes" in response_clean:
-                return "yes"
-    except Exception as e:
-        logging.warning(f"LLM detect_page_index failed: {e}")
-
-    # Default: no page numbers found
+    logging.info(f"Insufficient page references: {lines_with_page_refs} lines ({page_ref_ratio*100:.1f}%)")
     return "no"
 
 def toc_extractor(page_list, toc_page_list, model):
@@ -546,10 +618,11 @@ def toc_transformer(toc_content, model=None):
 
 def find_toc_pages(start_page_index, page_list, opt, logger=None):
     print('start find_toc_pages')
+    _report("toc_detection", progress=5, message="Searching for table of contents...")
     last_page_is_yes = False
     toc_page_list = []
     i = start_page_index
-    
+
     while i < len(page_list):
         # Only check beyond max_pages if we're still finding TOC pages
         if i >= opt.toc_check_page_num and not last_page_is_yes:
@@ -560,15 +633,22 @@ def find_toc_pages(start_page_index, page_list, opt, logger=None):
                 logger.info(f'Page {i} has toc')
             toc_page_list.append(i)
             last_page_is_yes = True
+            _report("toc_detection", progress=5 + (i / opt.toc_check_page_num) * 5,
+                   message=f"Found TOC on page {i + 1}")
         elif detected_result == 'no' and last_page_is_yes:
             if logger:
                 logger.info(f'Found the last page with toc: {i-1}')
             break
         i += 1
-    
-    if not toc_page_list and logger:
-        logger.info('No toc found')
-        
+
+    if not toc_page_list:
+        if logger:
+            logger.info('No toc found')
+        _report("toc_detection", progress=10, message="No table of contents found")
+    else:
+        _report("toc_detection", progress=10,
+               message=f"Found TOC on {len(toc_page_list)} page(s)")
+
     return toc_page_list
 
 def remove_page_number(data):
@@ -793,9 +873,9 @@ def remove_first_physical_index_section(text):
     return text
 
 ### add verify completeness
-def generate_toc_continue(toc_content, part, model=None):
+def generate_toc_continue(toc_content, part, model=None, custom_prompt=None):
     print('start generate_toc_continue')
-    prompt = """
+    base_prompt = """
     You are an expert in extracting hierarchical tree structure.
     You are given a tree structure of the previous part and the text of the current part.
     Your task is to continue the tree structure from the previous part to include the current part.
@@ -804,11 +884,11 @@ def generate_toc_continue(toc_content, part, model=None):
 
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X. \
-    
+    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X.
+
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {
                 "structure": <structure index, "x.x.x"> (string),
@@ -816,11 +896,15 @@ def generate_toc_continue(toc_content, part, model=None):
                 "physical_index": "<physical_index_X> (keep the format)"
             },
             ...
-        ]    
+        ]
 
     Directly return the additional part of the final JSON structure. Do not output anything else."""
 
-    prompt = prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
+    # Append custom prompt if provided
+    if custom_prompt and custom_prompt.strip():
+        base_prompt += f"\n\nAdditional Instructions:\n{custom_prompt.strip()}"
+
+    prompt = base_prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
     if finish_reason == 'finished':
         return extract_json(response)
@@ -828,33 +912,37 @@ def generate_toc_continue(toc_content, part, model=None):
         raise Exception(f'finish reason: {finish_reason}')
     
 ### add verify completeness
-def generate_toc_init(part, model=None):
+def generate_toc_init(part, model=None, custom_prompt=None):
     print('start generate_toc_init')
-    prompt = """
+    base_prompt = """
     You are an expert in extracting hierarchical tree structure, your task is to generate the tree structure of the document.
 
     The structure variable is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X. 
+    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X.
 
     For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
 
-    The response should be in the following format. 
+    The response should be in the following format.
         [
             {{
                 "structure": <structure index, "x.x.x"> (string),
                 "title": <title of the section, keep the original title>,
                 "physical_index": "<physical_index_X> (keep the format)"
             }},
-            
+
         ],
 
 
     Directly return the final JSON structure. Do not output anything else."""
 
-    prompt = prompt + '\nGiven text\n:' + part
+    # Append custom prompt if provided
+    if custom_prompt and custom_prompt.strip():
+        base_prompt += f"\n\nAdditional Instructions:\n{custom_prompt.strip()}"
+
+    prompt = base_prompt + '\nGiven text\n:' + part
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
 
     if finish_reason == 'finished':
@@ -862,8 +950,9 @@ def generate_toc_init(part, model=None):
     else:
         raise Exception(f'finish reason: {finish_reason}')
 
-def process_no_toc(page_list, start_index=1, model=None, logger=None):
+def process_no_toc(page_list, start_index=1, model=None, logger=None, custom_prompt=None):
     print(f"[DEBUG] process_no_toc: Starting auto-structure generation for {len(page_list)} pages")
+    _report("toc_processing", progress=12, message="Analyzing document structure...")
 
     page_contents=[]
     token_lengths=[]
@@ -885,13 +974,20 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None):
         tokens = count_tokens(group, model)
         print(f"[DEBUG]   Chunk {i+1}: {tokens:,} tokens")
 
+    _report("toc_processing", progress=14, message=f"Analyzing {len(group_texts)} section(s)...")
+
     print(f"[DEBUG] process_no_toc: Generating initial structure from chunk 1...")
-    toc_with_page_number= generate_toc_init(group_texts[0], model)
+    toc_with_page_number= generate_toc_init(group_texts[0], model, custom_prompt)
     print(f"[DEBUG] process_no_toc: Initial structure: {len(toc_with_page_number)} items")
 
+    # Report progress for each chunk
+    total_chunks = len(group_texts)
     for i, group_text in enumerate(group_texts[1:], start=2):
+        chunk_progress = 14 + ((i - 1) / total_chunks) * 20
+        _report("toc_processing", progress=chunk_progress,
+               message=f"Analyzing section {i}/{total_chunks}...")
         print(f"[DEBUG] process_no_toc: Extending structure with chunk {i}...")
-        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model)
+        toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, custom_prompt)
         toc_with_page_number.extend(toc_with_page_number_additional)
         print(f"[DEBUG] process_no_toc: After chunk {i}: {len(toc_with_page_number)} total items")
 
@@ -1281,7 +1377,8 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
             break
     
     # Early return if we don't have valid physical indices
-    if last_physical_index is None or last_physical_index < len(page_list)/2:
+    # Relaxed threshold from 1/2 to 1/3 to accommodate documents with large table sections
+    if last_physical_index is None or last_physical_index < len(page_list)/3:
         return 0, []
     
     # Determine which items to check
@@ -1333,25 +1430,28 @@ async def verify_toc(page_list, list_result, start_index=1, N=None, model=None):
 async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=None, start_index=1, opt=None, logger=None):
     print(mode)
     print(f'start_index: {start_index}')
-    
+
+    # Get custom_prompt from opt if available
+    custom_prompt = getattr(opt, 'custom_prompt', None) if opt else None
+
     if mode == 'process_toc_with_page_numbers':
         toc_with_page_number = process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_check_page_num=opt.toc_check_page_num, model=opt.model, logger=logger)
     elif mode == 'process_toc_no_page_numbers':
         toc_with_page_number = process_toc_no_page_numbers(toc_content, toc_page_list, page_list, model=opt.model, logger=logger)
     else:
-        toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger)
-            
-    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None] 
-    
+        toc_with_page_number = process_no_toc(page_list, start_index=start_index, model=opt.model, logger=logger, custom_prompt=custom_prompt)
+
+    toc_with_page_number = [item for item in toc_with_page_number if item.get('physical_index') is not None]
+
     toc_with_page_number = validate_and_truncate_physical_indices(
-        toc_with_page_number, 
-        len(page_list), 
-        start_index=start_index, 
+        toc_with_page_number,
+        len(page_list),
+        start_index=start_index,
         logger=logger
     )
-    
+
     accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
-        
+
     logger.info({
         'mode': 'process_toc_with_page_numbers',
         'accuracy': accuracy,
@@ -1411,6 +1511,8 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     print(f"[DEBUG] Total tokens: {sum(p[1] for p in page_list):,}")
     print(f"{'='*60}\n")
 
+    _report("tree_building", progress=11, message="Building document structure...")
+
     # Stage: TOC Detection
     check_toc_result = check_toc(page_list, opt)
     logger.info(check_toc_result)
@@ -1420,7 +1522,8 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
 
     # Stage: TOC Processing
     async with monitor.stage("toc_processing"):
-        if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result["page_index_given_in_toc"] == "yes":
+        if check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result.get("page_index_given_in_toc") == "yes":
+            _report("toc_processing", progress=12, message="Processing table of contents...")
             toc_with_page_number = await meta_processor(
                 page_list,
                 mode='process_toc_with_page_numbers',
@@ -1439,9 +1542,11 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
                 logger=logger)
 
     print(f"[DEBUG] TOC items found: {len(toc_with_page_number)}")
+    _report("toc_processing", progress=38, message=f"Found {len(toc_with_page_number)} sections")
 
     # Stage: TOC Post-processing
     async with monitor.stage("toc_postprocessing"):
+        _report("toc_postprocessing", progress=45, message="Post-processing structure...")
         toc_with_page_number = add_preface_if_needed(toc_with_page_number)
         toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
 
@@ -1449,6 +1554,8 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     valid_toc_items = [item for item in toc_with_page_number if item.get('physical_index') is not None]
     invalid_count = len(toc_with_page_number) - len(valid_toc_items)
     print(f"[DEBUG] Valid TOC items: {len(valid_toc_items)} (filtered: {invalid_count})")
+
+    _report("tree_building", progress=58, message="Building tree hierarchy...")
 
     toc_tree = post_processing(valid_toc_items, len(page_list))
 
@@ -1464,12 +1571,14 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
 
     max_depth = calculate_tree_depth(toc_tree)
     print(f"[DEBUG] Tree nodes created: {len(all_nodes)}, max depth: {max_depth}")
+    _report("tree_building", progress=59, message=f"Tree built: {len(all_nodes)} nodes, depth {max_depth}")
 
     # Stage: Large Node Processing
     async with monitor.stage("large_node_processing"):
         large_nodes = [n for n in toc_tree if n.get('end_index', 0) - n.get('start_index', 0) > opt.max_page_num_each_node]
         if large_nodes:
             print(f"[DEBUG] Large nodes to process: {len(large_nodes)} (threshold: {opt.max_page_num_each_node} pages)")
+            _report("large_node_processing", progress=60, message=f"Processing {len(large_nodes)} large section(s)...")
             for node in large_nodes:
                 pages = node.get('end_index', 0) - node.get('start_index', 0)
                 title = node.get('title', 'Unknown')[:40]
@@ -1487,6 +1596,7 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     from pageindex.utils import structure_to_list
     final_nodes = structure_to_list(toc_tree)
     print(f"[DEBUG] Final tree nodes after large node processing: {len(final_nodes)}\n")
+    _report("large_node_processing", progress=62, message=f"Final tree: {len(final_nodes)} nodes")
 
     return toc_tree
 
@@ -1506,15 +1616,9 @@ def page_index_main(doc, opt=None):
     - summary_generation: Creating node summaries
     """
     # Initialize performance monitor
-    # Don't reset if monitor already has data (called from API with existing context)
+    # Always reset for a fresh parse to avoid mixing data from previous runs
+    reset_monitor()
     monitor = get_monitor()
-    has_existing_data = (
-        monitor.metrics["llm_calls"]["total"] > 0 or
-        monitor.metrics["stages"]
-    )
-    if not has_existing_data:
-        reset_monitor()
-        monitor = get_monitor()
 
     logger = JsonLogger(doc)
 
@@ -1524,6 +1628,11 @@ def page_index_main(doc, opt=None):
     )
     if not is_valid_pdf:
         raise ValueError("Unsupported input type. Expected a PDF file path or BytesIO object.")
+
+    # Set document_id for progress callbacks (from progress_callback registry)
+    doc_id = get_document_id()
+    if doc_id:
+        _report("pdf_tokenization", progress=1, message="Reading PDF and counting tokens...")
 
     print('Parsing PDF...')
 
@@ -1536,6 +1645,9 @@ def page_index_main(doc, opt=None):
 
     logger.info({'total_page_number': len(page_list)})
     logger.info({'total_token': sum([page[1] for page in page_list])})
+
+    _report("pdf_tokenization", progress=5,
+           message=f"PDF loaded: {len(page_list)} pages, {sum([page[1] for page in page_list]):,} tokens")
 
     async def page_index_builder():
         # Stage: Tree Building (includes all TOC processing)
@@ -1552,13 +1664,19 @@ def page_index_main(doc, opt=None):
                 from pageindex.utils import structure_to_list
                 nodes_to_summarize = structure_to_list(structure)
                 print(f"[DEBUG] Generating summaries for {len(nodes_to_summarize)} nodes...")
+                _report("summary_generation", progress=63,
+                       message=f"Generating summaries for {len(nodes_to_summarize)} sections...")
 
                 if opt.if_add_node_text == 'no':
                     add_node_text(structure, page_list)
-                await generate_summaries_for_structure(structure, model=opt.model)
+
+                # Generate summaries with progress tracking
+                await _generate_summaries_with_progress(structure, model=opt.model, total_nodes=len(nodes_to_summarize))
+
                 if opt.if_add_node_text == 'no':
                     remove_structure_text(structure)
                 print(f"[DEBUG] Summary generation completed")
+                _report("summary_generation", progress=95, message="Summarization complete")
             if opt.if_add_doc_description == 'yes':
                 # Create a clean structure without unnecessary fields for description generation
                 clean_structure = create_clean_structure_for_description(structure)
@@ -1588,6 +1706,73 @@ def page_index_main(doc, opt=None):
     }
 
 
+async def _generate_summaries_with_progress(structure, model, total_nodes):
+    """Generate summaries with progress reporting."""
+    import asyncio
+    from pageindex.utils import structure_to_list
+
+    nodes = structure_to_list(structure)
+    completed = 0
+
+    async def summarize_node(node):
+        nonlocal completed
+        try:
+            await generate_summary_for_node(node, model)
+            completed += 1
+            # Report progress from 63% to 95%
+            progress = 63 + (completed / total_nodes) * 32
+            _report("summary_generation", progress,
+                   message=f"Summarized {completed}/{total_nodes} sections",
+                   metadata={"node": node.get('title', 'Unknown')[:50]})
+        except Exception as e:
+            print(f"Error summarizing node {node.get('title', 'Unknown')}: {e}")
+            completed += 1
+
+    # Summarize nodes concurrently with limit
+    tasks = []
+    semaphore = asyncio.Semaphore(10)  # Max 10 concurrent summaries
+
+    async def bounded_summarize(node):
+        async with semaphore:
+            await summarize_node(node)
+
+    for node in nodes:
+        tasks.append(bounded_summarize(node))
+
+    await asyncio.gather(*tasks)
+
+
+async def generate_summary_for_node(node, model):
+    """Generate summary for a single node."""
+    from .utils import ChatGPT_API_async
+
+    if 'text' not in node or not node['text']:
+        return
+
+    content = node['text']
+    title = node.get('title', '')
+
+    # Truncate content if too long (keep first 3000 chars)
+    if len(content) > 3000:
+        content = content[:3000]
+
+    prompt = f"""Summarize the following section from a document in 1-2 sentences.
+
+Section Title: {title}
+
+Content:
+{content}
+
+Provide a concise summary that captures the main points."""
+
+    try:
+        summary = await ChatGPT_API_async(model=model, prompt=prompt)
+        node['summary'] = summary.strip()
+    except Exception as e:
+        print(f"Error generating summary: {e}")
+        node['summary'] = ""
+
+
 def page_index(doc, model=None, toc_check_page_num=None, max_page_num_each_node=None, max_token_num_each_node=None,
                if_add_node_id=None, if_add_node_summary=None, if_add_doc_description=None, if_add_node_text=None):
     
@@ -1603,30 +1788,51 @@ def validate_and_truncate_physical_indices(toc_with_page_number, page_list_lengt
     """
     Validates and truncates physical indices that exceed the actual document length.
     This prevents errors when TOC references pages that don't exist in the document (e.g. the file is broken or incomplete).
+    Enhanced to also check for indices less than start_index.
     """
     if not toc_with_page_number:
         return toc_with_page_number
-    
+
     max_allowed_page = page_list_length + start_index - 1
     truncated_items = []
-    
+    invalid_items = []
+
     for i, item in enumerate(toc_with_page_number):
         if item.get('physical_index') is not None:
             original_index = item['physical_index']
+
+            # Check 1: Index exceeds maximum allowed page
             if original_index > max_allowed_page:
                 item['physical_index'] = None
                 truncated_items.append({
                     'title': item.get('title', 'Unknown'),
-                    'original_index': original_index
+                    'original_index': original_index,
+                    'reason': 'exceeds_max'
                 })
                 if logger:
-                    logger.info(f"Removed physical_index for '{item.get('title', 'Unknown')}' (was {original_index}, too far beyond document)")
-    
+                    logger.info(f"Removed physical_index for '{item.get('title', 'Unknown')}' (was {original_index}, exceeds max page {max_allowed_page})")
+
+            # Check 2: Index is less than start_index (invalid)
+            elif original_index < start_index:
+                item['physical_index'] = None
+                invalid_items.append({
+                    'title': item.get('title', 'Unknown'),
+                    'original_index': original_index,
+                    'reason': 'below_start'
+                })
+                if logger:
+                    logger.warning(f"Removed physical_index for '{item.get('title', 'Unknown')}' (was {original_index}, below start index {start_index})")
+
     if truncated_items and logger:
-        logger.info(f"Total removed items: {len(truncated_items)}")
-        
-    print(f"Document validation: {page_list_length} pages, max allowed index: {max_allowed_page}")
+        logger.info(f"Total removed items (exceeds max): {len(truncated_items)}")
+
+    if invalid_items and logger:
+        logger.info(f"Total removed items (below start): {len(invalid_items)}")
+
+    print(f"Document validation: {page_list_length} pages, valid range: {start_index}-{max_allowed_page}")
     if truncated_items:
-        print(f"Truncated {len(truncated_items)} TOC items that exceeded document length")
-     
+        print(f"  - Truncated {len(truncated_items)} TOC items that exceeded document length")
+    if invalid_items:
+        print(f"  - Removed {len(invalid_items)} TOC items with invalid page numbers (below start)")
+
     return toc_with_page_number

@@ -11,18 +11,38 @@ import tempfile
 import traceback
 import logging
 from typing import Optional, Literal
+from pathlib import Path
 
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# Configure logging for request debugging
+# Configure logging first
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger("pageindex.api")
+
+# Load environment variables from .env file
+try:
+    from dotenv import load_dotenv
+    # Load .env from the same directory as this script
+    env_path = Path(__file__).resolve().parent.parent / ".env"
+    logger.info(f"Loading .env from: {env_path}")
+    logger.info(f".env exists: {env_path.exists()}")
+    loaded = load_dotenv(env_path)
+    logger.info(f"load_dotenv returned: {loaded}")
+    if loaded:
+        import os
+        key_preview = os.getenv("DEEPSEEK_API_KEY", "")[:8] if os.getenv("DEEPSEEK_API_KEY") else "NOT FOUND"
+        logger.info(f"DEEPSEEK_API_KEY preview: {key_preview}...")
+    else:
+        logger.warning(f"No .env file loaded from {env_path}")
+except ImportError:
+    # python-dotenv not available, will use system environment variables
+    logger.warning("python-dotenv not available, using system environment variables")
 
 from api.models import (
     HealthResponse,
@@ -42,6 +62,17 @@ from api.services import (
 from api.database import init_database, get_db
 from api.storage import StorageService
 from api.document_routes import router as document_router, initialize_services
+
+# Initialize global storage service
+storage_service = StorageService()
+from api.websocket_routes import router as websocket_router
+
+# Import bid writing extension
+try:
+    from bid import bid_router
+    BID_EXTENSION_AVAILABLE = True
+except ImportError:
+    BID_EXTENSION_AVAILABLE = False
 
 
 # =============================================================================
@@ -85,12 +116,9 @@ async def startup_event():
     # Initialize database
     init_database()
 
-    # Initialize storage service
-    storage = StorageService()
-
     # Initialize document routes with services
     if llm_provider is not None:
-        initialize_services(llm_provider, storage)
+        initialize_services(llm_provider, storage_service)
 
 # =============================================================================
 # Request Debugging Middleware
@@ -142,6 +170,13 @@ app.add_middleware(RequestDebugMiddleware)
 # Include document management router
 app.include_router(document_router)
 
+# Include WebSocket router for real-time status updates
+app.include_router(websocket_router)
+
+# Include bid writing extension (if available)
+if BID_EXTENSION_AVAILABLE:
+    app.include_router(bid_router)
+
 
 # =============================================================================
 # Exception Handlers
@@ -185,7 +220,7 @@ async def root() -> APIInfo:
     return APIInfo(
         name="PageIndex API",
         version="0.2.0",
-        description="Vectorless, reasoning-based RAG system for document analysis",
+        description="Vectorless, reasoning-based RAG system for document analysis and bid writing",
         endpoints=[
             EndpointInfo(path="/health", method="GET", description="Health check"),
             EndpointInfo(path="/api/parse/markdown", method="POST", description="Parse Markdown document"),
@@ -198,7 +233,16 @@ async def root() -> APIInfo:
             EndpointInfo(path="/api/documents/{id}/parse", method="POST", description="Re-parse document"),
             EndpointInfo(path="/api/documents/{id}/download", method="GET", description="Download original file"),
             EndpointInfo(path="/api/documents/{id}/tree", method="GET", description="Get parsed tree structure"),
-        ],
+        ] + ([
+            EndpointInfo(path="/api/bid/projects", method="POST", description="Create bid writing project"),
+            EndpointInfo(path="/api/bid/projects", method="GET", description="List all bid projects"),
+            EndpointInfo(path="/api/bid/projects/{id}", method="GET", description="Get bid project details"),
+            EndpointInfo(path="/api/bid/projects/{id}", method="PUT", description="Update bid project"),
+            EndpointInfo(path="/api/bid/projects/{id}", method="DELETE", description="Delete bid project"),
+            EndpointInfo(path="/api/bid/projects/{id}/sections/{sid}/auto-save", method="POST", description="Auto-save section"),
+            EndpointInfo(path="/api/bid/content/generate", method="POST", description="AI generate bid content"),
+            EndpointInfo(path="/api/bid/content/rewrite", method="POST", description="AI rewrite text"),
+        ] if BID_EXTENSION_AVAILABLE else []),
     )
 
 
@@ -208,11 +252,22 @@ async def health() -> HealthResponse:
     Health check endpoint.
 
     Returns service status, version, current provider/model, and available providers.
+    Returns unhealthy if no API key is configured for the current provider.
     """
     if llm_provider is None:
         raise HTTPException(
             status_code=503,
             detail=f"LLM provider initialization failed: {provider_error}"
+        )
+
+    # Verify that the provider's API key is actually configured
+    if not llm_provider.api_key:
+        return HealthResponse(
+            status="unhealthy",
+            version="0.2.0",
+            provider=llm_provider.provider,
+            model=llm_provider.model,
+            available_providers=LLMProvider.SUPPORTED_PROVIDERS,
         )
 
     return HealthResponse(
@@ -497,6 +552,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
     - **question**: User's question to answer (required)
     - **tree**: Document tree structure from parse endpoint (required)
     - **history**: Optional conversation history for follow-up questions
+    - **document_id**: Optional document ID for loading PDF page content dynamically
     """
     if llm_provider is None:
         raise HTTPException(
@@ -505,8 +561,17 @@ async def chat(request: ChatRequest) -> ChatResponse:
         )
 
     try:
-        # Create chat service
-        chat_service = ChatService(llm_provider)
+        # Get PDF file path if document_id is provided
+        pdf_file_path = None
+        if request.document_id:
+            db = get_db()
+            doc = db.get_document(request.document_id)
+
+            if doc and doc.file_type == "pdf":
+                pdf_file_path = str(storage_service.get_upload_path(doc.file_path))
+
+        # Create chat service with PDF access
+        chat_service = ChatService(llm_provider, pdf_file_path=pdf_file_path, storage_service=storage_service)
 
         # Convert Pydantic models to dict for internal processing
         tree_dict = request.tree.model_dump()
