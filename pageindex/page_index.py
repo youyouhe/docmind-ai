@@ -748,8 +748,9 @@ def calculate_optimal_chunk_size(total_tokens, model=None):
     """
     # Model context windows (conservative estimates, leaving room for prompt/response)
     MODEL_CONTEXT = {
-        # Gemini 2.5
+        # Gemini 2.5 (1M context)
         "gemini-2.5-flash": 1000000,
+        "gemini-2.5-flash-lite": 1000000,  # Explicitly add flash-lite
         "gemini-2.5-pro": 1000000,
         "gemini-1.5": 1000000,
         # GPT-4o
@@ -774,25 +775,44 @@ def calculate_optimal_chunk_size(total_tokens, model=None):
             max_context = limit
             break
 
-    # Reserve space for prompt and response (about 30K tokens)
-    available_for_content = max_context - 30000
-
-    # Dynamic chunking strategy - smaller chunks to avoid output token limits
-    if total_tokens <= 20000:
-        # Small docs: single chunk
-        return min(total_tokens + 5000, available_for_content)
-    elif total_tokens <= 50000:
-        # Medium docs: 2-4 chunks (smaller chunks per chunk)
-        return min(total_tokens / 3 + 5000, available_for_content)
-    elif total_tokens <= 100000:
-        # Medium-large docs: more chunks
-        return min(total_tokens / 4 + 5000, available_for_content)
-    elif total_tokens <= 150000:
-        # Large docs: 5-7 chunks
-        return min(total_tokens / 5 + 5000, available_for_content)
+    # Reserve space for prompt and response
+    # For large context models (>500K), reserve more space for potential large outputs
+    if max_context >= 500000:
+        reserve = 100000  # 100K for prompt/response when context is huge
     else:
-        # Very large docs: use smaller chunks
-        return min(total_tokens / 6 + 5000, available_for_content)
+        reserve = 30000   # 30K for normal models
+    available_for_content = max_context - reserve
+
+    # Adaptive chunking strategy based on model context window
+    # Large context models (>=500K) can process much more in single chunk
+    if max_context >= 500000:
+        # For models like Gemini 2.5 with 1M context
+        # Single chunk for docs up to 200K tokens
+        if total_tokens <= 200000:
+            return min(total_tokens + 10000, available_for_content)
+        elif total_tokens <= 500000:
+            # For 200K-500K docs, use 2-3 chunks
+            return min(total_tokens / 3 + 10000, available_for_content)
+        else:
+            # For very large docs, use multiple chunks
+            return min(total_tokens / 5 + 10000, available_for_content)
+    else:
+        # For normal context models (128K-200K)
+        if total_tokens <= 20000:
+            # Small docs: single chunk
+            return min(total_tokens + 5000, available_for_content)
+        elif total_tokens <= 50000:
+            # Medium docs: more chunks with smaller size
+            return min(total_tokens / 5 + 5000, available_for_content)
+        elif total_tokens <= 100000:
+            # Medium-large docs: more chunks with smaller size
+            return min(total_tokens / 6 + 5000, available_for_content)
+        elif total_tokens <= 150000:
+            # Large docs: more chunks with smaller size
+            return min(total_tokens / 8 + 5000, available_for_content)
+        else:
+            # Very large docs: use smaller chunks
+            return min(total_tokens / 10 + 5000, available_for_content)
 
 
 def page_list_to_group_text(page_contents, token_lengths, max_tokens=200000, overlap_page=1):    
@@ -878,45 +898,83 @@ def remove_first_physical_index_section(text):
 ### add verify completeness
 def generate_toc_continue(toc_content, part, model=None, custom_prompt=None):
     print('start generate_toc_continue')
+
+    # OPTIMIZATION: Send only necessary context instead of full history
+    # 1. Recent items (for numbering context) - only last 10
+    recent_items = toc_content[-10:] if len(toc_content) > 10 else toc_content
+
+    # 2. All titles (for deduplication) - compact format
+    existing_titles = [item.get('title', '') for item in toc_content]
+    # Show first 50 and count of rest
+    if len(existing_titles) > 50:
+        titles_preview = existing_titles[:50]
+        titles_summary = f"{', '.join(titles_preview)} ... and {len(existing_titles) - 50} more"
+    else:
+        titles_summary = ', '.join(existing_titles)
+
     base_prompt = """
     You are an expert in extracting hierarchical tree structure.
-    You are given a tree structure of the previous part and the text of the current part.
-    Your task is to continue the tree structure from the previous part to include the current part.
+    Your task is to extract the structure from the CURRENT TEXT and return NEW items only.
 
-    IMPORTANT: Return ONLY the NEW structure items found in the current text. Do NOT repeat items from the previous structure.
+    IMPORTANT: Do NOT repeat items that already exist in the extracted titles list.
 
-    The structure variable is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
+    The structure variable is the numeric system which represents the index of the hierarchy section. For example: 1, 1.1, 1.2, 2, 2.1, etc.
 
-    For the title, you need to extract the original title from the text, only fix the space inconsistency.
+    For the title, extract the original title from the text, only fix spacing.
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X.
+    The provided text contains tags like <physical_index_X> to indicate page boundaries.
 
-    For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
+    For the physical_index, extract the physical index where the section starts. Keep the <physical_index_X> format.
 
-    The response should be in the following format.
+    RESPONSE FORMAT:
         [
             {
-                "structure": <structure index, "x.x.x"> (string),
-                "title": <title of the section, keep the original title>,
-                "physical_index": "<physical_index_X> (keep the format)"
+                "structure": <structure index, "x.x.x">,
+                "title": <title of the section>,
+                "physical_index": "<physical_index_X>"
             },
             ...
         ]
 
     CONSTRAINTS:
-    - Return ONLY new items from the current text
+    - Return ONLY new items from current text
     - Be concise: prefer main sections over subsections
-    - Maximum 50 new items per response
+    - Maximum 30 new items per response
     - Do not include explanations outside the JSON
 
-    Directly return the additional part of the final JSON structure. Do not output anything else."""
+    Directly return the JSON. Do not output anything else."""
 
     # Append custom prompt if provided
     if custom_prompt and custom_prompt.strip():
         base_prompt += f"\n\nAdditional Instructions:\n{custom_prompt.strip()}"
 
-    prompt = base_prompt + '\nGiven text\n:' + part + '\nPrevious tree structure\n:' + json.dumps(toc_content, indent=2)
+    # Build optimized prompt
+    prompt = f"""{base_prompt}
+
+RECENT STRUCTURE (last {len(recent_items)} items, for numbering context):
+{json.dumps(recent_items, ensure_ascii=False, indent=2)}
+
+ALREADY EXTRACTED TITLES (do not repeat these):
+{titles_summary}
+
+CURRENT TEXT TO ANALYZE:
+{part}
+"""
+
+    print(f"[DEBUG] generate_toc_continue: Sending optimized prompt")
+    print(f"[DEBUG]   - Total history items: {len(toc_content)}")
+    print(f"[DEBUG]   - Recent context items: {len(recent_items)}")
+    print(f"[DEBUG]   - Titles summary length: {len(titles_summary)} chars")
+
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
+
+    # DEBUG: Print the raw response
+    print(f"\n{'='*60}")
+    print(f"[DEBUG generate_toc_continue] finish_reason: {finish_reason}")
+    print(f"[DEBUG generate_toc_continue] response length: {len(response)} chars")
+    print(f"[DEBUG generate_toc_continue] response (first 2000 chars):\n{response[:2000]}")
+    print(f"{'='*60}\n")
+
     if finish_reason == 'finished':
         return extract_json(response)
     else:
@@ -961,6 +1019,13 @@ def generate_toc_init(part, model=None, custom_prompt=None):
     prompt = base_prompt + '\nGiven text\n:' + part
     response, finish_reason = ChatGPT_API_with_finish_reason(model=model, prompt=prompt)
 
+    # DEBUG: Print the raw response
+    print(f"\n{'='*60}")
+    print(f"[DEBUG generate_toc_init] finish_reason: {finish_reason}")
+    print(f"[DEBUG generate_toc_init] response length: {len(response)} chars")
+    print(f"[DEBUG generate_toc_init] response (first 2000 chars):\n{response[:2000]}")
+    print(f"{'='*60}\n")
+
     if finish_reason == 'finished':
          return extract_json(response)
     else:
@@ -993,6 +1058,9 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None, custom_pro
     _report("toc_processing", progress=14, message=f"Analyzing {len(group_texts)} section(s)...")
 
     print(f"[DEBUG] process_no_toc: Generating initial structure from chunk 1...")
+    # DEBUG: Print preview of input content
+    print(f"[DEBUG] process_no_toc: Input content preview (first 1000 chars):\n{group_texts[0][:1000]}")
+    print(f"[DEBUG] process_no_toc: Input content preview (last 500 chars):\n{group_texts[0][-500:]}")
     toc_with_page_number= generate_toc_init(group_texts[0], model, custom_prompt)
     print(f"[DEBUG] process_no_toc: Initial structure: {len(toc_with_page_number)} items")
 
@@ -1003,6 +1071,9 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None, custom_pro
         _report("toc_processing", progress=chunk_progress,
                message=f"Analyzing section {i}/{total_chunks}...")
         print(f"[DEBUG] process_no_toc: Extending structure with chunk {i}...")
+        # DEBUG: Print preview of input content
+        print(f"[DEBUG] process_no_toc: Chunk {i} preview (first 500 chars):\n{group_text[:500]}")
+        print(f"[DEBUG] process_no_toc: Chunk {i} preview (last 300 chars):\n{group_text[-300:]}")
         toc_with_page_number_additional = generate_toc_continue(toc_with_page_number, group_text, model, custom_prompt)
         toc_with_page_number.extend(toc_with_page_number_additional)
         print(f"[DEBUG] process_no_toc: After chunk {i}: {len(toc_with_page_number)} total items")
@@ -1400,17 +1471,27 @@ async def fix_incorrect_toc_with_retries(toc_with_page_number, page_list, incorr
     fix_attempt = 0
     current_toc = toc_with_page_number
     current_incorrect = incorrect_results
+    prev_incorrect_count = len(incorrect_results) + 1  # Initialize higher than current
 
     while current_incorrect:
-        print(f"Fixing {len(current_incorrect)} incorrect results")
-        
+        current_count = len(current_incorrect)
+        print(f"Fixing {current_count} incorrect results (attempt {fix_attempt + 1}/{max_attempts})")
+
         current_toc, current_incorrect = await fix_incorrect_toc(current_toc, page_list, current_incorrect, start_index, model, logger)
-                
+
         fix_attempt += 1
-        if fix_attempt >= max_attempts:
-            logger.info("Maximum fix attempts reached")
+
+        # Early exit: no improvement
+        new_count = len(current_incorrect) if current_incorrect else 0
+        if new_count >= current_count:
+            print(f"No improvement ({current_count} → {new_count}), stopping fix attempts")
+            logger.info(f"No improvement after {fix_attempt} attempts, stopping with {new_count} incorrect results")
             break
-    
+
+        if fix_attempt >= max_attempts:
+            logger.info(f"Maximum fix attempts reached ({max_attempts}), {new_count} incorrect results remaining")
+            break
+
     return current_toc, current_incorrect
 
 
