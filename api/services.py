@@ -448,10 +448,11 @@ class ParseService:
                 api_node["summary"] = node["summary"]
 
             # PDF-specific fields
+            # Note: PageIndex already uses 1-based indexing, so no conversion needed
             if "start_index" in node:
-                api_node["page_start"] = node["start_index"] + 1  # Convert to 1-based
+                api_node["page_start"] = node["start_index"]
             if "end_index" in node:
-                api_node["page_end"] = node["end_index"] + 1  # Convert to 1-based
+                api_node["page_end"] = node["end_index"]
 
             # Markdown-specific fields
             if "line_num" in node:
@@ -563,7 +564,9 @@ class ParseService:
         if_add_node_summary: bool = True,
         if_add_node_id: bool = True,
         if_add_node_text: bool = False,
-        llm_provider: Optional["LLMProvider"] = None
+        llm_provider: Optional["LLMProvider"] = None,
+        custom_prompt: Optional[str] = None,
+        progress_callback: Optional[Any] = None
     ) -> dict:
         """
         Parse PDF file to tree structure.
@@ -578,12 +581,15 @@ class ParseService:
             if_add_node_id: Whether to add node IDs
             if_add_node_text: Whether to add full text content
             llm_provider: LLM provider instance (for future use with PDF parsing)
+            custom_prompt: Custom prompt for TOC extraction
+            progress_callback: ProgressCallback instance for real-time updates
 
         Returns:
             PageIndex format tree structure
         """
         from pageindex import page_index_main
         from pageindex.utils import ConfigLoader
+        from pageindex.progress_callback import register_callback
 
         # Use provider's configured model if not specified
         if model is None and llm_provider is not None:
@@ -598,17 +604,67 @@ class ParseService:
             "if_add_node_id": "yes" if if_add_node_id else "no",
             "if_add_node_summary": "yes" if if_add_node_summary else "no",
             "if_add_node_text": "yes" if if_add_node_text else "no",
-            "if_add_doc_description": "no"
+            "if_add_doc_description": "no",
         }
+
+        # Add custom_prompt if provided
+        if custom_prompt:
+            user_opt["custom_prompt"] = custom_prompt
 
         # Load config using ConfigLoader
         opt = ConfigLoader().load(user_opt)
 
-        # Run the synchronous page_index_main in a thread to avoid event loop conflicts
-        # page_index_main uses asyncio.run() internally which conflicts with FastAPI
-        import asyncio
-        loop = asyncio.get_event_loop()
-        parsed_data = await loop.run_in_executor(None, lambda: page_index_main(file_path, opt=opt))
+        # Register progress callback if provided
+        document_id = None
+        if progress_callback is not None:
+            document_id = getattr(progress_callback, 'document_id', None)
+            if document_id:
+                register_callback(document_id, progress_callback)
+
+        # Create a wrapper that processes updates periodically during parsing
+        async def parse_with_updates():
+            # Run the synchronous page_index_main in a thread to avoid event loop conflicts
+            # page_index_main uses asyncio.run() internally which conflicts with FastAPI
+            import asyncio
+            loop = asyncio.get_event_loop()
+
+            # Start a background task to process progress updates
+            async def process_updates():
+                while progress_callback is not None:
+                    await progress_callback.process_updates()
+                    await asyncio.sleep(0.2)  # Process updates every 200ms
+                    # Check if parsing is done by checking if callback is disabled
+                    if not progress_callback.is_enabled():
+                        break
+
+            update_task = None
+            if progress_callback is not None and document_id:
+                update_task = asyncio.create_task(process_updates())
+
+            try:
+                parsed_data = await loop.run_in_executor(
+                    None,
+                    lambda: page_index_main(file_path, opt=opt)
+                )
+            finally:
+                if update_task:
+                    update_task.cancel()
+                    try:
+                        await update_task
+                    except asyncio.CancelledError:
+                        pass
+
+            return parsed_data
+
+        parsed_data = await parse_with_updates()
+
+        # Unregister callback and process final updates
+        if document_id:
+            from pageindex.progress_callback import unregister_callback
+            if progress_callback:
+                await progress_callback.process_updates()
+                progress_callback.disable()
+            unregister_callback(document_id)
 
         # Extract result and performance data
         # page_index_main now returns {"result": ..., "performance": ...}
@@ -633,15 +689,19 @@ class ChatService:
     Chat/Q&A service using tree search and LLM generation.
     """
 
-    def __init__(self, llm_provider: LLMProvider):
+    def __init__(self, llm_provider: LLMProvider, pdf_file_path: Optional[str] = None, storage_service: Optional["StorageService"] = None):
         """
         Initialize chat service.
 
         Args:
             llm_provider: Configured LLM provider
+            pdf_file_path: Path to the PDF file (for dynamic page content loading)
+            storage_service: Storage service instance
         """
         self.llm = llm_provider
         self.search_service = TreeSearchService(llm_provider)
+        self.pdf_file_path = pdf_file_path
+        self.storage_service = storage_service
 
     def _get_node_by_id(self, tree: dict, node_id: str) -> Optional[dict]:
         """Find a node by its ID."""
@@ -654,13 +714,39 @@ class ChatService:
         return None
 
     def _build_context_from_nodes(self, tree: dict, node_ids: List[str]) -> str:
-        """Build context string from relevant nodes."""
+        """
+        Build context string from relevant nodes.
+
+        Strategy:
+        - If pdf_file_path is available: Load actual page content dynamically
+        - Otherwise: Use stored content (truncated) or summary
+
+        This allows the tree to be lightweight while still providing
+        full content during chat.
+        """
         context_parts = []
 
         for node_id in node_ids:
             node = self._get_node_by_id(tree, node_id)
             if node:
                 title = node.get("title", "")
+
+                # Try to load actual page content if PDF is available
+                if self.pdf_file_path and self.storage_service:
+                    page_start = node.get("page_start")
+                    page_end = node.get("page_end")
+                    if page_start and page_end:
+                        try:
+                            pages = self.storage_service.get_pdf_pages(
+                                self.pdf_file_path, page_start, page_end
+                            )
+                            content = "\n\n".join([p[1] for p in pages])
+                            context_parts.append(f"# {title}\n\n{content}")
+                            continue
+                        except Exception as e:
+                            logger.warning(f"Failed to load pages for {title}: {e}")
+
+                # Fallback to stored content (truncated) or summary
                 content = node.get("content") or node.get("summary", "")
                 context_parts.append(f"# {title}\n\n{content}")
 

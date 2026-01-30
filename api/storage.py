@@ -338,6 +338,31 @@ class StorageService:
         """
         return (self.data_dir / relative_path).exists()
 
+    def get_pdf_pages(self, file_path: str, page_start: int, page_end: int) -> list:
+        """
+        Extract text content from specific pages of a PDF file.
+
+        Args:
+            file_path: Path to the PDF file
+            page_start: Starting page number (1-based)
+            page_end: Ending page number (1-based, inclusive)
+
+        Returns:
+            List of tuples (page_number, page_text)
+        """
+        import pymupdf
+
+        pages = []
+        doc = pymupdf.open(file_path)
+
+        for page_num in range(page_start - 1, min(page_end, len(doc))):
+            page = doc[page_num]
+            page_text = page.get_text("text")
+            pages.append((page_num + 1, page_text))
+
+        doc.close()
+        return pages
+
     # -------------------------------------------------------------------------
     # Cleanup
     # -------------------------------------------------------------------------

@@ -16,10 +16,11 @@ import json
 import time
 import traceback
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
 # Configure logging
 logger = logging.getLogger("pageindex.api.documents")
@@ -36,6 +37,13 @@ from api.models import (
     TreeStats,
 )
 from api.websocket_manager import manager
+
+# Import progress callback for real-time updates
+try:
+    from pageindex.progress_callback import ProgressCallback, set_document_id
+except ImportError:
+    ProgressCallback = None
+    set_document_id = None
 
 
 # =============================================================================
@@ -87,6 +95,21 @@ async def parse_document_background(
     # Import performance monitor
     from pageindex.performance_monitor import reset_monitor, get_monitor
 
+    # Create async callback for WebSocket updates
+    async def ws_callback(doc_id: str, stage: str, progress: float, metadata: dict):
+        """Async callback to send WebSocket updates."""
+        message = metadata.get("message", f"Processing: {stage}")
+        await manager.broadcast_status_update(
+            doc_id,
+            "processing",
+            progress=progress,
+            metadata={
+                "stage": stage,
+                "message": message,
+                **metadata
+            }
+        )
+
     try:
         # Clear any previous PDF performance data
         ParseService.clear_last_pdf_performance()
@@ -97,7 +120,16 @@ async def parse_document_background(
         # Broadcast status update via WebSocket
         await manager.broadcast_status_update(document_id, "processing", progress=0.0)
 
+        # Set document_id for progress callbacks
+        if set_document_id:
+            set_document_id(document_id)
+
         start_time = time.time()
+
+        # Create progress callback for real-time updates
+        progress_callback = None
+        if ProgressCallback and file_type == "pdf":
+            progress_callback = ProgressCallback(document_id, ws_callback)
 
         # Parse the document
         if file_type == "pdf":
@@ -119,14 +151,15 @@ async def parse_document_background(
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
                 custom_prompt=parse_config.get("custom_prompt"),
+                progress_callback=progress_callback,
             )
 
             # Stage 2: Building tree structure
             await manager.broadcast_status_update(
                 document_id,
                 "processing",
-                progress=60.0,
-                metadata={"stage": "Building tree structure..."}
+                progress=96.0,
+                metadata={"stage": "Finalizing tree structure..."}
             )
         else:  # markdown
             # Stage 1: Analyzing markdown structure
@@ -163,7 +196,7 @@ async def parse_document_background(
         await manager.broadcast_status_update(
             document_id,
             "processing",
-            progress=80.0,
+            progress=97.0,
             metadata={"stage": "Saving results..."}
         )
 
@@ -538,6 +571,31 @@ async def reparse_document(
     # Broadcast status update via WebSocket
     await manager.broadcast_status_update(document_id, "processing")
 
+    # Set document_id for progress callbacks
+    if set_document_id:
+        set_document_id(document_id)
+
+    # Create progress callback for real-time updates
+    progress_callback = None
+
+    # Create async callback for WebSocket updates
+    async def ws_callback(doc_id: str, stage: str, progress: float, metadata: dict):
+        """Async callback to send WebSocket updates."""
+        message = metadata.get("message", f"Processing: {stage}")
+        await manager.broadcast_status_update(
+            doc_id,
+            "processing",
+            progress=progress,
+            metadata={
+                "stage": stage,
+                "message": message,
+                **metadata
+            }
+        )
+
+    if ProgressCallback and doc.file_type == "pdf":
+        progress_callback = ProgressCallback(document_id, ws_callback)
+
     try:
         start_time = time.time()
 
@@ -553,6 +611,7 @@ async def reparse_document(
                 if_add_node_id=parse_config.get("if_add_node_id", True),
                 if_add_node_text=parse_config.get("if_add_node_text", False),
                 custom_prompt=custom_prompt,
+                progress_callback=progress_callback,
             )
         else:  # markdown
             page_index_tree = await ParseService.parse_markdown(
@@ -807,3 +866,165 @@ async def get_document_pages(
             status_code=500,
             detail=f"Failed to extract pages: {str(e)}"
         )
+
+
+# =============================================================================
+# Conversation History Endpoints
+# =============================================================================
+
+class ConversationMessage(BaseModel):
+    """Model for a conversation message."""
+    id: str
+    document_id: str
+    role: str  # 'user' or 'assistant'
+    content: str
+    created_at: str
+    sources: Optional[str] = None  # JSON string
+    debug_path: Optional[str] = None  # JSON string
+
+
+class ConversationHistory(BaseModel):
+    """Model for conversation history response."""
+    document_id: str
+    messages: List[ConversationMessage]
+    count: int
+
+
+class SaveConversationRequest(BaseModel):
+    """Model for saving a conversation message."""
+    role: str  # 'user' or 'assistant'
+    content: str
+    sources: Optional[List[Dict[str, Any]]] = None
+    debug_path: Optional[List[str]] = None
+
+
+@router.get("/{document_id}/conversations", response_model=ConversationHistory)
+async def get_conversation_history(
+    document_id: str,
+    limit: int = Query(100, description="Maximum number of messages", ge=1, le=1000)
+):
+    """
+    Get conversation history for a document.
+
+    Returns all chat messages associated with the document,
+    ordered by creation time (oldest first).
+
+    - **document_id**: Document ID
+    - **limit**: Maximum number of messages to return (default: 100)
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Get conversation history
+    messages = db.get_conversation_history(document_id, limit=limit)
+
+    return ConversationHistory(
+        document_id=document_id,
+        messages=[
+            ConversationMessage(
+                id=m.id,
+                document_id=m.document_id,
+                role=m.role,
+                content=m.content,
+                created_at=m.created_at.isoformat() if m.created_at else "",
+                sources=m.sources,
+                debug_path=m.debug_path,
+            )
+            for m in messages
+        ],
+        count=len(messages),
+    )
+
+
+@router.post("/{document_id}/conversations")
+async def save_conversation_message(
+    document_id: str,
+    request: SaveConversationRequest
+):
+    """
+    Save a conversation message for a document.
+
+    This endpoint is called after each user message or AI response
+    to maintain conversation history.
+
+    - **document_id**: Document ID
+    - **role**: Message role ('user' or 'assistant')
+    - **content**: Message content
+    - **sources**: Optional source information (for assistant messages)
+    - **debug_path**: Optional debug path for highlighting (for assistant messages)
+    """
+    import uuid
+    import json
+
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Validate role
+    if request.role not in ("user", "assistant"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role: {request.role}. Use 'user' or 'assistant'."
+        )
+
+    # Generate message ID
+    message_id = str(uuid.uuid4())
+
+    # Save message
+    db.save_conversation_message(
+        message_id=message_id,
+        document_id=document_id,
+        role=request.role,
+        content=request.content,
+        sources=request.sources,
+        debug_path=request.debug_path,
+    )
+
+    return {
+        "id": message_id,
+        "document_id": document_id,
+        "role": request.role,
+        "created": True
+    }
+
+
+@router.delete("/{document_id}/conversations")
+async def delete_conversation_history(document_id: str):
+    """
+    Delete all conversation history for a document.
+
+    Use this endpoint to clear the chat history for a document.
+
+    **This action cannot be undone.**
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Delete conversation history
+    count = db.delete_conversation_history(document_id)
+
+    return {
+        "document_id": document_id,
+        "deleted": count,
+        "message": f"Deleted {count} message(s)"
+    }

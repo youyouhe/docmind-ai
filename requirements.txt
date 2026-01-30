@@ -1,6 +1,22 @@
+# ========== LLM & API ==========
 openai==1.101.0
-pymupdf==1.26.4
+
+# ========== PDF Parsing ==========
+markitdown[pdf]>=0.0.1
+pymupdf>=1.24.0
 PyPDF2==3.0.1
+
+# ========== Web Framework ==========
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-multipart>=0.0.6
+
+# ========== Database ==========
+sqlalchemy>=2.0.0
+aiofiles>=23.0.0
+
+# ========== Utilities ==========
 python-dotenv==1.1.0
 tiktoken==0.11.0
 pyyaml==6.0.2
+requests>=2.31.0
