@@ -1042,7 +1042,6 @@ async def categorize_document(
     Query Parameters:
     - force: Re-categorize even if already has category (default: false)
     """
-    from api.services import get_llm_provider
     from api.database import get_db
     from api.storage import get_storage
 
