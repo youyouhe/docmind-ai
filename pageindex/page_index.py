@@ -777,19 +777,22 @@ def calculate_optimal_chunk_size(total_tokens, model=None):
     # Reserve space for prompt and response (about 30K tokens)
     available_for_content = max_context - 30000
 
-    # Dynamic chunking strategy
-    if total_tokens <= 50000:
+    # Dynamic chunking strategy - smaller chunks to avoid output token limits
+    if total_tokens <= 20000:
         # Small docs: single chunk
         return min(total_tokens + 5000, available_for_content)
+    elif total_tokens <= 50000:
+        # Medium docs: 2-4 chunks (smaller chunks per chunk)
+        return min(total_tokens / 3 + 5000, available_for_content)
     elif total_tokens <= 100000:
-        # Medium docs: 2-3 chunks
-        return min(total_tokens / 2 + 10000, available_for_content)
+        # Medium-large docs: more chunks
+        return min(total_tokens / 4 + 5000, available_for_content)
     elif total_tokens <= 150000:
-        # Large docs: 3-5 chunks
-        return min(total_tokens / 3 + 10000, available_for_content)
+        # Large docs: 5-7 chunks
+        return min(total_tokens / 5 + 5000, available_for_content)
     else:
-        # Very large docs: use max capacity
-        return available_for_content
+        # Very large docs: use smaller chunks
+        return min(total_tokens / 6 + 5000, available_for_content)
 
 
 def page_list_to_group_text(page_contents, token_lengths, max_tokens=200000, overlap_page=1):    
@@ -880,6 +883,8 @@ def generate_toc_continue(toc_content, part, model=None, custom_prompt=None):
     You are given a tree structure of the previous part and the text of the current part.
     Your task is to continue the tree structure from the previous part to include the current part.
 
+    IMPORTANT: Return ONLY the NEW structure items found in the current text. Do NOT repeat items from the previous structure.
+
     The structure variable is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
     For the title, you need to extract the original title from the text, only fix the space inconsistency.
@@ -897,6 +902,12 @@ def generate_toc_continue(toc_content, part, model=None, custom_prompt=None):
             },
             ...
         ]
+
+    CONSTRAINTS:
+    - Return ONLY new items from the current text
+    - Be concise: prefer main sections over subsections
+    - Maximum 50 new items per response
+    - Do not include explanations outside the JSON
 
     Directly return the additional part of the final JSON structure. Do not output anything else."""
 
@@ -935,6 +946,11 @@ def generate_toc_init(part, model=None, custom_prompt=None):
 
         ],
 
+    CONSTRAINTS:
+    - Be concise: extract main sections and important subsections only
+    - Prefer fewer, more meaningful sections over many trivial ones
+    - Do not create sections for every minor heading
+    - Maximum 80 items total
 
     Directly return the final JSON structure. Do not output anything else."""
 
@@ -1192,38 +1208,72 @@ def check_toc(page_list, opt=None):
 
 ################### fix incorrect toc #########################################################
 def single_toc_item_index_fixer(section_title, content, model=None):
-    tob_extractor_prompt = """
-    You are given a section title and several pages of a document, your job is to find the physical index of the start page of the section in the partial document.
+    # Detect if using gemini model (which tends to over-generate)
+    is_gemini = model and 'gemini' in model.lower()
 
-    The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
+    if is_gemini:
+        # For gemini: simpler prompt without thinking field to avoid over-generation
+        tob_extractor_prompt = """
+        You are given a section title and several pages of a document, your job is to find the physical index of the start page of the section.
 
-    Reply in a JSON format:
-    {
-        "thinking": <explain which page, started and closed by <physical_index_X>, contains the start of this section>,
-        "physical_index": "<physical_index_X>" (keep the format)
-    }
-    Directly return the final JSON structure. Do not output anything else."""
+        The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
 
-    prompt = tob_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
-    response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)
+        Reply in a JSON format:
+        {
+            "physical_index": "<physical_index_X>"
+        }
 
-    # Handle JSON extraction failure
-    if json_content is None:
-        logging.error(f"Failed to extract JSON from LLM response in single_toc_item_index_fixer")
-        logging.error(f"LLM Response: {response[:500]}...")
-        return None
+        Directly return the final JSON structure. Do not output anything else."""
+    else:
+        # For other models: include thinking field
+        tob_extractor_prompt = """
+        You are given a section title and several pages of a document, your job is to find the physical index of the start page of the section in the partial document.
 
-    # Handle missing 'physical_index' key
-    if not isinstance(json_content, dict):
-        logging.error(f"Extracted content is not a dict in single_toc_item_index_fixer: {type(json_content)}")
-        return None
+        The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
 
-    if 'physical_index' not in json_content:
-        logging.error(f"'physical_index' key not found in JSON: {json_content}")
-        return None
+        Reply in a JSON format:
+        {
+            "thinking": <brief explanation of which page contains the section start, max 50 words>,
+            "physical_index": "<physical_index_X>" (keep the format)
+        }
 
-    return convert_physical_index_to_int(json_content['physical_index'])
+        CONSTRAINTS:
+        - Keep "thinking" field brief and concise (under 50 words)
+        - Focus on the result, not detailed reasoning
+        - Ensure JSON is properly formatted and complete
+
+        Directly return the final JSON structure. Do not output anything else."""
+
+    max_retries = 3
+    for attempt in range(max_retries):
+        prompt = tob_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
+        response = ChatGPT_API(model=model, prompt=prompt)
+        json_content = extract_json(response)
+
+        # Success case
+        if json_content is not None:
+            # Handle missing 'physical_index' key
+            if not isinstance(json_content, dict):
+                logging.error(f"Extracted content is not a dict in single_toc_item_index_fixer: {type(json_content)}")
+                if attempt < max_retries - 1:
+                    continue
+                return None
+
+            if 'physical_index' not in json_content:
+                logging.error(f"'physical_index' key not found in JSON: {json_content}")
+                if attempt < max_retries - 1:
+                    continue
+                return None
+
+            return convert_physical_index_to_int(json_content['physical_index'])
+
+        # JSON extraction failed - log and retry
+        logging.warning(f"Failed to extract JSON from LLM response in single_toc_item_index_fixer (attempt {attempt + 1}/{max_retries})")
+        logging.warning(f"LLM Response: {response[:500]}...")
+
+    # All retries failed
+    logging.error(f"Failed to extract JSON from LLM response in single_toc_item_index_fixer after {max_retries} attempts")
+    return None
 
 
 

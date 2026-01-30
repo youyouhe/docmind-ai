@@ -47,7 +47,7 @@ PROVIDER_CONFIG = {
         "api_key_env": "OPENROUTER_API_KEY",
         "base_url": "https://openrouter.ai/api/v1",
         "default_model": "deepseek/deepseek-chat",
-        "max_tokens": 8192  # Conservative limit, varies by model
+        "max_tokens": 524288  # 512k for gemini-2.5-flash-lite and similar models
     },
     "zhipu": {
         "api_key_env": "ZHIPU_API_KEY",
