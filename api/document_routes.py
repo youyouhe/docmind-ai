@@ -1043,7 +1043,6 @@ async def categorize_document(
     - force: Re-categorize even if already has category (default: false)
     """
     from api.database import get_db
-    from api.storage import get_storage
 
     llm = get_llm_provider()
     storage = get_storage()
