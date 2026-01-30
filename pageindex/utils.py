@@ -875,10 +875,25 @@ def post_processing(structure, end_physical_index):
         item['start_index'] = start_idx
 
         if i < len(structure) - 1:
-            next_physical_index = structure[i + 1].get('physical_index')
-            # Only set end_index if next_physical_index exists and is valid
-            if next_physical_index is not None and isinstance(next_physical_index, int):
-                if structure[i + 1].get('appear_start') == 'yes':
+            # Find the next item with a different physical_index
+            j = i + 1
+            next_physical_index = None
+            next_appear_start = None
+
+            while j < len(structure):
+                candidate_physical = structure[j].get('physical_index')
+                if candidate_physical is not None and isinstance(candidate_physical, int):
+                    if candidate_physical != start_idx:
+                        # Found a different physical_index
+                        next_physical_index = candidate_physical
+                        next_appear_start = structure[j].get('appear_start')
+                        break
+                    # Same physical_index, keep looking
+                j += 1
+
+            # Set end_index based on found next_physical_index or use default
+            if next_physical_index is not None:
+                if next_appear_start == 'yes':
                     end_idx = next_physical_index - 1
                 else:
                     end_idx = next_physical_index
@@ -886,9 +901,10 @@ def post_processing(structure, end_physical_index):
                 end_idx = max(end_idx, start_idx)
                 item['end_index'] = min(end_idx, end_physical_index)
             else:
-                # Fallback to end_physical_index if next physical_index is invalid
+                # No more items with different physical_index, use end_physical_index
                 item['end_index'] = max(start_idx, end_physical_index)
         else:
+            # Last item
             item['end_index'] = max(start_idx, end_physical_index)
     tree = list_to_tree(structure)
     if len(tree)!=0:
