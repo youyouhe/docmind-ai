@@ -224,6 +224,8 @@ class DatabaseManager:
         from sqlalchemy import inspect, text
 
         with self.engine.connect() as conn:
+            inspector = inspect(conn)
+
             # Migration for documents table
             doc_columns = [col['name'] for col in inspector.get_columns('documents')]
 
