@@ -36,8 +36,14 @@ try:
     logger.info(f"load_dotenv returned: {loaded}")
     if loaded:
         import os
-        key_preview = os.getenv("DEEPSEEK_API_KEY", "")[:8] if os.getenv("DEEPSEEK_API_KEY") else "NOT FOUND"
-        logger.info(f"DEEPSEEK_API_KEY preview: {key_preview}...")
+        # Check the API key for the configured provider
+        provider = os.getenv("LLM_PROVIDER", "deepseek")
+        model = os.getenv("LLM_MODEL", "")
+        key_env = f"{provider.upper()}_API_KEY"
+        api_key = os.getenv(key_env, "")
+        key_preview = api_key[:8] + "***" if api_key else "NOT FOUND"
+        model_info = f", LLM_MODEL={model}" if model else ""
+        logger.info(f"LLM_PROVIDER={provider}, {key_env}: {key_preview}{model_info}")
     else:
         logger.warning(f"No .env file loaded from {env_path}")
 except ImportError:
@@ -84,9 +90,13 @@ LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
 LLM_API_KEY = os.getenv(f"{LLM_PROVIDER.upper()}_API_KEY")
 LLM_MODEL = os.getenv("LLM_MODEL", None)
 
+# Debug logging
+logger.info(f"Config: LLM_PROVIDER={LLM_PROVIDER}, LLM_MODEL={repr(LLM_MODEL)}")
+
 # Create LLM provider instance
 try:
     llm_provider = LLMProvider(provider=LLM_PROVIDER, api_key=LLM_API_KEY, model=LLM_MODEL)
+    logger.info(f"LLMProvider initialized: provider={llm_provider.provider}, model={llm_provider.model}")
 except ValueError as e:
     # If provider initialization fails, we'll handle it in endpoints
     llm_provider = None
@@ -254,6 +264,8 @@ async def health() -> HealthResponse:
     Returns service status, version, current provider/model, and available providers.
     Returns unhealthy if no API key is configured for the current provider.
     """
+    logger.info(f"/health called: llm_provider.model={llm_provider.model if llm_provider else None}")
+
     if llm_provider is None:
         raise HTTPException(
             status_code=503,
@@ -295,6 +307,25 @@ async def provider_health(provider: str = None) -> dict:
         "google": "gemini",
     }
 
+    # Get the actual model from environment or current provider
+    def get_actual_model(target_provider: str) -> str:
+        # If this is the current active provider, use its model
+        if llm_provider and llm_provider.provider == target_provider:
+            return llm_provider.model
+
+        # Check LLM_MODEL environment variable
+        llm_model = os.getenv("LLM_MODEL", "")
+        if llm_model:
+            # For openrouter: any model with "/" uses openrouter
+            if target_provider == "openrouter" and "/" in llm_model:
+                return llm_model
+            # For other providers: check if model name contains provider name
+            if target_provider in llm_model.lower():
+                return llm_model
+
+        # Fall back to default model from config
+        return PROVIDER_CONFIG[target_provider]["default_model"]
+
     if provider:
         # Normalize provider name using alias map
         provider = provider_alias_map.get(provider, provider)
@@ -313,7 +344,7 @@ async def provider_health(provider: str = None) -> dict:
         return {
             "provider": provider,
             "configured": is_configured,
-            "default_model": config["default_model"],
+            "default_model": get_actual_model(provider),
             "base_url": config["base_url"],
         }
     else:
@@ -323,7 +354,7 @@ async def provider_health(provider: str = None) -> dict:
             api_key = os.getenv(prov_config["api_key_env"])
             providers_info[prov_name] = {
                 "configured": bool(api_key),
-                "default_model": prov_config["default_model"],
+                "default_model": get_actual_model(prov_name),
                 "base_url": prov_config["base_url"],
             }
 
@@ -584,7 +615,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             question=request.question,
             tree=tree_dict,
             history=history_dict,
-            max_source_nodes=3,
+            max_source_nodes=8,
         )
 
         return ChatResponse(**result)

@@ -225,7 +225,8 @@ class TreeSearchService:
         self,
         question: str,
         tree: dict,
-        max_nodes: int = 5
+        max_nodes: int = 8,
+        is_list_question: bool = False
     ) -> Dict[str, Any]:
         """
         Search for relevant nodes based on question.
@@ -234,6 +235,7 @@ class TreeSearchService:
             question: User's question
             tree: Document tree structure
             max_nodes: Maximum number of nodes to return
+            is_list_question: Whether this is a list/enumeration question
 
         Returns:
             Dictionary with thinking, node_ids, and path information
@@ -241,8 +243,32 @@ class TreeSearchService:
         # Flatten tree for search
         flat_tree = self._flatten_tree_for_search(tree)
 
-        # Build LLM prompt
-        prompt = f"""You are a document search assistant. Your task is to find the most relevant sections in a document tree based on a user's question.
+        # Build LLM prompt with list question awareness
+        if is_list_question:
+            prompt = f"""You are a document search assistant. Your task is to find ALL relevant sections in a document tree based on a user's question.
+
+User Question: {question}
+
+Document Tree Structure:
+{json.dumps(flat_tree, ensure_ascii=False, indent=2)}
+
+IMPORTANT: This is a LIST question. The user wants a COMPLETE enumeration.
+Instructions:
+1. Analyze the question and understand what complete list is being requested
+2. Examine the document tree structure (titles and summaries)
+3. Select ALL nodes that are relevant to the question (up to {max_nodes} nodes)
+4. Do NOT truncate - include all matching items for a complete list
+5. Return your reasoning and the selected node IDs
+
+Response Format (JSON):
+{{
+    "thinking": "Your thought process explaining why you selected these nodes",
+    "node_ids": ["id1", "id2", ...]
+}}
+
+Respond only with valid JSON, no additional text."""
+        else:
+            prompt = f"""You are a document search assistant. Your task is to find the most relevant sections in a document tree based on a user's question.
 
 User Question: {question}
 
@@ -752,12 +778,28 @@ class ChatService:
 
         return "\n\n---\n\n".join(context_parts)
 
+    def _is_list_question(self, question: str) -> bool:
+        """
+        Detect if the question is asking for a list/complete enumeration.
+
+        List questions typically contain keywords like:
+        - 列出, 列表, 所有, 全部, 多少, 有哪些
+        - list, all, every, what are, how many
+        """
+        list_keywords = [
+            "列出", "列表", "采购清单", "所有", "全部", "都有哪些", "有哪些",
+            "多少", "几个", "几项", "包含", "包括",
+            "list", "all", "every", "what are", "how many", "enumerate"
+        ]
+        question_lower = question.lower()
+        return any(keyword in question or keyword.lower() in question_lower for keyword in list_keywords)
+
     async def answer_question(
         self,
         question: str,
         tree: dict,
         history: Optional[List[dict]] = None,
-        max_source_nodes: int = 3
+        max_source_nodes: int = 8
     ) -> dict:
         """
         Answer a question based on document tree.
@@ -773,11 +815,15 @@ class ChatService:
         """
         history = history or []
 
-        # Search for relevant nodes
+        # Detect if this is a list question
+        is_list_question = self._is_list_question(question)
+
+        # Search for relevant nodes (with list question awareness)
         search_result = await self.search_service.search_nodes(
             question=question,
             tree=tree,
-            max_nodes=max_source_nodes
+            max_nodes=max_source_nodes,
+            is_list_question=is_list_question
         )
 
         node_ids = search_result.get("node_ids", [])
