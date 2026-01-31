@@ -1,0 +1,117 @@
+{
+  "document_id": "c5539fe0",
+  "timestamp": "20260131_194625",
+  "stages": {
+    "initialization": [
+      {
+        "timestamp": "0.00s",
+        "message": "Starting parsing: 15 pages, 7,576 tokens",
+        "data": {
+          "total_pages": 15,
+          "total_tokens": 7576
+        }
+      }
+    ],
+    "toc_detection": [
+      {
+        "timestamp": "30.19s",
+        "message": "No TOC detected - will auto-generate structure",
+        "data": {
+          "total_pages": 15,
+          "has_toc": false,
+          "toc_pages": [
+            1
+          ],
+          "has_page_numbers": false,
+          "toc_content_length": 544
+        }
+      }
+    ],
+    "structure_extraction": [
+      {
+        "timestamp": "49.49s",
+        "message": "Extracted 14 structure items using mode: process_no_toc",
+        "data": {
+          "mode": "process_no_toc",
+          "total_items": 14,
+          "items_with_page": 14,
+          "items_without_page": 0,
+          "sample_items": [
+            {
+              "structure": "1",
+              "title": "Introduction",
+              "physical_index": 3,
+              "appear_start": "yes",
+              "start_index": 3,
+              "end_index": 3
+            },
+            {
+              "structure": "2",
+              "title": "Data Guard Asynchronous Transport – an Overview",
+              "physical_index": 4,
+              "appear_start": "yes",
+              "start_index": 4,
+              "end_index": 4
+            },
+            {
+              "structure": "2.1",
+              "title": "Asynchronous Transport Architecture",
+              "physical_index": 4,
+              "appear_start": "yes",
+              "start_index": 4,
+              "end_index": 4
+            },
+            {
+              "structure": "3",
+              "title": "Configuration Best Practices",
+              "physical_index": 5,
+              "appear_start": "yes",
+              "start_index": 5,
+              "end_index": 5
+            },
+            {
+              "structure": "3.1",
+              "title": "Set TCP Socket Buffer Size to 3 x BDP",
+              "physical_index": 5,
+              "appear_start": "yes",
+              "start_index": 5,
+              "end_index": 5
+            }
+          ],
+          "structure_distribution": {
+            "1": 7,
+            "2": 7
+          }
+        }
+      }
+    ],
+    "title_validation": [
+      {
+        "timestamp": "50.93s",
+        "message": "Title validation: 14/14 titles confirmed (100.0%)",
+        "data": {
+          "total_validated": 14,
+          "confirmed": 14,
+          "rejected": 0,
+          "confirmation_rate": "100.0%"
+        }
+      }
+    ],
+    "tree_building": [
+      {
+        "timestamp": "50.96s",
+        "message": "Tree built: 14 nodes, depth 1",
+        "data": {
+          "total_nodes": 14,
+          "max_depth": 1,
+          "total_pages": 15,
+          "avg_pages_per_node": 1.5,
+          "min_pages": 1,
+          "max_pages": 4,
+          "content_issues_count": 0
+        }
+      }
+    ]
+  },
+  "total_time": "50.96s"
+}

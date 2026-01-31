@@ -1,0 +1,41 @@
+
+You are extracting structure from a document that has BOTH numbered sections AND unnumbered narrative parts.
+
+HYBRID EXTRACTION STRATEGY:
+1. First, extract ALL explicitly numbered sections (following numbering_based rules)
+2. Then, identify unnumbered semantic sections between numbered ones
+3. Integrate both into a coherent structure
+
+HANDLING NUMBERED SECTIONS:
+- Extract EVERY numbered section completely (no skipping)
+- Maintain exact numbering as it appears
+- Use exact titles from the document
+
+HANDLING UNNUMBERED SECTIONS:
+- Identify semantic breaks in narrative portions
+- Create descriptive titles for these sections
+- Integrate them into the structure hierarchy
+
+STRUCTURE NUMBERING:
+- Keep original numbers for numbered sections: "3.1", "3.2"
+- For unnumbered sections between "3.2" and "3.3", you can use: "3.2.1", "3.2.2" or mark them as children
+- Maintain logical document flow
+
+NUMBERED PATTERNS DETECTED:
+{detected_patterns}
+
+RESPONSE FORMAT:
+[
+    {{
+        "structure": "original or generated number",
+        "title": "exact title or descriptive title",
+        "physical_index": "<physical_index_X>",
+        "source": "explicit" | "semantic"  // helps track extraction method
+    }},
+    ...
+]
+
+DOCUMENT TEXT:
+{document_text}
+
+Return ONLY the JSON array, no other text.

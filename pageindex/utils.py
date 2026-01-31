@@ -407,6 +407,306 @@ def extract_json(content):
         return None
 
 
+# ============================================================================
+# Enhanced JSON Parsing (v2.0.0 Accuracy Improvements)
+# ============================================================================
+
+def validate_json_schema(data, schema_type='toc'):
+    """
+    Validate JSON data against expected schema.
+    
+    Args:
+        data: Parsed JSON data to validate
+        schema_type: Type of schema - 'toc', 'title_check', 'appear_start'
+    
+    Returns:
+        bool: True if data matches expected schema
+    """
+    import re
+    
+    if schema_type == 'toc':
+        # TOC schema: list of dicts with structure, title, physical_index
+        if not isinstance(data, list):
+            return False
+        
+        required_keys = {'structure', 'title', 'physical_index'}
+        for item in data:
+            if not isinstance(item, dict):
+                return False
+            if not required_keys.issubset(item.keys()):
+                return False
+            # Validate physical_index format
+            physical_idx = str(item.get('physical_index', ''))
+            if not re.match(r'<physical_index_\d+>', physical_idx):
+                return False
+        return True
+    
+    elif schema_type == 'title_check':
+        # Title check schema: dict with 'appear_start' key
+        if not isinstance(data, dict):
+            return False
+        return 'appear_start' in data
+    
+    elif schema_type == 'appear_start':
+        # Appear start schema: list of dicts with 'start' and 'start_index'
+        if not isinstance(data, list):
+            return False
+        for item in data:
+            if not isinstance(item, dict):
+                return False
+            if 'start' not in item or 'start_index' not in item:
+                return False
+        return True
+    
+    # Unknown schema type
+    return False
+
+
+def extract_json_markdown_block(content):
+    """
+    Extract JSON from markdown code blocks (```json ... ```).
+    
+    Args:
+        content: Raw text content
+    
+    Returns:
+        dict or list: Parsed JSON, or None if extraction fails
+    """
+    try:
+        # Try to find ```json ... ``` block
+        start_idx = content.find("```json")
+        if start_idx != -1:
+            start_idx += 7  # Skip past ```json
+            end_idx = content.find("```", start_idx)
+            if end_idx != -1:
+                json_str = content[start_idx:end_idx].strip()
+                # Clean up
+                json_str = json_str.replace('None', 'null')
+                return json.loads(json_str)
+        
+        # Try ``` without json marker
+        start_idx = content.find("```")
+        if start_idx != -1:
+            start_idx += 3
+            end_idx = content.find("```", start_idx)
+            if end_idx != -1:
+                json_str = content[start_idx:end_idx].strip()
+                json_str = json_str.replace('None', 'null')
+                return json.loads(json_str)
+        
+        return None
+    except Exception as e:
+        logging.debug(f"Markdown block extraction failed: {e}")
+        return None
+
+
+def extract_json_bracket_matching(content):
+    """
+    Extract JSON by finding matching brackets/braces.
+    Handles both objects {...} and arrays [...].
+    
+    Args:
+        content: Raw text content
+    
+    Returns:
+        dict or list: Parsed JSON, or None if extraction fails
+    """
+    def find_matching_bracket(text, start_char, end_char):
+        """Find matching bracket starting from first occurrence of start_char."""
+        start_idx = text.find(start_char)
+        if start_idx == -1:
+            return None
+        
+        count = 0
+        in_string = False
+        escape_next = False
+        
+        for i in range(start_idx, len(text)):
+            char = text[i]
+            
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if char == '\\':
+                escape_next = True
+                continue
+            
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if not in_string:
+                if char == start_char:
+                    count += 1
+                elif char == end_char:
+                    count -= 1
+                    if count == 0:
+                        return text[start_idx:i+1]
+        
+        return None
+    
+    try:
+        # Try to find JSON array [...] first (more common for TOC)
+        json_str = find_matching_bracket(content, '[', ']')
+        if json_str:
+            json_str = json_str.replace('None', 'null')
+            return json.loads(json_str)
+        
+        # Try to find JSON object {...}
+        json_str = find_matching_bracket(content, '{', '}')
+        if json_str:
+            json_str = json_str.replace('None', 'null')
+            return json.loads(json_str)
+        
+        return None
+    except Exception as e:
+        logging.debug(f"Bracket matching extraction failed: {e}")
+        return None
+
+
+def extract_json_regex_patterns(content):
+    """
+    Extract JSON using regex patterns as fallback.
+    
+    Args:
+        content: Raw text content
+    
+    Returns:
+        dict or list: Parsed JSON, or None if extraction fails
+    """
+    import re
+    
+    try:
+        # Pattern 1: JSON in code fence with optional language marker
+        pattern1 = r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```'
+        match = re.search(pattern1, content, re.DOTALL)
+        if match:
+            json_str = match.group(1).replace('None', 'null')
+            return json.loads(json_str)
+        
+        # Pattern 2: JSON object without code fence
+        pattern2 = r'(\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\})'
+        match = re.search(pattern2, content, re.DOTALL)
+        if match:
+            json_str = match.group(1).replace('None', 'null')
+            return json.loads(json_str)
+        
+        # Pattern 3: JSON array without code fence
+        pattern3 = r'(\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\])'
+        match = re.search(pattern3, content, re.DOTALL)
+        if match:
+            json_str = match.group(1).replace('None', 'null')
+            return json.loads(json_str)
+        
+        return None
+    except Exception as e:
+        logging.debug(f"Regex pattern extraction failed: {e}")
+        return None
+
+
+def extract_json_llm_repair(content, model=None, schema_type='toc'):
+    """
+    Use LLM to repair malformed JSON as last resort.
+    
+    Args:
+        content: Malformed JSON text
+        model: LLM model to use for repair
+        schema_type: Expected schema type
+    
+    Returns:
+        dict or list: Repaired and parsed JSON, or None if repair fails
+    """
+    try:
+        if model is None:
+            model = 'deepseek-chat'  # Default model
+        
+        repair_prompt = f"""The following text contains malformed JSON that needs to be fixed.
+Please extract and repair it to match the {schema_type} schema format.
+
+Requirements:
+- Return ONLY valid JSON, no explanation
+- Maintain all original data
+- Fix syntax errors (missing commas, quotes, brackets)
+- Ensure proper formatting
+
+Text to repair:
+{content[:2000]}
+
+Return the corrected JSON:"""
+        
+        response = ChatGPT_API(model=model, prompt=repair_prompt)
+        
+        # Try to extract from repaired response
+        return extract_json_markdown_block(response) or extract_json_bracket_matching(response)
+    
+    except Exception as e:
+        logging.error(f"LLM repair failed: {e}")
+        return None
+
+
+def extract_json_v2(content, max_retries=2, expected_schema='toc', model=None):
+    """
+    Enhanced JSON extraction with multiple fallback strategies.
+    
+    This is the main entry point for improved JSON parsing. It tries
+    multiple strategies in order of reliability:
+    1. Markdown code block extraction
+    2. Bracket matching
+    3. Regex patterns
+    4. LLM repair (last resort)
+    
+    Args:
+        content: Raw text content from LLM response
+        max_retries: Maximum LLM repair attempts (default: 2)
+        expected_schema: Expected schema type for validation
+        model: LLM model for repair attempts
+    
+    Returns:
+        dict or list: Parsed and validated JSON, or None if all strategies fail
+    """
+    # Define strategies in priority order
+    strategies = [
+        ('markdown_block', extract_json_markdown_block),
+        ('bracket_match', extract_json_bracket_matching),
+        ('regex_pattern', extract_json_regex_patterns),
+    ]
+    
+    # Try each strategy
+    for strategy_name, strategy_func in strategies:
+        try:
+            result = strategy_func(content)
+            
+            if result is not None:
+                # Validate against expected schema
+                if validate_json_schema(result, expected_schema):
+                    logging.debug(f"JSON extracted successfully via {strategy_name}")
+                    return result
+                else:
+                    logging.debug(f"JSON from {strategy_name} failed schema validation")
+        
+        except Exception as e:
+            logging.debug(f"Strategy {strategy_name} failed: {e}")
+            continue
+    
+    # Last resort: Try LLM repair
+    if max_retries > 0:
+        logging.info(f"All extraction strategies failed. Attempting LLM repair (retries={max_retries})")
+        try:
+            repaired = extract_json_llm_repair(content, model, expected_schema)
+            if repaired and validate_json_schema(repaired, expected_schema):
+                logging.info("JSON successfully repaired by LLM")
+                return repaired
+        except Exception as e:
+            logging.error(f"LLM repair failed: {e}")
+    
+    # All strategies failed
+    logging.error(f"All JSON extraction strategies failed. Content preview: {content[:500]}")
+    return None
+
+
+
+
 async def extract_json_with_retry(
     llm_provider,  # LLMProvider instance
     prompt: str,
@@ -900,6 +1200,199 @@ def get_number_of_pages(pdf_path):
 
 
 
+# ============================================================================
+# Parent-Child Consistency Validation (Phase 1.4)
+# ============================================================================
+
+def validate_parent_child_consistency(structure, logger=None):
+    """
+    Validate and fix parent-child consistency in hierarchical TOC structure.
+    
+    Validates:
+    1. Parent's physical_index should be <= all children's physical_index
+    2. Structure codes are properly nested (e.g., "1.1" is child of "1")
+    3. No orphaned children (children without valid parents)
+    4. Physical indices are monotonically increasing within same level
+    
+    Args:
+        structure: Flat list of TOC items with structure codes and physical_index
+        logger: Optional logger instance
+    
+    Returns:
+        tuple: (validated_structure, validation_report)
+    """
+    if not structure:
+        return structure, {'status': 'empty'}
+    
+    import logging
+    if logger is None:
+        logger = logging.getLogger("pageindex.utils")
+    
+    logger.info("[PARENT_CHILD] Starting parent-child consistency validation")
+    
+    violations = []
+    fixes_applied = 0
+    
+    # Build parent-child relationship map
+    parent_map = {}
+    for item in structure:
+        struct_code = str(item.get('structure', ''))
+        parts = struct_code.split('.')
+        if len(parts) > 1:
+            parent_code = '.'.join(parts[:-1])
+            parent_map[struct_code] = parent_code
+    
+    # Find parent items by structure code
+    struct_to_item = {str(item.get('structure', '')): item for item in structure}
+    
+    # Step 1: Detect all violations (without fixing yet)
+    parent_violations = {}  # Track violations per parent: {parent_code: [child_indices]}
+    
+    for i, item in enumerate(structure):
+        struct_code = str(item.get('structure', ''))
+        title = item.get('title', '')[:30]
+        phys_idx = item.get('physical_index')
+        
+        if phys_idx is None:
+            continue
+        
+        # Check if this item has a parent
+        if struct_code in parent_map:
+            parent_code = parent_map[struct_code]
+            parent_item = struct_to_item.get(parent_code)
+            
+            if parent_item is None:
+                # Orphaned child - parent doesn't exist
+                violation = {
+                    'type': 'orphaned_child',
+                    'position': i,
+                    'structure': struct_code,
+                    'title': title,
+                    'parent_structure': parent_code
+                }
+                violations.append(violation)
+                logger.warning(f"[PARENT_CHILD] Orphaned child '{title}' (structure={struct_code}), parent '{parent_code}' not found")
+                
+            elif parent_item.get('physical_index') is not None:
+                parent_idx = parent_item['physical_index']
+                parent_title = parent_item.get('title', '')[:30]
+                
+                # Validate: parent's page should be <= child's page
+                if parent_idx > phys_idx:
+                    violation = {
+                        'type': 'parent_after_child',
+                        'position': i,
+                        'structure': struct_code,
+                        'title': title,
+                        'physical_index': phys_idx,
+                        'parent_structure': parent_code,
+                        'parent_title': parent_title,
+                        'parent_index': parent_idx
+                    }
+                    violations.append(violation)
+                    logger.warning(f"[PARENT_CHILD] Parent-child violation: parent '{parent_title}' (page {parent_idx}) comes after child '{title}' (page {phys_idx})")
+                    
+                    # Track this violation for later fixing
+                    if parent_code not in parent_violations:
+                        parent_violations[parent_code] = []
+                    parent_violations[parent_code].append(phys_idx)
+    
+    # Step 2: Apply fixes to parents (adjust to minimum child index)
+    for parent_code, child_indices in parent_violations.items():
+        parent_item = struct_to_item.get(parent_code)
+        if parent_item:
+            min_child_idx = min(child_indices)
+            old_idx = parent_item['physical_index']
+            parent_item['physical_index'] = min_child_idx
+            # Count each violation as a fix (not just each parent)
+            fixes_applied += len(child_indices)
+            parent_title = parent_item.get('title', '')[:30]
+            logger.info(f"[PARENT_CHILD] Fixed: set parent '{parent_title}' physical_index from {old_idx} to {parent_item['physical_index']} (resolved {len(child_indices)} violations)")
+    
+    # Step 3: Check and fix non-monotonic ordering at same hierarchy level
+    # Build children map first (for fixing strategy)
+    children_map = {}  # {parent_code: [child_items]}
+    for item in structure:
+        struct_code = str(item.get('structure', ''))
+        if struct_code in parent_map:
+            parent_code = parent_map[struct_code]
+            if parent_code not in children_map:
+                children_map[parent_code] = []
+            children_map[parent_code].append(item)
+    
+    # Group by hierarchy level
+    by_level = {}
+    for item in structure:
+        struct_code = str(item.get('structure', ''))
+        level = len(struct_code.split('.'))
+        if level not in by_level:
+            by_level[level] = []
+        by_level[level].append(item)
+    
+    # Detect non-monotonic violations and fix them
+    for level, items in by_level.items():
+        prev_idx = None
+        for item in items:
+            phys_idx = item.get('physical_index')
+            title = item.get('title', '')[:30]
+            struct_code = str(item.get('structure', ''))
+            
+            if phys_idx is not None and prev_idx is not None:
+                if phys_idx < prev_idx:
+                    violation = {
+                        'type': 'non_monotonic_same_level',
+                        'level': level,
+                        'title': title,
+                        'physical_index': phys_idx,
+                        'previous_index': prev_idx
+                    }
+                    violations.append(violation)
+                    logger.warning(f"[PARENT_CHILD] Non-monotonic at level {level}: '{title}' (page {phys_idx}) comes before previous item (page {prev_idx})")
+                    
+                    # Fix strategy: if item has children, adjust to first child's index
+                    # Otherwise, adjust to prev_idx + 1
+                    children = children_map.get(struct_code, [])
+                    if children:
+                        child_indices = [c.get('physical_index') for c in children if c.get('physical_index') is not None]
+                        if child_indices:
+                            new_idx = min(child_indices)
+                            item['physical_index'] = new_idx
+                            fixes_applied += 1
+                            logger.info(f"[PARENT_CHILD] Fixed non-monotonic: set '{title}' physical_index from {phys_idx} to {new_idx} (first child's index)")
+                            phys_idx = new_idx
+                    else:
+                        # No children, just make it sequential
+                        new_idx = prev_idx + 1
+                        item['physical_index'] = new_idx
+                        fixes_applied += 1
+                        logger.info(f"[PARENT_CHILD] Fixed non-monotonic: set '{title}' physical_index from {phys_idx} to {new_idx} (prev + 1)")
+                        phys_idx = new_idx
+            
+            if phys_idx is not None:
+                prev_idx = phys_idx
+    
+    # Generate report
+    report = {
+        'status': 'success' if len(violations) == 0 else 'violations_found',
+        'total_items': len(structure),
+        'violations_count': len(violations),
+        'fixes_applied': fixes_applied,
+        'violation_types': {
+            'orphaned_child': sum(1 for v in violations if v['type'] == 'orphaned_child'),
+            'parent_after_child': sum(1 for v in violations if v['type'] == 'parent_after_child'),
+            'non_monotonic_same_level': sum(1 for v in violations if v['type'] == 'non_monotonic_same_level')
+        }
+    }
+    
+    if logger:
+        logger.info(f"[PARENT_CHILD] Validation complete: {report['violations_count']} violations found, {fixes_applied} fixes applied")
+        for vtype, count in report['violation_types'].items():
+            if count > 0:
+                logger.info(f"[PARENT_CHILD]   - {vtype}: {count}")
+    
+    return structure, report
+
+
 def post_processing(structure, end_physical_index):
     """
     Convert TOC structure to tree with proper page ranges.
@@ -972,6 +1465,11 @@ def post_processing(structure, end_physical_index):
             logger.info(f"[PAGE_INDEX] Item {i} '{title}': last item, extending to document end {end_physical_index}")
 
         logger.info(f"[PAGE_INDEX] Item {i} '{title}': FINAL start={item['start_index']}, end={item['end_index']}")
+
+    # Phase 1.4: Validate parent-child consistency before building tree
+    structure, validation_report = validate_parent_child_consistency(structure, logger)
+    if validation_report['status'] != 'empty':
+        logger.info(f"[PAGE_INDEX] Parent-child validation: {validation_report}")
 
     tree = list_to_tree(structure)
     if len(tree)!=0:

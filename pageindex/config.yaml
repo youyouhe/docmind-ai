@@ -7,3 +7,17 @@ if_add_node_summary: "yes"
 if_add_doc_description: "no"
 if_add_node_text: "no"
 custom_prompt: null
+
+# Phase 1.3: Intelligent Document Chunking Parameters
+# Strategy: 'auto', 'toc', 'adaptive', 'fixed'
+#   - auto: Automatically choose based on TOC availability (recommended)
+#   - toc: Force TOC-aware chunking at chapter boundaries
+#   - adaptive: Token-based with balanced chunk sizes
+#   - fixed: Strict token-based (legacy)
+chunking_strategy: "auto"
+
+# Number of pages to overlap between chunks (for better context continuity)
+chunking_overlap_pages: 1
+
+# Minimum chunk size in tokens (prevents too-small chunks in TOC-aware mode)
+chunking_min_size: 5000

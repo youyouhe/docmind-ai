@@ -1,0 +1,115 @@
+{
+  "document_id": "eb4cde78",
+  "timestamp": "20260131_190108",
+  "stages": {
+    "initialization": [
+      {
+        "timestamp": "0.00s",
+        "message": "Starting parsing: 5 pages, 2,776 tokens",
+        "data": {
+          "total_pages": 5,
+          "total_tokens": 2776
+        }
+      }
+    ],
+    "toc_detection": [
+      {
+        "timestamp": "9.02s",
+        "message": "No TOC detected - will auto-generate structure",
+        "data": {
+          "total_pages": 5,
+          "has_toc": null,
+          "toc_pages": [],
+          "has_page_numbers": false,
+          "toc_content_length": 0
+        }
+      }
+    ],
+    "structure_extraction": [
+      {
+        "timestamp": "72.72s",
+        "message": "Extracted 34 structure items using mode: process_no_toc",
+        "data": {
+          "mode": "process_no_toc",
+          "total_items": 34,
+          "items_with_page": 34,
+          "items_without_page": 0,
+          "sample_items": [
+            {
+              "structure": "1.",
+              "title": "项目概况与招标内容",
+              "physical_index": 1,
+              "appear_start": "yes",
+              "start_index": 1,
+              "end_index": 1
+            },
+            {
+              "structure": "1.1",
+              "title": "项目概况",
+              "physical_index": 1,
+              "appear_start": "yes",
+              "start_index": 1,
+              "end_index": 1
+            },
+            {
+              "structure": "1.2",
+              "title": "招标内容",
+              "physical_index": 1,
+              "appear_start": "yes",
+              "start_index": 1,
+              "end_index": 1
+            },
+            {
+              "structure": "1.3",
+              "title": "本项目划分标包",
+              "physical_index": 1,
+              "appear_start": "yes",
+              "start_index": 1,
+              "end_index": 1
+            },
+            {
+              "structure": "1.4",
+              "title": "本项目设置最高投标限价",
+              "physical_index": 1,
+              "appear_start": "yes",
+              "start_index": 1,
+              "end_index": 1
+            }
+          ],
+          "structure_distribution": {
+            "2": 27,
+            "3": 7
+          }
+        }
+      }
+    ],
+    "title_validation": [
+      {
+        "timestamp": "76.08s",
+        "message": "Title validation: 29/29 titles confirmed (100.0%)",
+        "data": {
+          "total_validated": 29,
+          "confirmed": 29,
+          "rejected": 0,
+          "confirmation_rate": "100.0%"
+        }
+      }
+    ],
+    "tree_building": [
+      {
+        "timestamp": "76.09s",
+        "message": "Tree built: 29 nodes, depth 1",
+        "data": {
+          "total_nodes": 29,
+          "max_depth": 1,
+          "total_pages": 5,
+          "avg_pages_per_node": 1.0,
+          "min_pages": 1,
+          "max_pages": 1,
+          "content_issues_count": 4
+        }
+      }
+    ]
+  },
+  "total_time": "76.09s"
+}

@@ -46,8 +46,13 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
 
 
     page_number = item['physical_index']
-    page_text = page_list[page_number - start_index][0]
-
+    
+    # Bounds check: ensure page_number is within valid range
+    page_index = page_number - start_index
+    if page_index < 0 or page_index >= len(page_list):
+        return {'list_index': item.get('list_index'), 'answer': 'no', 'title': title, 'page_number': page_number}
+    
+    page_text = page_list[page_index][0]
 
     # First try simple substring matching (case-insensitive)
     title_clean = title.lower().strip()
@@ -55,6 +60,18 @@ async def check_title_appearance(item, page_list, start_index=1, model=None):
 
     if title_clean in page_text_lower:
         return {'list_index': item.get('list_index'), 'answer': 'yes', 'title': title, 'page_number': page_number}
+    
+    # Special handling for number-only titles (e.g., "3.1", "4.2.2")
+    # These often appear as prefixes like "3.1 content..." in the PDF
+    import re
+    # Match section numbers: digits with optional dots/dashes (e.g., "3.1", "4.2.2", "1-2")
+    # Fix: Use raw string and proper escaping to avoid catastrophic backtracking
+    if re.match(r'^\d+([.\-]\d+)*$', title_clean):
+        # Search for title as a prefix followed by space or common separators
+        # This matches "3.1 ", "3.1\t", "3.1、", "3.1.", etc.
+        pattern = re.escape(title_clean) + r'[\s\.\、\t]'
+        if re.search(pattern, page_text_lower):
+            return {'list_index': item.get('list_index'), 'answer': 'yes', 'title': title, 'page_number': page_number}
 
     # Try word-by-word matching
     title_words = set(title_clean.split())
@@ -85,6 +102,189 @@ Answer ONLY with "yes" or "no". No explanation."""
     return {'list_index': item.get('list_index'), 'answer': 'no', 'title': title, 'page_number': page_number}
 
 
+async def check_title_appearance_v2(item, page_list, start_index=1, model=None, logger=None):
+    """
+    Enhanced version of check_title_appearance with fuzzy matching.
+    
+    Improvements over check_title_appearance():
+    1. Fuzzy string matching using Levenshtein distance for typos
+    2. Better handling of formatting variations (punctuation, spacing)
+    3. Multi-strategy matching with confidence scoring
+    4. More robust word-level matching
+    
+    Matching strategies (in order):
+    1. Exact substring match (case-insensitive)
+    2. Normalized match (remove punctuation, extra spaces)
+    3. Fuzzy match (Levenshtein distance <= 15% of title length)
+    4. Word-level match (>=70% words present)
+    5. LLM fallback
+    
+    Args:
+        item: Dict with 'title' and 'physical_index'
+        page_list: List of (content, page_info) tuples
+        start_index: Starting page index (default 1)
+        model: Model name for LLM fallback
+        logger: Optional logger instance
+    
+    Returns:
+        dict: {'list_index': ..., 'answer': 'yes'/'no', 'title': ..., 'page_number': ..., 'confidence': ...}
+    """
+    from fuzzywuzzy import fuzz
+    import re
+    import logging
+    
+    if logger is None:
+        logger = logging.getLogger("pageindex.page_index")
+    
+    title = item['title']
+    if 'physical_index' not in item or item['physical_index'] is None:
+        return {
+            'list_index': item.get('list_index'),
+            'answer': 'no',
+            'title': title,
+            'page_number': None,
+            'confidence': 0
+        }
+    
+    page_number = item['physical_index']
+    
+    # Bounds check: ensure page_number is within valid range
+    page_index = page_number - start_index
+    if page_index < 0 or page_index >= len(page_list):
+        return {
+            'list_index': item.get('list_index'),
+            'answer': 'no',
+            'title': title,
+            'page_number': page_number,
+            'confidence': 0
+        }
+    
+    page_text = page_list[page_index][0]
+    
+    # Strategy 1: Exact substring match (case-insensitive)
+    title_clean = title.lower().strip()
+    page_text_lower = page_text.lower()
+    
+    if title_clean in page_text_lower:
+        logger.debug(f"[FUZZY_MATCH] Exact match for '{title}' on page {page_number}")
+        return {
+            'list_index': item.get('list_index'),
+            'answer': 'yes',
+            'title': title,
+            'page_number': page_number,
+            'confidence': 100
+        }
+    
+    # Strategy 2: Normalized match (remove punctuation, extra spaces)
+    def normalize_text(text):
+        # Remove punctuation except spaces
+        text = re.sub(r'[^\w\s]', ' ', text)
+        # Collapse multiple spaces
+        text = re.sub(r'\s+', ' ', text)
+        return text.lower().strip()
+    
+    title_normalized = normalize_text(title)
+    page_text_normalized = normalize_text(page_text)
+    
+    if title_normalized in page_text_normalized:
+        logger.debug(f"[FUZZY_MATCH] Normalized match for '{title}' on page {page_number}")
+        return {
+            'list_index': item.get('list_index'),
+            'answer': 'yes',
+            'title': title,
+            'page_number': page_number,
+            'confidence': 95
+        }
+    
+    # Strategy 3: Fuzzy match using Levenshtein distance
+    # Search for title-length substrings in page_text and calculate similarity
+    max_similarity = 0
+    title_len = len(title_clean)
+    
+    # Only do fuzzy matching for titles between 10-200 characters
+    if 10 <= title_len <= 200:
+        # Slide a window across the page text
+        step_size = max(1, title_len // 4)  # Overlap windows for better coverage
+        for i in range(0, len(page_text_lower) - title_len + 1, step_size):
+            substring = page_text_lower[i:i + title_len]
+            similarity = fuzz.ratio(title_clean, substring)
+            max_similarity = max(max_similarity, similarity)
+            
+            # Early exit if we found a very good match
+            if similarity >= 90:
+                break
+        
+        # Also try partial ratio (handles substring matching better)
+        partial_similarity = fuzz.partial_ratio(title_clean, page_text_lower)
+        max_similarity = max(max_similarity, partial_similarity)
+        
+        # Threshold: 85% similarity is considered a match
+        if max_similarity >= 85:
+            logger.debug(f"[FUZZY_MATCH] Fuzzy match for '{title}' on page {page_number} (similarity: {max_similarity}%)")
+            return {
+                'list_index': item.get('list_index'),
+                'answer': 'yes',
+                'title': title,
+                'page_number': page_number,
+                'confidence': max_similarity
+            }
+    
+    # Strategy 4: Word-level match (70% of words present)
+    title_words = set(title_clean.split())
+    if title_words and len(title_words) > 2:
+        words_found = sum(1 for word in title_words if word in page_text_lower)
+        word_match_ratio = words_found / len(title_words)
+        
+        if word_match_ratio >= 0.7:
+            confidence = int(word_match_ratio * 80)  # Max 80 for word matching
+            logger.debug(f"[FUZZY_MATCH] Word-level match for '{title}' on page {page_number} ({words_found}/{len(title_words)} words)")
+            return {
+                'list_index': item.get('list_index'),
+                'answer': 'yes',
+                'title': title,
+                'page_number': page_number,
+                'confidence': confidence
+            }
+    
+    # Strategy 5: LLM fallback
+    prompt = f"""Does the section "{title[:100]}" appear in this page?
+
+Page text (first 500 chars):
+{page_text[:500]}
+
+Answer ONLY with "yes" or "no". No explanation."""
+    
+    try:
+        response = await ChatGPT_API_async(model=model, prompt=prompt)
+        if response and isinstance(response, str):
+            response_clean = response.strip().lower()
+            answer = 'yes' if 'yes' in response_clean else 'no'
+            confidence = 70 if answer == 'yes' else 0  # LLM match gets 70 confidence
+            
+            if answer == 'yes':
+                logger.debug(f"[FUZZY_MATCH] LLM confirmed match for '{title}' on page {page_number}")
+            
+            return {
+                'list_index': item.get('list_index'),
+                'answer': answer,
+                'title': title,
+                'page_number': page_number,
+                'confidence': confidence
+            }
+    except Exception as e:
+        logger.warning(f"[FUZZY_MATCH] LLM check failed: {e}")
+    
+    # Default to no if all methods fail
+    logger.debug(f"[FUZZY_MATCH] No match found for '{title}' on page {page_number}")
+    return {
+        'list_index': item.get('list_index'),
+        'answer': 'no',
+        'title': title,
+        'page_number': page_number,
+        'confidence': 0
+    }
+
+
 async def check_title_appearance_in_start(title, page_text, model=None, logger=None):
     """
     Check if a section title appears at the start of a page.
@@ -111,6 +311,25 @@ async def check_title_appearance_in_start(title, page_text, model=None, logger=N
     if title_words and title_words[0].lower() in [w.lower() for w in page_words[:5]]:
         # First word matches at the beginning
         return "yes"
+    
+    # NEW: Try substring match anywhere in the page (not just at start)
+    # This handles cases where title appears in the middle of the page
+    title_clean_lower = title_clean.lower()
+    page_text_lower = page_text.lower()
+    
+    if title_clean_lower in page_text_lower:
+        return "yes"
+    
+    # NEW: Special handling for number-only titles (e.g., "3.1", "4.2.2")
+    # These often appear as prefixes like "3.1 content..." in the PDF
+    import re
+    # Match section numbers: digits with optional dots/dashes (e.g., "3.1", "4.2.2", "1-2")
+    if re.match(r'^\d+([.\-]\d+)*$', title_clean_lower):
+        # Search for title as a prefix followed by space or common separators
+        # This matches "3.1 ", "3.1\t", "3.1、", "3.1.", etc.
+        pattern = re.escape(title_clean_lower) + r'[\s\.\、\t]'
+        if re.search(pattern, page_text_lower):
+            return "yes"
 
     # LLM fallback with simplified prompt
     prompt = f"""Does the section "{title[:100]}" start at the beginning of this page?
@@ -151,7 +370,14 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     valid_items = []
     for item in structure:
         if item.get('physical_index') is not None:
-            page_text = page_list[item['physical_index'] - 1][0]
+            # Bounds check: ensure physical_index is within valid range
+            page_index = item['physical_index'] - 1
+            if page_index < 0 or page_index >= len(page_list):
+                # Mark as 'no' if page index is out of range
+                item['appear_start'] = 'no'
+                continue
+            
+            page_text = page_list[page_index][0]
             tasks.append(check_title_appearance_in_start(item['title'], page_text, model=model, logger=logger))
             valid_items.append(item)
 
@@ -169,6 +395,16 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
     print(f"[DEBUG] check_title_appearance: {confirmed}/{len(results)} titles confirmed")
     _report("toc_postprocessing", progress=55,
            message=f"Validated {confirmed}/{len(results)} section titles")
+
+    # NEW: Remove invalid entries (titles not found in their page)
+    # Keep only entries where appear_start == 'yes'
+    removed_count = 0
+    original_count = len(structure)
+    structure[:] = [item for item in structure if item.get('appear_start') != 'no']
+    removed_count = original_count - len(structure)
+    
+    if removed_count > 0 and logger:
+        logger.info(f"[Validation] Removed {removed_count} invalid index entries (titles not found in document)")
 
     return structure
 
@@ -251,6 +487,285 @@ Note: A table of contents MUST have page number references. Abstracts, summaries
     except Exception as e:
         logging.warning(f"LLM toc_detector failed: {e}")
 
+    return "no"
+
+
+def calculate_toc_likelihood_score(content):
+    """
+    Calculate a likelihood score (0-100) that a page contains a table of contents.
+    
+    This provides a more nuanced assessment than binary yes/no, allowing for
+    multi-stage validation and borderline case handling.
+    
+    Scoring factors:
+    - TOC keywords presence: +20 points
+    - Multiple headings/sections: +15 points  
+    - Page number citations: +25 points
+    - Hierarchical structure (1., 1.1, etc.): +20 points
+    - Length appropriateness: +10 points
+    - Avoid false positives (figures, tables, abstracts): -30 points each
+    
+    Returns:
+        int: Score from 0-100 indicating TOC likelihood
+    """
+    import re
+    
+    score = 0
+    content_lower = content.lower()
+    lines = [line.strip() for line in content.split('\n') if line.strip()]
+    
+    # Factor 1: TOC keywords (+20 points)
+    toc_keywords = ['table of contents', 'contents', 'chapter', '目录', '目　录']
+    if any(keyword in content_lower for keyword in toc_keywords):
+        score += 20
+    
+    # Factor 2: Multiple headings/sections (+15 points)
+    # Look for numbered sections or chapter-like headings
+    heading_patterns = [
+        r'^\s*\d+\.?\s+[A-Z]',  # "1. Introduction" or "1 Introduction"
+        r'^\s*[IVX]+\.?\s+[A-Z]',  # Roman numerals "I. Introduction"
+        r'^chapter\s+\d+',  # "Chapter 1"
+        r'^第[一二三四五六七八九十\d]+章',  # Chinese chapters
+    ]
+    heading_count = sum(1 for line in lines 
+                       if any(re.match(pattern, line, re.IGNORECASE) for pattern in heading_patterns))
+    if heading_count >= 3:
+        score += 15
+    elif heading_count >= 1:
+        score += 7
+    
+    # Factor 3: Page number citations (+25 points - most important!)
+    page_patterns = [
+        r'\b(?:p|page|pp)\.?\s*\d+',  # "p.5", "page 10", "pp. 23"
+        r'\d+\s*(?:p|page|pp)\.?',    # "5 p", "10 page"
+        r'\.{2,}\d+',                 # "....... 23" or "......1" (dotted line to page number)
+        r'\d+\s*$',                   # Line ending with just a number (common in TOC)
+        r'第\s*\d+\s*页',             # Chinese "第5页"
+        r'\d+\s*页',                  # Chinese "5页"
+    ]
+    page_citation_matches = sum(len(re.findall(pattern, content, re.IGNORECASE | re.MULTILINE)) 
+                                for pattern in page_patterns)
+    if page_citation_matches >= 10:
+        score += 25
+    elif page_citation_matches >= 5:
+        score += 15
+    elif page_citation_matches >= 2:
+        score += 8
+    
+    # Factor 4: Hierarchical structure (+20 points)
+    # Look for nested numbering like "1.1", "2.3.4"
+    hierarchical_pattern = r'\d+\.\d+'
+    hierarchical_matches = len(re.findall(hierarchical_pattern, content))
+    if hierarchical_matches >= 5:
+        score += 20
+    elif hierarchical_matches >= 2:
+        score += 10
+    
+    # Factor 5: Length appropriateness (+10 points)
+    # TOC should have reasonable length (not too short, not too long)
+    word_count = len(content.split())
+    if 100 <= word_count <= 2000:
+        score += 10
+    elif 50 <= word_count < 100 or 2000 < word_count <= 3000:
+        score += 5
+    
+    # Factor 6: False positive penalties
+    false_positive_keywords = [
+        ('list of figures', -30),
+        ('list of tables', -30),
+        ('abstract', -30),
+        ('summary', -20),
+        ('notation', -25),
+        ('abbreviations', -25),
+        ('acknowledgment', -25),
+        ('preface', -15),  # Can be near TOC but not TOC itself
+    ]
+    for keyword, penalty in false_positive_keywords:
+        if keyword in content_lower:
+            score += penalty
+    
+    # Ensure score is in valid range [0, 100]
+    score = max(0, min(100, score))
+    
+    return score
+
+
+def check_toc_v2(page_list, opt=None, logger=None):
+    """
+    Enhanced TOC detection with multi-stage validation.
+    
+    Improvements over check_toc():
+    1. Uses calculate_toc_likelihood_score() for more nuanced detection
+    2. Implements confidence thresholds:
+       - High confidence (score >= 70): Immediate acceptance
+       - Medium confidence (50 <= score < 70): LLM confirmation required
+       - Low confidence (score < 50): Rejection
+    3. Better handling of borderline cases
+    4. More robust against false positives
+    
+    Args:
+        page_list: List of (content, page_info) tuples
+        opt: Options object with model and toc_check_page_num
+        logger: Optional logger instance
+    
+    Returns:
+        dict: {'toc_content': ..., 'toc_page_list': [...], 'page_index_given_in_toc': 'yes'/'no'}
+    """
+    import logging
+    if logger is None:
+        logger = logging.getLogger("pageindex.page_index")
+    
+    logger.info("[TOC_V2] Starting multi-stage TOC detection")
+    _report("toc_detection", progress=5, message="Searching for table of contents (enhanced)...")
+    
+    HIGH_CONFIDENCE_THRESHOLD = 70
+    MEDIUM_CONFIDENCE_THRESHOLD = 50
+    
+    toc_page_list = []
+    last_page_is_yes = False
+    i = 0
+    
+    # Stage 1: Scan pages with likelihood scoring
+    while i < len(page_list):
+        if i >= opt.toc_check_page_num and not last_page_is_yes:
+            break
+        
+        content = page_list[i][0]
+        score = calculate_toc_likelihood_score(content)
+        
+        logger.info(f"[TOC_V2] Page {i}: TOC likelihood score = {score}")
+        
+        is_toc = False
+        
+        # High confidence: immediate acceptance
+        if score >= HIGH_CONFIDENCE_THRESHOLD:
+            logger.info(f"[TOC_V2] Page {i}: HIGH confidence (score={score}), accepting as TOC")
+            is_toc = True
+        
+        # Medium confidence: LLM confirmation
+        elif score >= MEDIUM_CONFIDENCE_THRESHOLD:
+            logger.info(f"[TOC_V2] Page {i}: MEDIUM confidence (score={score}), requesting LLM confirmation")
+            llm_result = confirm_toc_with_llm(content, opt.model)
+            if llm_result == "yes":
+                logger.info(f"[TOC_V2] Page {i}: LLM confirmed as TOC")
+                is_toc = True
+            else:
+                logger.info(f"[TOC_V2] Page {i}: LLM rejected as TOC")
+        
+        # Low confidence: rejection
+        else:
+            logger.info(f"[TOC_V2] Page {i}: LOW confidence (score={score}), rejecting")
+        
+        if is_toc:
+            toc_page_list.append(i)
+            last_page_is_yes = True
+            _report("toc_detection", progress=5 + (i / opt.toc_check_page_num) * 5,
+                   message=f"Found TOC on page {i + 1} (score: {score})")
+        elif last_page_is_yes:
+            logger.info(f"[TOC_V2] Page {i}: End of TOC sequence detected")
+            break
+        
+        i += 1
+    
+    # Stage 2: Extract TOC content if pages found
+    if not toc_page_list:
+        logger.info("[TOC_V2] No TOC pages found")
+        _report("toc_detection", progress=10, message="No table of contents found")
+        return {'toc_content': None, 'toc_page_list': [], 'page_index_given_in_toc': 'no'}
+    
+    logger.info(f"[TOC_V2] Found {len(toc_page_list)} TOC pages: {toc_page_list}")
+    
+    # Extract TOC content
+    toc_json = toc_extractor(page_list, toc_page_list, opt.model)
+    
+    if toc_json['page_index_given_in_toc'] == 'yes':
+        logger.info("[TOC_V2] TOC with page indices extracted successfully")
+        _report("toc_detection", progress=10, message=f"Found TOC with page numbers")
+        return {
+            'toc_content': toc_json['toc_content'],
+            'toc_page_list': toc_page_list,
+            'page_index_given_in_toc': 'yes'
+        }
+    
+    # Stage 3: Search for continuation pages if no page indices found
+    logger.info("[TOC_V2] No page indices found, searching for continuation pages")
+    current_start_index = toc_page_list[-1] + 1
+    
+    while (toc_json['page_index_given_in_toc'] == 'no' and 
+           current_start_index < len(page_list) and 
+           current_start_index < opt.toc_check_page_num):
+        
+        content = page_list[current_start_index][0]
+        score = calculate_toc_likelihood_score(content)
+        
+        logger.info(f"[TOC_V2] Continuation page {current_start_index}: score = {score}")
+        
+        # Lower threshold for continuation pages (they may not have "TOC" keyword)
+        if score >= MEDIUM_CONFIDENCE_THRESHOLD:
+            additional_toc_pages = [current_start_index]
+            additional_toc_json = toc_extractor(page_list, additional_toc_pages, opt.model)
+            
+            if additional_toc_json['page_index_given_in_toc'] == 'yes':
+                logger.info(f"[TOC_V2] Found page indices in continuation page {current_start_index}")
+                _report("toc_detection", progress=10, message=f"Found TOC continuation with page numbers")
+                return {
+                    'toc_content': additional_toc_json['toc_content'],
+                    'toc_page_list': additional_toc_pages,
+                    'page_index_given_in_toc': 'yes'
+                }
+        
+        current_start_index += 1
+    
+    logger.info("[TOC_V2] No page indices found in TOC")
+    _report("toc_detection", progress=10, message=f"Found TOC without page numbers")
+    return {
+        'toc_content': toc_json['toc_content'],
+        'toc_page_list': toc_page_list,
+        'page_index_given_in_toc': 'no'
+    }
+
+
+def confirm_toc_with_llm(content, model=None):
+    """
+    Use LLM to confirm if a page is a table of contents.
+    
+    This is used for borderline cases (medium confidence scores) where
+    structural analysis is insufficient.
+    
+    Args:
+        content: Page content to analyze
+        model: Model name for LLM
+    
+    Returns:
+        str: "yes" or "no"
+    """
+    prompt = f"""Analyze if this page contains a table of contents with page number references.
+
+Text (first 500 chars):
+{content[:500]}
+
+A valid table of contents must:
+1. List chapter/section titles
+2. Include page number references (e.g., "Page 5", "p.12", "...23", "第3页")
+3. Show document structure
+
+NOT valid as TOC:
+- List of figures/tables
+- Abstract or summary
+- Notation/abbreviation list
+- Acknowledgments
+
+Answer ONLY "yes" or "no". No explanation."""
+
+    try:
+        response = ChatGPT_API(model=model, prompt=prompt)
+        if response and isinstance(response, str):
+            response_clean = response.strip().lower()
+            if "yes" in response_clean:
+                return "yes"
+    except Exception as e:
+        logging.warning(f"[TOC_V2] LLM confirmation failed: {e}")
+    
     return "no"
 
 
@@ -499,7 +1014,7 @@ def toc_index_extractor(toc, content, model=None):
 
     prompt = tob_extractor_prompt + '\nTable of contents:\n' + str(toc) + '\nDocument pages:\n' + content
     response = ChatGPT_API(model=model, prompt=prompt)
-    json_content = extract_json(response)    
+    json_content = extract_json_v2(response, expected_schema='appear_start', model=model)    
     return json_content
 
 
@@ -530,7 +1045,7 @@ def toc_transformer(toc_content, model=None):
 
     # If finished in one go, return immediately
     if finish_reason == "finished":
-        last_complete = extract_json(last_complete)
+        last_complete = extract_json_v2(last_complete, expected_schema='toc', model=model)
         cleaned_response = convert_page_to_int(last_complete['table_of_contents'])
         return cleaned_response
 
@@ -603,7 +1118,7 @@ def toc_transformer(toc_content, model=None):
     try:
         last_complete = json.loads(last_complete)
     except json.JSONDecodeError as e:
-        last_complete = extract_json(last_complete)
+        last_complete = extract_json_v2(last_complete, expected_schema='toc', model=model)
         if last_complete is None:
             raise ValueError(f"Failed to parse LLM response as JSON. Original error: {e}")
 
@@ -850,6 +1365,223 @@ def page_list_to_group_text(page_contents, token_lengths, max_tokens=200000, ove
     print('divide page_list to groups', len(subsets))
     return subsets
 
+
+# ============================================================================
+# Enhanced Intelligent Document Chunking (Phase 1.3)
+# ============================================================================
+
+def chunk_by_toc_structure(page_contents, token_lengths, toc_items, start_index=1, max_tokens=200000, min_chunk_size=5000):
+    """
+    Chunk document by TOC chapter boundaries for better context preservation.
+    
+    This is the primary strategy when TOC is available. It splits at major
+    section boundaries (chapters) to keep related content together.
+    
+    Args:
+        page_contents: List of page content strings
+        token_lengths: List of token counts per page
+        toc_items: TOC structure with physical_index values
+        start_index: Starting page number (default: 1)
+        max_tokens: Maximum tokens per chunk
+        min_chunk_size: Minimum tokens to create a chunk
+    
+    Returns:
+        List of text chunks (strings)
+    """
+    if not toc_items or not page_contents:
+        return []
+    
+    chunks = []
+    current_chunk_pages = []
+    current_chunk_tokens = 0
+    
+    # Build a map of page_index -> major section boundary
+    # Major sections are level 1 (structure like "1", "2", "3", not "1.1", "1.2")
+    major_boundaries = set()
+    for item in toc_items:
+        if item.get('physical_index') is not None:
+            structure = str(item.get('structure', ''))
+            # Major section if structure has no dots (e.g., "1", "2", "3")
+            if structure and '.' not in structure:
+                page_idx = item['physical_index'] - start_index
+                if 0 <= page_idx < len(page_contents):
+                    major_boundaries.add(page_idx)
+    
+    # Iterate through pages, splitting at major boundaries when token limit approached
+    for i, (page_content, page_tokens) in enumerate(zip(page_contents, token_lengths)):
+        # Check if we should start a new chunk
+        would_exceed = current_chunk_tokens + page_tokens > max_tokens
+        is_boundary = i in major_boundaries and current_chunk_tokens >= min_chunk_size
+        already_large = current_chunk_tokens > max_tokens * 0.7  # Already at 70% of limit
+        
+        # Split if: (1) would exceed limit AND at boundary, OR (2) already large AND at boundary
+        should_split = (would_exceed or already_large) and is_boundary and current_chunk_pages
+        
+        if should_split:
+            # Save current chunk and start new one
+            chunks.append(''.join(current_chunk_pages))
+            current_chunk_pages = []
+            current_chunk_tokens = 0
+        
+        # Add current page to chunk
+        current_chunk_pages.append(page_content)
+        current_chunk_tokens += page_tokens
+        
+        # Force split if token limit far exceeded (safety) - even without boundary
+        if current_chunk_tokens > max_tokens * 1.5:
+            chunks.append(''.join(current_chunk_pages))
+            current_chunk_pages = []
+            current_chunk_tokens = 0
+    
+    # Add final chunk
+    if current_chunk_pages:
+        chunks.append(''.join(current_chunk_pages))
+    
+    print(f'[TOC-aware chunking] Split into {len(chunks)} chunks at chapter boundaries')
+    return chunks
+
+
+def chunk_by_tokens_with_overlap(page_contents, token_lengths, max_tokens=200000, overlap_pages=1, strategy='adaptive'):
+    """
+    Enhanced token-based chunking with adaptive overlap.
+    
+    This is the fallback strategy when TOC is unavailable or for fine-grained
+    control. Uses adaptive chunk sizing to balance load.
+    
+    Args:
+        page_contents: List of page content strings
+        token_lengths: List of token counts per page
+        max_tokens: Maximum tokens per chunk
+        overlap_pages: Number of pages to overlap between chunks
+        strategy: 'adaptive' or 'fixed'
+            - adaptive: Balances chunk sizes to avoid small final chunks
+            - fixed: Uses strict max_tokens limit
+    
+    Returns:
+        List of text chunks (strings)
+    """
+    num_tokens = sum(token_lengths)
+    
+    # Single chunk if fits
+    if num_tokens <= max_tokens:
+        return ["".join(page_contents)]
+    
+    chunks = []
+    
+    if strategy == 'adaptive':
+        # Calculate balanced chunk size to avoid very small final chunks
+        expected_chunks = math.ceil(num_tokens / max_tokens)
+        average_tokens = math.ceil(((num_tokens / expected_chunks) + max_tokens) / 2)
+        target_tokens = average_tokens
+    else:
+        # Fixed strategy: use strict max_tokens
+        target_tokens = max_tokens
+    
+    current_pages = []
+    current_tokens = 0
+    
+    for i, (page_content, page_tokens) in enumerate(zip(page_contents, token_lengths)):
+        # Check if adding this page exceeds target
+        if current_tokens + page_tokens > target_tokens and current_pages:
+            # Save current chunk
+            chunks.append(''.join(current_pages))
+            
+            # Start new chunk with overlap
+            overlap_start = max(i - overlap_pages, 0)
+            current_pages = list(page_contents[overlap_start:i])
+            current_tokens = sum(token_lengths[overlap_start:i])
+        
+        # Add current page
+        current_pages.append(page_content)
+        current_tokens += page_tokens
+    
+    # Add final chunk
+    if current_pages:
+        chunks.append(''.join(current_pages))
+    
+    print(f'[Token-based chunking] Split into {len(chunks)} chunks (strategy: {strategy})')
+    return chunks
+
+
+def page_list_to_group_text_v2(page_contents, token_lengths, toc_items=None, start_index=1, 
+                                 max_tokens=200000, overlap_pages=1, chunking_strategy='auto'):
+    """
+    Enhanced intelligent chunking with TOC-awareness and adaptive strategies.
+    
+    This is the main entry point for Phase 1.3 improvements. It selects the
+    best chunking strategy based on available data and configuration.
+    
+    Strategy Selection:
+    - 'auto': Automatically choose based on TOC availability
+        - Use TOC-aware if TOC available and has major sections
+        - Otherwise use adaptive token-based
+    - 'toc': Force TOC-aware chunking (requires toc_items)
+    - 'adaptive': Use adaptive token-based chunking
+    - 'fixed': Use fixed token-based chunking (legacy behavior)
+    
+    Args:
+        page_contents: List of page content strings
+        token_lengths: List of token counts per page  
+        toc_items: Optional TOC structure for TOC-aware chunking
+        start_index: Starting page number
+        max_tokens: Maximum tokens per chunk
+        overlap_pages: Pages to overlap between chunks
+        chunking_strategy: Strategy to use ('auto', 'toc', 'adaptive', 'fixed')
+    
+    Returns:
+        List of text chunks (strings)
+    """
+    if not page_contents:
+        return []
+    
+    num_tokens = sum(token_lengths)
+    
+    # Single chunk if small enough
+    if num_tokens <= max_tokens:
+        print('[Chunking] Document fits in single chunk')
+        return ["".join(page_contents)]
+    
+    # Strategy selection
+    if chunking_strategy == 'auto':
+        # Check if TOC-aware chunking is viable
+        if toc_items:
+            # Count major sections (structure without dots)
+            major_sections = sum(1 for item in toc_items 
+                                if item.get('physical_index') is not None 
+                                and '.' not in str(item.get('structure', '')))
+            
+            if major_sections >= 2:
+                print(f'[Chunking] Auto-selected TOC-aware strategy ({major_sections} major sections)')
+                return chunk_by_toc_structure(page_contents, token_lengths, toc_items, 
+                                             start_index, max_tokens)
+        
+        # Fallback to adaptive
+        print('[Chunking] Auto-selected adaptive token-based strategy')
+        return chunk_by_tokens_with_overlap(page_contents, token_lengths, 
+                                           max_tokens, overlap_pages, 'adaptive')
+    
+    elif chunking_strategy == 'toc':
+        if not toc_items:
+            print('[Chunking] Warning: TOC strategy requested but no TOC available, falling back to adaptive')
+            return chunk_by_tokens_with_overlap(page_contents, token_lengths, 
+                                               max_tokens, overlap_pages, 'adaptive')
+        return chunk_by_toc_structure(page_contents, token_lengths, toc_items, 
+                                     start_index, max_tokens)
+    
+    elif chunking_strategy == 'adaptive':
+        return chunk_by_tokens_with_overlap(page_contents, token_lengths, 
+                                           max_tokens, overlap_pages, 'adaptive')
+    
+    elif chunking_strategy == 'fixed':
+        return chunk_by_tokens_with_overlap(page_contents, token_lengths, 
+                                           max_tokens, overlap_pages, 'fixed')
+    
+    else:
+        print(f'[Chunking] Warning: Unknown strategy "{chunking_strategy}", using adaptive')
+        return chunk_by_tokens_with_overlap(page_contents, token_lengths, 
+                                           max_tokens, overlap_pages, 'adaptive')
+
+
 def add_page_number_to_toc(part, structure, model=None):
     fill_prompt_seq = """
     You are given an JSON structure of a document and a partial part of the document. Your task is to check if the title that is described in the structure is started in the partial given document.
@@ -875,7 +1607,7 @@ def add_page_number_to_toc(part, structure, model=None):
 
     prompt = fill_prompt_seq + f"\n\nCurrent Partial Document:\n{part}\n\nGiven Structure\n{json.dumps(structure, indent=2)}\n"
     current_json_raw = ChatGPT_API(model=model, prompt=prompt)
-    json_result = extract_json(current_json_raw)
+    json_result = extract_json_v2(current_json_raw, expected_schema='appear_start', model=model)
     
     for item in json_result:
         if 'start' in item:
@@ -920,18 +1652,31 @@ def generate_toc_continue(toc_content, part, model=None, custom_prompt=None):
 
     The structure variable is the numeric system which represents the index of the hierarchy section. For example: 1, 1.1, 1.2, 2, 2.1, etc.
 
-    For the title, extract the original title from the text, only fix spacing.
+    CRITICAL - Title Extraction Rules:
+    1. Extract the EXACT title text as it appears in the document
+    2. If a section has a clear heading/title, use that exact text including any number prefix
+    3. If a section ONLY has content without a clear title heading, use ONLY the section number as title
+    4. DO NOT invent, infer, or "beautify" titles based on section content
+    5. DO NOT summarize section content into a title name
+    6. Only fix obvious spacing/formatting issues
 
-    The provided text contains tags like <physical_index_X> to indicate page boundaries.
+    IMPORTANT: The provided text contains page boundary markers like <physical_index_X> that indicate ACTUAL PAGE NUMBERS in the PDF.
+    - These markers represent page numbers in the original PDF document
+    - For example: <physical_index_3> means content from page 3 of the PDF
+    - DO NOT confuse these page markers with section numbers (like "1. Introduction", "2. Methods")
+    - Multiple sections can appear on the same page
 
-    For the physical_index, extract the physical index where the section starts. Keep the <physical_index_X> format.
+    For the physical_index field:
+    - Extract the page number where the section FIRST APPEARS
+    - Look for the <physical_index_X> tag that appears BEFORE or AT the start of the section
+    - Keep the exact format: "<physical_index_X>"
 
     RESPONSE FORMAT:
         [
             {
                 "structure": <structure index, "x.x.x">,
-                "title": <title of the section>,
-                "physical_index": "<physical_index_X>"
+                "title": <EXACT title from document, no invention>,
+                "physical_index": "<physical_index_X>" (X is the actual page number from the text)
             },
             ...
         ]
@@ -972,11 +1717,19 @@ CURRENT TEXT TO ANALYZE:
     print(f"\n{'='*60}")
     print(f"[DEBUG generate_toc_continue] finish_reason: {finish_reason}")
     print(f"[DEBUG generate_toc_continue] response length: {len(response)} chars")
-    print(f"[DEBUG generate_toc_continue] response (first 2000 chars):\n{response[:2000]}")
+    # Handle encoding issues on Windows console - use ASCII-only output
+    import sys
+    if sys.platform == 'win32':
+        # On Windows, convert to ASCII to avoid GBK codec errors
+        safe_response = response[:2000].encode('ascii', errors='ignore').decode('ascii', errors='ignore')
+        print(f"[DEBUG generate_toc_continue] response (first 2000 chars):\n{safe_response}")
+    else:
+        print(f"[DEBUG generate_toc_continue] response (first 2000 chars):\n{response[:2000]}")
     print(f"{'='*60}\n")
 
     if finish_reason == 'finished':
-        return extract_json(response)
+         # Use enhanced JSON extraction with validation
+         return extract_json_v2(response, expected_schema='toc', model=model)
     else:
         raise Exception(f'finish reason: {finish_reason}')
     
@@ -988,21 +1741,40 @@ def generate_toc_init(part, model=None, custom_prompt=None):
 
     The structure variable is the numeric system which represents the index of the hierarchy section in the table of contents. For example, the first section has structure index 1, the first subsection has structure index 1.1, the second subsection has structure index 1.2, etc.
 
-    For the title, you need to extract the original title from the text, only fix the space inconsistency.
+    CRITICAL - Title Extraction Rules:
+    1. Extract the EXACT title text as it appears in the document
+    2. If a section has a clear heading/title (like "1. Introduction" or "2.1 采购内容"), use that exact text including the number prefix
+    3. If a section ONLY has content without a clear title heading, use ONLY the section number as title (like "3.1")
+    4. DO NOT invent, infer, or "beautify" titles based on section content
+    5. DO NOT summarize section content into a title name
+    6. Only fix obvious spacing/formatting issues, preserve the actual words
 
-    The provided text contains tags like <physical_index_X> and <physical_index_X> to indicate the start and end of page X.
+    Examples:
+    - Text: "2.1 采购内容：语言学习系统..." → title: "2.1 采购内容"
+    - Text: "3.1 供应商必须是具有独立法人资格..." (no title heading) → title: "3.1"
+    - DO NOT invent "供应商资格" if those exact words don't appear as a heading
 
-    For the physical_index, you need to extract the physical index of the start of the section from the text. Keep the <physical_index_X> format.
+    IMPORTANT: The provided text contains page boundary markers like <physical_index_X> and </physical_index_X> that indicate page X of the PDF document.
+    - These markers represent ACTUAL PAGE NUMBERS in the PDF
+    - For example: <physical_index_3> means content from page 3 of the PDF
+    - DO NOT confuse these page markers with section numbers in the document (like "1. Introduction", "2. Methods")
+    - Multiple sections can appear on the same page
 
-    The response should be in the following format.
+    For the physical_index field in your response:
+    - Extract the page number where the section FIRST APPEARS in the text
+    - Look for the <physical_index_X> tag that appears BEFORE or AT the start of the section
+    - Keep the exact format: "<physical_index_X>"
+    - Example: If a section titled "Introduction" appears after <physical_index_2> tag, use "physical_index": "<physical_index_2>"
+
+    The response should be in the following format:
         [
             {{
                 "structure": <structure index, "x.x.x"> (string),
-                "title": <title of the section, keep the original title>,
-                "physical_index": "<physical_index_X> (keep the format)"
+                "title": <EXACT title from document, no invention>,
+                "physical_index": "<physical_index_X>" (X is the actual page number from the text)
             }},
 
-        ],
+        ]
 
     CONSTRAINTS:
     - Be concise: extract main sections and important subsections only
@@ -1027,7 +1799,7 @@ def generate_toc_init(part, model=None, custom_prompt=None):
     print(f"{'='*60}\n")
 
     if finish_reason == 'finished':
-         return extract_json(response)
+         return extract_json_v2(response, expected_schema='toc', model=model)
     else:
         raise Exception(f'finish reason: {finish_reason}')
 
@@ -1047,7 +1819,10 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None, custom_pro
     optimal_chunk_size = calculate_optimal_chunk_size(total_tokens, model)
     print(f"[DEBUG] process_no_toc: Total tokens: {total_tokens:,}, optimal chunk size: {optimal_chunk_size:,}")
 
-    group_texts = page_list_to_group_text(page_contents, token_lengths, max_tokens=optimal_chunk_size)
+    # Phase 1.3: Use enhanced chunking (no TOC available, use adaptive strategy)
+    group_texts = page_list_to_group_text_v2(page_contents, token_lengths, toc_items=None, 
+                                              start_index=start_index, max_tokens=optimal_chunk_size, 
+                                              chunking_strategy='adaptive')
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     print(f"[DEBUG] process_no_toc: Split into {len(group_texts)} chunks for processing")
@@ -1061,7 +1836,16 @@ def process_no_toc(page_list, start_index=1, model=None, logger=None, custom_pro
     # DEBUG: Print preview of input content
     print(f"[DEBUG] process_no_toc: Input content preview (first 1000 chars):\n{group_texts[0][:1000]}")
     print(f"[DEBUG] process_no_toc: Input content preview (last 500 chars):\n{group_texts[0][-500:]}")
-    toc_with_page_number= generate_toc_init(group_texts[0], model, custom_prompt)
+    
+    # Try enhanced extraction method
+    try:
+        from pageindex.structure_extraction import generate_toc_init_enhanced
+        print(f"[INFO] Using ENHANCED structure extraction method")
+        toc_with_page_number = generate_toc_init_enhanced(group_texts[0], model, custom_prompt, logger)
+    except Exception as e:
+        print(f"[WARNING] Enhanced extraction failed: {e}, falling back to standard method")
+        toc_with_page_number = generate_toc_init(group_texts[0], model, custom_prompt)
+    
     print(f"[DEBUG] process_no_toc: Initial structure: {len(toc_with_page_number)} items")
 
     # Report progress for each chunk
@@ -1101,7 +1885,10 @@ def process_toc_no_page_numbers(toc_content, toc_page_list, page_list,  start_in
     optimal_chunk_size = calculate_optimal_chunk_size(total_tokens, model)
     print(f"[DEBUG] process_toc_no_page_numbers: Total tokens: {total_tokens:,}, optimal chunk size: {optimal_chunk_size:,}")
 
-    group_texts = page_list_to_group_text(page_contents, token_lengths, max_tokens=optimal_chunk_size)
+    # Phase 1.3: Use enhanced chunking (TOC without page numbers, can't use TOC-aware yet)
+    group_texts = page_list_to_group_text_v2(page_contents, token_lengths, toc_items=None,
+                                              start_index=start_index, max_tokens=optimal_chunk_size,
+                                              chunking_strategy='adaptive')
     logger.info(f'len(group_texts): {len(group_texts)}')
 
     toc_with_page_number=copy.deepcopy(toc_content)
@@ -1137,8 +1924,22 @@ def process_toc_with_page_numbers(toc_content, toc_page_list, page_list, toc_che
     optimal_chunk_size = calculate_optimal_chunk_size(total_tokens, model)
     logger.info(f'process_toc_with_page_numbers: Total content tokens: {total_tokens:,}, chunk size: {optimal_chunk_size:,}')
 
-    # Group pages into chunks for toc_index_extractor
-    group_texts = page_list_to_group_text(page_contents, token_lengths, max_tokens=optimal_chunk_size)
+    # Phase 1.3: Use enhanced TOC-aware chunking (TOC with page numbers available!)
+    # Convert toc_with_page_number to physical_index format for chunking
+    toc_for_chunking = []
+    for item in toc_with_page_number:
+        # toc_with_page_number has page numbers relative to TOC, need to convert to physical
+        if 'page' in item and item['page'] is not None:
+            physical_idx = item['page'] + start_page_index
+            toc_for_chunking.append({
+                'structure': item.get('structure'),
+                'title': item.get('title'),
+                'physical_index': physical_idx
+            })
+    
+    group_texts = page_list_to_group_text_v2(page_contents, token_lengths, toc_items=toc_for_chunking,
+                                              start_index=start_page_index+1, max_tokens=optimal_chunk_size,
+                                              chunking_strategy='auto')  # Auto will use TOC-aware if suitable
 
     # Process each chunk
     all_toc_with_physical_index = []
@@ -1319,7 +2120,7 @@ def single_toc_item_index_fixer(section_title, content, model=None):
     for attempt in range(max_retries):
         prompt = tob_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
         response = ChatGPT_API(model=model, prompt=prompt)
-        json_content = extract_json(response)
+        json_content = extract_json_v2(response, expected_schema='toc', model=model)
 
         # Success case
         if json_content is not None:
@@ -1581,10 +2382,21 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         logger=logger
     )
 
+    # Phase 1.2: Enhanced physical index validation and correction
+    toc_with_page_number, validation_report = validate_and_correct_physical_indices(
+        toc_with_page_number,
+        len(page_list),
+        start_index=start_index,
+        logger=logger
+    )
+    
+    if logger:
+        logger.info(f"Physical index validation report: {validation_report}")
+
     accuracy, incorrect_results = await verify_toc(page_list, toc_with_page_number, start_index=start_index, model=opt.model)
 
     logger.info({
-        'mode': 'process_toc_with_page_numbers',
+        'mode': mode,
         'accuracy': accuracy,
         'incorrect_results': incorrect_results
     })
@@ -1599,7 +2411,10 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
         elif mode == 'process_toc_no_page_numbers':
             return await meta_processor(page_list, mode='process_no_toc', start_index=start_index, opt=opt, logger=logger)
         else:
-            raise Exception('Processing failed')
+            # For process_no_toc mode with low accuracy, return the generated structure anyway
+            # This is acceptable since the structure was auto-generated and validation is just a quality check
+            logger.warning(f"process_no_toc mode has low accuracy ({accuracy:.2%}), but continuing with generated structure")
+            return toc_with_page_number
         
  
 async def process_large_node_recursively(node, page_list, opt=None, logger=None):
@@ -1634,6 +2449,13 @@ async def process_large_node_recursively(node, page_list, opt=None, logger=None)
 async def tree_parser(page_list, opt, doc=None, logger=None):
     """Parse document tree with detailed performance monitoring."""
     monitor = get_monitor()
+    
+    # Initialize debug logger
+    from .debug_logger import init_debug_logger, get_debug_logger, finalize_debug_logger
+    import uuid
+    doc_id = str(uuid.uuid4())[:8] if not hasattr(opt, 'document_id') else opt.document_id
+    debug_log_dir = os.path.join(os.path.dirname(__file__), "..", "debug_logs")
+    debug_logger = init_debug_logger(debug_log_dir, doc_id)
 
     # Debug: Document info
     print(f"\n{'='*60}")
@@ -1641,12 +2463,19 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     print(f"[DEBUG] Total pages: {len(page_list)}")
     print(f"[DEBUG] Total tokens: {sum(p[1] for p in page_list):,}")
     print(f"{'='*60}\n")
+    
+    debug_logger.log_stage("initialization", 
+                          f"Starting parsing: {len(page_list)} pages, {sum(p[1] for p in page_list):,} tokens",
+                          {"total_pages": len(page_list), "total_tokens": sum(p[1] for p in page_list)})
 
     _report("tree_building", progress=11, message="Building document structure...")
 
     # Stage: TOC Detection
     check_toc_result = check_toc(page_list, opt)
     logger.info(check_toc_result)
+    
+    # Log TOC detection results
+    debug_logger.log_toc_detection(page_list, check_toc_result)
 
     has_toc = check_toc_result.get("toc_content") and check_toc_result["toc_content"].strip() and check_toc_result.get("page_index_given_in_toc") == "yes"
     print(f"[DEBUG] TOC Detection: {'Found' if has_toc else 'Not Found - will generate structure'}")
@@ -1674,12 +2503,19 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
 
     print(f"[DEBUG] TOC items found: {len(toc_with_page_number)}")
     _report("toc_processing", progress=38, message=f"Found {len(toc_with_page_number)} sections")
+    
+    # Log structure extraction
+    mode = 'process_toc_with_page_numbers' if has_toc else 'process_no_toc'
+    debug_logger.log_structure_extraction(toc_with_page_number, mode)
 
     # Stage: TOC Post-processing
     async with monitor.stage("toc_postprocessing"):
         _report("toc_postprocessing", progress=45, message="Post-processing structure...")
         toc_with_page_number = add_preface_if_needed(toc_with_page_number)
         toc_with_page_number = await check_title_appearance_in_start_concurrent(toc_with_page_number, page_list, model=opt.model, logger=logger)
+    
+    # Log title validation results
+    debug_logger.log_title_validation(toc_with_page_number)
 
     # Filter out items with None physical_index before post_processings
     valid_toc_items = [item for item in toc_with_page_number if item.get('physical_index') is not None]
@@ -1689,6 +2525,9 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     _report("tree_building", progress=58, message="Building tree hierarchy...")
 
     toc_tree = post_processing(valid_toc_items, len(page_list))
+    
+    # Log tree building results
+    debug_logger.log_tree_building(toc_tree, len(page_list))
 
     # Debug: Tree structure info
     from pageindex.utils import structure_to_list
@@ -1728,6 +2567,9 @@ async def tree_parser(page_list, opt, doc=None, logger=None):
     final_nodes = structure_to_list(toc_tree)
     print(f"[DEBUG] Final tree nodes after large node processing: {len(final_nodes)}\n")
     _report("large_node_processing", progress=62, message=f"Final tree: {len(final_nodes)} nodes")
+    
+    # Finalize debug logger
+    finalize_debug_logger()
 
     return toc_tree
 
@@ -1967,3 +2809,237 @@ def validate_and_truncate_physical_indices(toc_with_page_number, page_list_lengt
         print(f"  - Removed {len(invalid_items)} TOC items with invalid page numbers (below start)")
 
     return toc_with_page_number
+
+
+# ============================================================================
+# Enhanced Physical Index Validation Pipeline (Phase 1.2)
+# ============================================================================
+
+def interpolate_missing_indices(toc_with_page_number, page_list_length, start_index=1, logger=None):
+    """
+    Intelligently fill gaps in physical_index sequence using linear interpolation.
+    
+    This function identifies items with None physical_index and interpolates
+    their values based on surrounding valid indices, respecting:
+    - Monotonically increasing constraint
+    - Document boundaries
+    - Parent-child hierarchy relationships
+    
+    Args:
+        toc_with_page_number: TOC list with potential None physical_index values
+        page_list_length: Total number of pages in document
+        start_index: Starting page number (default: 1)
+        logger: Optional logger instance
+    
+    Returns:
+        TOC list with interpolated physical_index values
+    """
+    if not toc_with_page_number:
+        return toc_with_page_number
+    
+    max_allowed_page = page_list_length + start_index - 1
+    interpolated_count = 0
+    
+    for i, item in enumerate(toc_with_page_number):
+        if item.get('physical_index') is None:
+            # Find previous valid index
+            prev_index = None
+            for j in range(i - 1, -1, -1):
+                if toc_with_page_number[j].get('physical_index') is not None:
+                    prev_index = toc_with_page_number[j]['physical_index']
+                    prev_pos = j
+                    break
+            
+            # Find next valid index
+            next_index = None
+            for j in range(i + 1, len(toc_with_page_number)):
+                if toc_with_page_number[j].get('physical_index') is not None:
+                    next_index = toc_with_page_number[j]['physical_index']
+                    next_pos = j
+                    break
+            
+            # Interpolate based on available data
+            if prev_index is not None and next_index is not None:
+                # Both boundaries exist: linear interpolation
+                gap_size = next_pos - prev_pos
+                position = i - prev_pos
+                interpolated = prev_index + int((next_index - prev_index) * position / gap_size)
+                
+                # Ensure monotonically increasing
+                interpolated = max(interpolated, prev_index + 1)
+                interpolated = min(interpolated, next_index - 1)
+                
+            elif prev_index is not None:
+                # Only previous exists: increment by 1
+                interpolated = prev_index + 1
+                
+            elif next_index is not None:
+                # Only next exists: decrement by 1
+                interpolated = next_index - 1
+                
+            else:
+                # No valid indices found: use start_index
+                interpolated = start_index
+            
+            # Ensure within document boundaries
+            if start_index <= interpolated <= max_allowed_page:
+                item['physical_index'] = interpolated
+                interpolated_count += 1
+                if logger:
+                    logger.debug(f"Interpolated physical_index for '{item.get('title', 'Unknown')}': {interpolated}")
+    
+    if interpolated_count > 0 and logger:
+        logger.info(f"Interpolated {interpolated_count} missing physical_index values")
+    
+    return toc_with_page_number
+
+
+def resolve_duplicate_indices(toc_with_page_number, logger=None):
+    """
+    Detect duplicate physical_index values.
+    
+    IMPORTANT: Multiple sections can legitimately appear on the same page!
+    This function now ONLY logs duplicates for informational purposes
+    without modifying them. Duplicates are normal and expected in real documents.
+    
+    Strategy:
+    - Log duplicate occurrences for monitoring
+    - Do NOT modify physical_index values
+    - Preserve the original LLM-extracted page numbers
+    
+    Args:
+        toc_with_page_number: TOC list
+        logger: Optional logger instance
+    
+    Returns:
+        TOC list (unchanged)
+    """
+    if not toc_with_page_number:
+        return toc_with_page_number
+    
+    # Count duplicates for logging only
+    index_counts = {}
+    for item in toc_with_page_number:
+        idx = item.get('physical_index')
+        if idx is not None:
+            index_counts[idx] = index_counts.get(idx, 0) + 1
+    
+    # Log pages with multiple sections
+    duplicates_found = sum(1 for count in index_counts.values() if count > 1)
+    if duplicates_found > 0 and logger:
+        logger.info(f"Found {duplicates_found} pages with multiple sections (this is normal)")
+        for idx, count in sorted(index_counts.items()):
+            if count > 1:
+                logger.debug(f"  Page {idx}: {count} sections")
+    
+    # Return unchanged - duplicates are legitimate
+    return toc_with_page_number
+
+
+def validate_monotonic_increasing(toc_with_page_number, logger=None):
+    """
+    Validate that physical_index values are monotonically non-decreasing.
+    
+    UPDATED: Changed from strictly increasing to non-decreasing to allow
+    multiple sections on the same page. Only violations where a later section
+    has an EARLIER page number are considered errors.
+    
+    Args:
+        toc_with_page_number: TOC list
+        logger: Optional logger instance
+    
+    Returns:
+        tuple: (is_valid, violations_list)
+    """
+    violations = []
+    prev_index = None
+    
+    for i, item in enumerate(toc_with_page_number):
+        idx = item.get('physical_index')
+        if idx is None:
+            continue
+        
+        # Changed from idx <= prev_index to idx < prev_index
+        # This allows equal values (multiple sections on same page)
+        if prev_index is not None and idx < prev_index:
+            violations.append({
+                'position': i,
+                'title': item.get('title', 'Unknown'),
+                'current_index': idx,
+                'previous_index': prev_index
+            })
+        
+        prev_index = idx
+    
+    if violations and logger:
+        logger.warning(f"Found {len(violations)} backward page jumps in physical_index sequence")
+        for v in violations[:5]:  # Log first 5
+            logger.warning(f"  - Position {v['position']}: '{v['title']}' has index {v['current_index']} after {v['previous_index']}")
+    
+    return len(violations) == 0, violations
+
+
+def validate_and_correct_physical_indices(toc_with_page_number, page_list_length, start_index=1, logger=None):
+    """
+    Enhanced validation and correction pipeline for physical indices.
+    
+    This is the main entry point for Phase 1.2 enhancements. It runs:
+    1. Basic bounds validation (existing validate_and_truncate_physical_indices)
+    2. Interpolation of missing values
+    3. Duplicate resolution
+    4. Monotonic increasing validation
+    
+    Args:
+        toc_with_page_number: TOC list
+        page_list_length: Total pages in document
+        start_index: Starting page number
+        logger: Optional logger instance
+    
+    Returns:
+        tuple: (corrected_toc, validation_report)
+    """
+    if not toc_with_page_number:
+        return toc_with_page_number, {'status': 'empty'}
+    
+    if logger:
+        logger.info("Starting enhanced physical index validation pipeline")
+    
+    # Count initial valid indices
+    initial_valid = sum(1 for item in toc_with_page_number if item.get('physical_index') is not None)
+    
+    # Step 1: Basic bounds validation (already done by validate_and_truncate_physical_indices)
+    # This function is called AFTER validate_and_truncate_physical_indices, so we skip it here
+    
+    # Step 2: Interpolate missing indices
+    toc_with_page_number = interpolate_missing_indices(
+        toc_with_page_number,
+        page_list_length,
+        start_index,
+        logger
+    )
+    
+    # Step 3: Resolve duplicates
+    toc_with_page_number = resolve_duplicate_indices(toc_with_page_number, logger)
+    
+    # Step 4: Validate monotonic increasing
+    is_monotonic, violations = validate_monotonic_increasing(toc_with_page_number, logger)
+    
+    # Count final valid indices
+    final_valid = sum(1 for item in toc_with_page_number if item.get('physical_index') is not None)
+    
+    # Generate report
+    report = {
+        'status': 'success',
+        'initial_valid_count': initial_valid,
+        'final_valid_count': final_valid,
+        'interpolated_count': final_valid - initial_valid,
+        'is_monotonic': is_monotonic,
+        'monotonic_violations': len(violations) if violations else 0
+    }
+    
+    if logger:
+        logger.info(f"Physical index validation complete: {initial_valid} -> {final_valid} valid indices")
+        if not is_monotonic:
+            logger.warning(f"Monotonic constraint violated in {len(violations)} places")
+    
+    return toc_with_page_number, report

@@ -1,0 +1,111 @@
+{
+  "document_id": "b1a818a8",
+  "timestamp": "20260131_185641",
+  "stages": {
+    "initialization": [
+      {
+        "timestamp": "0.00s",
+        "message": "Starting parsing: 5 pages, 2,776 tokens",
+        "data": {
+          "total_pages": 5,
+          "total_tokens": 2776
+        }
+      }
+    ],
+    "toc_detection": [
+      {
+        "timestamp": "6.86s",
+        "message": "No TOC detected - will auto-generate structure",
+        "data": {
+          "total_pages": 5,
+          "has_toc": null,
+          "toc_pages": [],
+          "has_page_numbers": false,
+          "toc_content_length": 0
+        }
+      }
+    ],
+    "structure_extraction": [
+      {
+        "timestamp": "41.61s",
+        "message": "Extracted 19 structure items using mode: process_no_toc",
+        "data": {
+          "mode": "process_no_toc",
+          "total_items": 19,
+          "items_with_page": 5,
+          "items_without_page": 14,
+          "sample_items": [
+            {
+              "structure": "1.1",
+              "title": "Background and Context",
+              "physical_index": 1,
+              "source": "explicit",
+              "appear_start": "no"
+            },
+            {
+              "structure": "1.1.1",
+              "title": "The Problem Statement",
+              "physical_index": 2,
+              "source": "semantic",
+              "appear_start": "no"
+            },
+            {
+              "structure": "1.1.2",
+              "title": "Historical Overview",
+              "physical_index": 3,
+              "source": "semantic",
+              "appear_start": "no"
+            },
+            {
+              "structure": "1.2",
+              "title": "Project Objectives",
+              "physical_index": 4,
+              "source": "explicit",
+              "appear_start": "no"
+            },
+            {
+              "structure": "2",
+              "title": "Methodology",
+              "physical_index": 5,
+              "source": "explicit",
+              "appear_start": "no"
+            }
+          ],
+          "structure_distribution": {
+            "2": 9,
+            "3": 7,
+            "1": 3
+          }
+        }
+      }
+    ],
+    "title_validation": [
+      {
+        "timestamp": "44.47s",
+        "message": "Title validation: 0/0 titles confirmed (0%)",
+        "data": {
+          "total_validated": 0,
+          "confirmed": 0,
+          "rejected": 0,
+          "confirmation_rate": "0%"
+        }
+      }
+    ],
+    "tree_building": [
+      {
+        "timestamp": "44.47s",
+        "message": "Tree built: 0 nodes, depth 0",
+        "data": {
+          "total_nodes": 0,
+          "max_depth": 0,
+          "total_pages": 5,
+          "avg_pages_per_node": 0,
+          "min_pages": 0,
+          "max_pages": 0,
+          "content_issues_count": 0
+        }
+      }
+    ]
+  },
+  "total_time": "44.47s"
+}
