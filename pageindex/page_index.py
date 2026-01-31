@@ -397,14 +397,69 @@ async def check_title_appearance_in_start_concurrent(structure, page_list, model
            message=f"Validated {confirmed}/{len(results)} section titles")
 
     # NEW: Remove invalid entries (titles not found in their page)
-    # Keep only entries where appear_start == 'yes'
-    removed_count = 0
+    # Cascade removal: when a parent is removed, all its children are also removed
     original_count = len(structure)
-    structure[:] = [item for item in structure if item.get('appear_start') != 'no']
-    removed_count = original_count - len(structure)
-    
-    if removed_count > 0 and logger:
-        logger.info(f"[Validation] Removed {removed_count} invalid index entries (titles not found in document)")
+
+    # Build parent-child relationship map and identify items to remove
+    parent_map = {}  # {child_structure_code: parent_structure_code}
+    structure_to_item = {}  # {structure_code: item}
+
+    for item in structure:
+        struct_code = str(item.get('structure', ''))
+        structure_to_item[struct_code] = item
+        parts = struct_code.split('.')
+        if len(parts) > 1:
+            parent_code = '.'.join(parts[:-1])
+            parent_map[struct_code] = parent_code
+
+    # Find all items to remove (including cascaded children)
+    items_to_remove = set()
+
+    # First pass: mark items with appear_start == 'no'
+    for item in structure:
+        if item.get('appear_start') == 'no':
+            struct_code = str(item.get('structure', ''))
+            items_to_remove.add(struct_code)
+
+    # Second pass: cascade mark all descendants of removed parents
+    changed = True
+    max_iterations = 10  # Prevent infinite loops
+    iteration = 0
+
+    while changed and iteration < max_iterations:
+        changed = False
+        iteration += 1
+
+        for child_code, parent_code in parent_map.items():
+            if child_code not in items_to_remove and parent_code in items_to_remove:
+                items_to_remove.add(child_code)
+                changed = True
+
+    # Filter out items to remove
+    removed_count = 0
+    filtered_structure = []
+
+    for item in structure:
+        struct_code = str(item.get('structure', ''))
+        if struct_code in items_to_remove:
+            removed_count += 1
+        else:
+            filtered_structure.append(item)
+
+    structure[:] = filtered_structure
+
+    # Log cascade removal info
+    if removed_count > 0:
+        directly_removed = sum(1 for item in structure_to_item.values()
+                              if item.get('appear_start') == 'no')
+        cascaded_removed = removed_count - directly_removed
+
+        print(f"[DEBUG] Title validation: removed {removed_count} items "
+              f"({directly_removed} direct + {cascaded_removed} cascaded children)")
+
+        if logger:
+            logger.info(f"[Validation] Removed {removed_count} items "
+                       f"({directly_removed} failed validation + {cascaded_removed} cascaded children)")
 
     return structure
 
@@ -1313,21 +1368,22 @@ def calculate_optimal_chunk_size(total_tokens, model=None):
             return min(total_tokens / 5 + 10000, available_for_content)
     else:
         # For normal context models (128K-200K)
-        if total_tokens <= 20000:
+        # Reduced chunking strategy to maintain better structure continuity
+        if total_tokens <= 30000:
             # Small docs: single chunk
             return min(total_tokens + 5000, available_for_content)
-        elif total_tokens <= 50000:
-            # Medium docs: more chunks with smaller size
-            return min(total_tokens / 5 + 5000, available_for_content)
+        elif total_tokens <= 60000:
+            # Medium docs: 2 chunks for better structure preservation
+            return min(total_tokens / 2 + 5000, available_for_content)
         elif total_tokens <= 100000:
-            # Medium-large docs: more chunks with smaller size
-            return min(total_tokens / 6 + 5000, available_for_content)
+            # Medium-large docs: 3 chunks
+            return min(total_tokens / 3 + 5000, available_for_content)
         elif total_tokens <= 150000:
-            # Large docs: more chunks with smaller size
-            return min(total_tokens / 8 + 5000, available_for_content)
+            # Large docs: 4 chunks
+            return min(total_tokens / 4 + 5000, available_for_content)
         else:
-            # Very large docs: use smaller chunks
-            return min(total_tokens / 10 + 5000, available_for_content)
+            # Very large docs: 5 chunks max
+            return min(total_tokens / 5 + 5000, available_for_content)
 
 
 def page_list_to_group_text(page_contents, token_lengths, max_tokens=200000, overlap_page=1):    
@@ -2088,12 +2144,20 @@ def single_toc_item_index_fixer(section_title, content, model=None):
         tob_extractor_prompt = """
         You are given a section title and several pages of a document, your job is to find the physical index of the start page of the section.
 
-        The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
+        The provided pages contains tags like <physical_index_X> to indicate the physical location of the page, where X is the page number.
 
         Reply in a JSON format:
         {
-            "physical_index": "<physical_index_X>"
+            "physical_index": <the actual page number as an integer, e.g., 15>
         }
+
+        EXAMPLE:
+        If the section starts on page tagged <physical_index_15>, return:
+        {
+            "physical_index": 15
+        }
+
+        IMPORTANT: "physical_index" must be an integer (e.g., 15, NOT "<physical_index_15>")
 
         Directly return the final JSON structure. Do not output anything else."""
     else:
@@ -2101,16 +2165,24 @@ def single_toc_item_index_fixer(section_title, content, model=None):
         tob_extractor_prompt = """
         You are given a section title and several pages of a document, your job is to find the physical index of the start page of the section in the partial document.
 
-        The provided pages contains tags like <physical_index_X> and <physical_index_X> to indicate the physical location of the page X.
+        The provided pages contains tags like <physical_index_X> to indicate the physical location of the page, where X is the page number.
 
         Reply in a JSON format:
         {
             "thinking": <brief explanation of which page contains the section start, max 50 words>,
-            "physical_index": "<physical_index_X>" (keep the format)
+            "physical_index": <the actual page number as an integer, e.g., 15>
+        }
+
+        EXAMPLE:
+        If the section starts on page tagged <physical_index_15>, return:
+        {
+            "thinking": "Section title found on page 15",
+            "physical_index": 15
         }
 
         CONSTRAINTS:
         - Keep "thinking" field brief and concise (under 50 words)
+        - "physical_index" must be an integer (e.g., 15, NOT "<physical_index_15>")
         - Focus on the result, not detailed reasoning
         - Ensure JSON is properly formatted and complete
 
@@ -2120,7 +2192,7 @@ def single_toc_item_index_fixer(section_title, content, model=None):
     for attempt in range(max_retries):
         prompt = tob_extractor_prompt + '\nSection Title:\n' + str(section_title) + '\nDocument pages:\n' + content
         response = ChatGPT_API(model=model, prompt=prompt)
-        json_content = extract_json_v2(response, expected_schema='toc', model=model)
+        json_content = extract_json_v2(response, expected_schema='single_item_fixer', model=model)
 
         # Success case
         if json_content is not None:
@@ -2417,33 +2489,52 @@ async def meta_processor(page_list, mode=None, toc_content=None, toc_page_list=N
             return toc_with_page_number
         
  
-async def process_large_node_recursively(node, page_list, opt=None, logger=None):
+async def process_large_node_recursively(node, page_list, opt=None, logger=None, current_depth=0):
+    """
+    Recursively process large nodes with depth limit.
+
+    Args:
+        node: The node to process
+        page_list: List of pages
+        opt: Options
+        logger: Logger instance
+        current_depth: Current depth in the tree (0 = root level)
+    """
+    # Maximum hierarchy depth limit
+    MAX_DEPTH = 4
+
     node_page_list = page_list[node['start_index']-1:node['end_index']]
     token_num = sum([page[1] for page in node_page_list])
-    
-    if node['end_index'] - node['start_index'] > opt.max_page_num_each_node and token_num >= opt.max_token_num_each_node:
-        print('large node:', node['title'], 'start_index:', node['start_index'], 'end_index:', node['end_index'], 'token_num:', token_num)
 
-        node_toc_tree = await meta_processor(node_page_list, mode='process_no_toc', start_index=node['start_index'], opt=opt, logger=logger)
-        node_toc_tree = await check_title_appearance_in_start_concurrent(node_toc_tree, page_list, model=opt.model, logger=logger)
-        
-        # Filter out items with None physical_index before post_processing
-        valid_node_toc_items = [item for item in node_toc_tree if item.get('physical_index') is not None]
-        
-        if valid_node_toc_items and node['title'].strip() == valid_node_toc_items[0]['title'].strip():
-            node['nodes'] = post_processing(valid_node_toc_items[1:], node['end_index'])
-            node['end_index'] = valid_node_toc_items[1]['start_index'] if len(valid_node_toc_items) > 1 else node['end_index']
-        else:
-            node['nodes'] = post_processing(valid_node_toc_items, node['end_index'])
-            node['end_index'] = valid_node_toc_items[0]['start_index'] if valid_node_toc_items else node['end_index']
-        
+    # Only split large nodes if we haven't reached max depth
+    if current_depth < MAX_DEPTH:
+        if node['end_index'] - node['start_index'] > opt.max_page_num_each_node and token_num >= opt.max_token_num_each_node:
+            print(f'large node (depth {current_depth}): {node["title"][:50]}, start_index: {node["start_index"]}, end_index: {node["end_index"]}, token_num: {token_num}')
+
+            node_toc_tree = await meta_processor(node_page_list, mode='process_no_toc', start_index=node['start_index'], opt=opt, logger=logger)
+            node_toc_tree = await check_title_appearance_in_start_concurrent(node_toc_tree, page_list, model=opt.model, logger=logger)
+
+            # Filter out items with None physical_index before post_processing
+            valid_node_toc_items = [item for item in node_toc_tree if item.get('physical_index') is not None]
+
+            if valid_node_toc_items and node['title'].strip() == valid_node_toc_items[0]['title'].strip():
+                node['nodes'] = post_processing(valid_node_toc_items[1:], node['end_index'])
+                node['end_index'] = valid_node_toc_items[1]['start_index'] if len(valid_node_toc_items) > 1 else node['end_index']
+            else:
+                node['nodes'] = post_processing(valid_node_toc_items, node['end_index'])
+                node['end_index'] = valid_node_toc_items[0]['start_index'] if len(valid_node_toc_items) else node['end_index']
+    else:
+        # Reached max depth - skip further splitting
+        if node['end_index'] - node['start_index'] > opt.max_page_num_each_node and token_num >= opt.max_token_num_each_node:
+            print(f'[DEPTH LIMIT] Node "{node["title"][:50]}" at max depth {current_depth}, skipping split ({token_num} tokens, {node["end_index"] - node["start_index"]} pages)')
+
     if 'nodes' in node and node['nodes']:
         tasks = [
-            process_large_node_recursively(child_node, page_list, opt, logger=logger)
+            process_large_node_recursively(child_node, page_list, opt, logger=logger, current_depth=current_depth + 1)
             for child_node in node['nodes']
         ]
         await asyncio.gather(*tasks)
-    
+
     return node
 
 async def tree_parser(page_list, opt, doc=None, logger=None):

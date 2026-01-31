@@ -21,10 +21,70 @@ from pageindex.prompts.structure_extraction_prompts import (
 )
 
 
+def extract_json_object_first(content):
+    """
+    Extract JSON by prioritizing objects {...} over arrays [...].
+    This is specifically for structure analysis which expects a dict.
+
+    Args:
+        content: Raw text content
+
+    Returns:
+        dict: Parsed JSON object, or None if extraction fails
+    """
+    def find_matching_bracket(text, start_char, end_char):
+        """Find matching bracket starting from first occurrence of start_char."""
+        start_idx = text.find(start_char)
+        if start_idx == -1:
+            return None
+
+        count = 0
+        in_string = False
+        escape_next = False
+
+        for i in range(start_idx, len(text)):
+            char = text[i]
+
+            if escape_next:
+                escape_next = False
+                continue
+
+            if char == '\\':
+                escape_next = True
+                continue
+
+            if char == '"' and not escape_next:
+                in_string = not in_string
+                continue
+
+            if not in_string:
+                if char == start_char:
+                    count += 1
+                elif char == end_char:
+                    count -= 1
+                    if count == 0:
+                        return text[start_idx:i+1]
+
+        return None
+
+    try:
+        # Try to find JSON object {...} FIRST (prioritized for structure analysis)
+        json_str = find_matching_bracket(content, '{', '}')
+        if json_str:
+            json_str = json_str.replace('None', 'null')
+            result = json.loads(json_str)
+            if isinstance(result, dict):
+                return result
+
+        return None
+    except Exception as e:
+        return None
+
+
 def analyze_document_structure(document_text: str, model=None) -> Dict:
     """
     Phase 1: Analyze document to determine its structure type.
-    
+
     Returns:
         {
             "structure_type": "highly_structured" | "partially_structured" | "minimally_structured" | "unstructured",
@@ -36,44 +96,51 @@ def analyze_document_structure(document_text: str, model=None) -> Dict:
         }
     """
     from pageindex.utils import ChatGPT_API
-    
+
     # Sample the document (first 3000 chars for quick analysis)
     sample_text = document_text[:3000] if len(document_text) > 3000 else document_text
-    
+
     prompt = ANALYZE_DOCUMENT_STRUCTURE_PROMPT.format(document_text=sample_text)
-    
+
     try:
         response = ChatGPT_API(model=model, prompt=prompt)
-        
+
         # Debug: print LLM response
         print(f"[DEBUG] Structure analysis LLM response (first 500 chars):\n{response[:500]}")
-        
+
         # Try to parse JSON response with robust extraction
         from pageindex.utils import extract_json_markdown_block, extract_json_bracket_matching
-        
+
         # Try multiple extraction methods
         analysis = None
-        
+
         # Method 1: Markdown code block
         analysis = extract_json_markdown_block(response)
-        if analysis:
+        if analysis and isinstance(analysis, dict):
             print(f"[DEBUG] Successfully extracted via markdown block")
-        
-        # Method 2: Bracket matching
-        if not analysis:
-            analysis = extract_json_bracket_matching(response)
+
+        # Method 2: Object-first extraction (for structure analysis)
+        if not analysis or not isinstance(analysis, dict):
+            analysis = extract_json_object_first(response)
             if analysis:
+                print(f"[DEBUG] Successfully extracted via object-first extraction")
+
+        # Method 3: Bracket matching (original, may return list)
+        if not analysis or not isinstance(analysis, dict):
+            analysis = extract_json_bracket_matching(response)
+            if analysis and isinstance(analysis, dict):
                 print(f"[DEBUG] Successfully extracted via bracket matching")
-        
-        # Method 3: Direct JSON parsing
-        if not analysis:
+
+        # Method 4: Direct JSON parsing
+        if not analysis or not isinstance(analysis, dict):
             try:
                 analysis = json.loads(response.strip())
-                print(f"[DEBUG] Successfully extracted via direct JSON parsing")
+                if isinstance(analysis, dict):
+                    print(f"[DEBUG] Successfully extracted via direct JSON parsing")
             except Exception as parse_error:
                 print(f"[DEBUG] Direct JSON parsing failed: {parse_error}")
                 pass
-        
+
         # Validate we got a dict with required keys
         if analysis and isinstance(analysis, dict) and 'structure_type' in analysis:
             logging.info(f"[Structure Analysis] Type: {analysis.get('structure_type')}, "

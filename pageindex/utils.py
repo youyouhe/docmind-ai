@@ -435,9 +435,21 @@ def validate_json_schema(data, schema_type='toc'):
                 return False
             if not required_keys.issubset(item.keys()):
                 return False
-            # Validate physical_index format
-            physical_idx = str(item.get('physical_index', ''))
-            if not re.match(r'<physical_index_\d+>', physical_idx):
+            # Validate physical_index format - accept both placeholder format and integer
+            physical_idx = item.get('physical_index')
+            # Accept either: <physical_index_N> format OR an integer (or string representation of integer)
+            if isinstance(physical_idx, int):
+                # Direct integer is valid
+                continue
+            elif isinstance(physical_idx, str):
+                # String must be either placeholder format or parseable as integer
+                if not re.match(r'<physical_index_\d+>', physical_idx):
+                    # Try to parse as integer
+                    try:
+                        int(physical_idx)
+                    except ValueError:
+                        return False
+            else:
                 return False
         return True
     
@@ -457,7 +469,28 @@ def validate_json_schema(data, schema_type='toc'):
             if 'start' not in item or 'start_index' not in item:
                 return False
         return True
-    
+
+    elif schema_type == 'single_item_fixer':
+        # Single item fixer schema: dict with 'thinking' (optional) and 'physical_index' keys
+        if not isinstance(data, dict):
+            return False
+        if 'physical_index' not in data:
+            return False
+        # Validate physical_index - accept integer, null, or string that can be parsed as integer
+        physical_idx = data.get('physical_index')
+        # Allow None (null) for cases where LLM cannot find the title
+        if physical_idx is None:
+            return True
+        if isinstance(physical_idx, int):
+            return True
+        elif isinstance(physical_idx, str):
+            try:
+                int(physical_idx)
+                return True
+            except ValueError:
+                return False
+        return False
+
     # Unknown schema type
     return False
 
