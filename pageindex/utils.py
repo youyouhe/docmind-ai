@@ -11,6 +11,7 @@ import PyPDF2
 import copy
 import asyncio
 import pymupdf
+import re
 from io import BytesIO
 from dotenv import load_dotenv
 from markitdown import MarkItDown
@@ -1000,10 +1001,123 @@ class JsonLogger:
 
 
 
+def normalize_structure(structure):
+    """
+    Normalize various structure formats to standard numeric format.
+
+    This improves robustness by handling LLM outputs that don't follow
+    the expected "x.x.x" numeric format.
+
+    Examples:
+        "第一部分" → "1"
+        "二" → "2"
+        "4.综合比较与评价" → "4"
+        "二.1" → "2.1"
+        "1.1" → "1.1" (unchanged)
+        "1.2.1" → "1.2.1" (unchanged)
+
+    Args:
+        structure: The structure string to normalize
+
+    Returns:
+        Normalized structure string in numeric format
+    """
+    if not structure:
+        return structure
+
+    structure = str(structure).strip()
+
+    # Case 1: Already in standard format (numbers and dots only)
+    # e.g., "1", "1.1", "1.2.3"
+    if re.match(r'^[\d.]+$', structure):
+        return structure
+
+    # Case 2: Chinese ordinal numbers (第X部分)
+    # e.g., "第一部分" → "1", "第二部分" → "2"
+    match = re.match(r'第([一二三四五六七八九十百]+)部分', structure)
+    if match:
+        chinese_num = match.group(1)
+        # Map Chinese numbers to digits
+        cn_to_digits = {
+            '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+            '六': '6', '七': '7', '八': '8', '九': '9', '十': '10'
+        }
+        if chinese_num in cn_to_digits:
+            return cn_to_digits[chinese_num]
+        # Handle compound numbers like "十一", "十二"
+        elif len(chinese_num) == 2 and chinese_num[0] == '十':
+            second_digit = cn_to_digits.get(chinese_num[1], '0')
+            return '1' + second_digit
+        # Fallback: extract any digits from the string
+        digits = re.findall(r'\d+', structure)
+        return digits[0] if digits else structure
+
+    # Case 3: Chinese numerals with dot-separated sub-items
+    # e.g., "二.1" → "2.1", "三.2.1" → "3.2.1"
+    if '.' in structure:
+        parts = structure.split('.')
+        normalized_parts = []
+        for part in parts:
+            if part in ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']:
+                cn_to_digits = {
+                    '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+                    '六': '6', '七': '7', '八': '8', '九': '9', '十': '10'
+                }
+                normalized_parts.append(cn_to_digits[part])
+            elif re.match(r'^\d+$', part):
+                normalized_parts.append(part)
+            else:
+                # Keep original if not recognized
+                normalized_parts.append(part)
+        return '.'.join(normalized_parts) if any(p != part for p, part in zip(normalized_parts, parts)) else structure
+
+    # Case 4: Chinese numerals directly (single level)
+    # e.g., "一" → "1", "二" → "2", "三" → "3"
+    if structure in ['一', '二', '三', '四', '五', '六', '七', '八', '九', '十']:
+        cn_to_digits = {
+            '一': '1', '二': '2', '三': '3', '四': '4', '五': '5',
+            '六': '6', '七': '7', '八': '8', '九': '9', '十': '10'
+        }
+        return cn_to_digits.get(structure, structure)
+
+    # Case 5: Mixed format with number and text
+    # e.g., "4.综合比较与评价" → "4"
+    match = re.match(r'^(\d+)(?:\.|$)', structure)
+    if match:
+        return match.group(1)
+
+    # Case 6: Try to extract any leading number
+    # e.g., "2.3采购内容" might be parsed by LLM as structure
+    match = re.match(r'^([\d.]+)', structure)
+    if match:
+        extracted = match.group(1)
+        # Ensure it's a valid number/dot format
+        if re.match(r'^[\d.]+$', extracted):
+            return extracted
+
+    # Fallback: return original if no pattern matches
+    return structure
+
+
 def list_to_tree(data):
     import logging
+    import re
     logger = logging.getLogger("pageindex.utils")
     logger.info(f"[LIST_TO_TREE] Converting {len(data)} flat items to tree structure")
+
+    # PRE-PROCESSING: Normalize all structure formats
+    # This handles various LLM output formats (Chinese, mixed, etc.)
+    normalized_count = 0
+    for item in data:
+        original_structure = item.get('structure')
+        if original_structure:
+            normalized = normalize_structure(original_structure)
+            if normalized != original_structure:
+                item['structure'] = normalized
+                normalized_count += 1
+
+    if normalized_count > 0:
+        logger.info(f"[LIST_TO_TREE] Normalized {normalized_count} structure formats to numeric format")
 
     def get_parent_structure(structure):
         """Helper function to get the parent structure code"""
