@@ -360,7 +360,7 @@ async def upload_document(
     if auto_parse:
         absolute_path = storage.get_upload_path(relative_path)
         # Run parsing in background
-        asyncio.create_task(
+        task = asyncio.create_task(
             parse_document_background(
                 document_id=document_id,
                 file_path=str(absolute_path),
@@ -371,6 +371,15 @@ async def upload_document(
                 storage=storage,
             )
         )
+        # Add callback to handle exceptions
+        def task_done_callback(task):
+            try:
+                task.result()
+            except Exception as e:
+                logger.error(f"Background parsing task failed for document {document_id}: {e}")
+                traceback.print_exc()
+        
+        task.add_done_callback(task_done_callback)
 
     return DocumentUploadResponse(
         id=document_id,

@@ -258,7 +258,7 @@ def _wrap_progress_reporting(processor):
             
             if stage and progress_pct is not None:
                 # 转发到老系统
-                report_progress(doc_id, stage, progress_pct, clean_msg)
+                report_progress(doc_id, stage, progress=progress_pct, message=clean_msg)
         
         # 替换函数
         processor.log_progress = wrapped_log_progress
