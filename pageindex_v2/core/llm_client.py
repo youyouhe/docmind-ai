@@ -87,10 +87,19 @@ class LLMClient:
         system: Optional[str] = None,
         temperature: float = 0.1,
         max_retries: int = 3,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        response_format: Optional[str] = None
     ) -> str:
         """
         Async chat with retry and debug logging
+        
+        Args:
+            prompt: User prompt
+            system: System message
+            temperature: Sampling temperature
+            max_retries: Maximum retry attempts
+            max_tokens: Maximum tokens in response
+            response_format: Optional response format ("json_object" for JSON mode)
         """
         if not self.client:
             raise ValueError("LLM client not initialized. Check API key.")
@@ -109,7 +118,7 @@ class LLMClient:
                 print(f"[SYSTEM] {sys_preview}...")
             prompt_preview = prompt[:300].replace('\n', ' ')
             print(f"[PROMPT] {prompt_preview}...")
-            print(f"[PARAMS] temp={temperature}, retries={max_retries}")
+            print(f"[PARAMS] temp={temperature}, retries={max_retries}, format={response_format}")
         
         for attempt in range(max_retries):
             try:
@@ -119,7 +128,8 @@ class LLMClient:
                     "temperature": temperature,
                 }
                 
-                if self._supports_json():
+                # Only use JSON mode if explicitly requested
+                if response_format == "json_object" and self._supports_json():
                     params["response_format"] = {"type": "json_object"}
                 
                 if max_tokens:
@@ -156,7 +166,12 @@ class LLMClient:
         temperature: float = 0.1,
         max_tokens: Optional[int] = None
     ) -> Dict[str, Any]:
-        """Chat with JSON parsing"""
+        """
+        Chat with JSON parsing and structured output
+        
+        Automatically ensures the prompt contains "json" keyword for DeepSeek API
+        and uses response_format: json_object for supported providers.
+        """
         # DeepSeek requires the word "json" in prompt when using response_format: json_object
         # Check both system and user prompt
         has_json_keyword = "json" in prompt.lower()
@@ -166,7 +181,14 @@ class LLMClient:
         if self.provider == "deepseek" and not has_json_keyword:
             prompt = f"{prompt}\n\nPlease respond in JSON format."
         
-        content = await self.chat(prompt, system, temperature, max_tokens=max_tokens)
+        # Use JSON response format
+        content = await self.chat(
+            prompt, 
+            system, 
+            temperature, 
+            max_tokens=max_tokens,
+            response_format="json_object"
+        )
         
         try:
             # Clean up markdown if present
