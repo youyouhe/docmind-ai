@@ -1,0 +1,237 @@
+{
+  "result": {
+    "doc_name": "four-lectures.pdf",
+    "structure": [
+      {
+        "title": "Preface / 前言",
+        "start_index": 1,
+        "end_index": 1,
+        "node_id": "0000",
+        "nodes": []
+      },
+      {
+        "title": "ML at a Glance",
+        "start_index": 2,
+        "nodes": [
+          {
+            "title": "An ML session",
+            "start_index": 2,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0002"
+          },
+          {
+            "title": "Types and Values",
+            "start_index": 3,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0003"
+          },
+          {
+            "title": "Recursive Functions",
+            "start_index": 4,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0004"
+          },
+          {
+            "title": "Raising Exceptions",
+            "start_index": 4,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0005"
+          },
+          {
+            "title": "Structures",
+            "start_index": 5,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0006"
+          },
+          {
+            "title": "Signatures",
+            "start_index": 6,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0007"
+          },
+          {
+            "title": "Coersive Signature Matching",
+            "start_index": 6,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0008"
+          },
+          {
+            "title": "Functor Declaration",
+            "start_index": 7,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0009"
+          },
+          {
+            "title": "Summary",
+            "start_index": 9,
+            "nodes": [],
+            "end_index": 9,
+            "node_id": "0010"
+          }
+        ],
+        "end_index": 9,
+        "node_id": "0001"
+      },
+      {
+        "title": "Programming with ML Modules",
+        "start_index": 10,
+        "nodes": [
+          {
+            "title": "Introduction",
+            "start_index": 10,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0012"
+          },
+          {
+            "title": "Structures",
+            "start_index": 12,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0013"
+          },
+          {
+            "title": "Functors",
+            "start_index": 13,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0014"
+          },
+          {
+            "title": "Substructures",
+            "start_index": 14,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0015"
+          },
+          {
+            "title": "Sharing",
+            "start_index": 15,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0016"
+          },
+          {
+            "title": "Building the System",
+            "start_index": 16,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0017"
+          },
+          {
+            "title": "Separate Compilation",
+            "start_index": 17,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0018"
+          },
+          {
+            "title": "Good Style",
+            "start_index": 18,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0019"
+          },
+          {
+            "title": "Bad Style",
+            "start_index": 18,
+            "nodes": [],
+            "end_index": 19,
+            "node_id": "0020"
+          }
+        ],
+        "end_index": 19,
+        "node_id": "0011"
+      },
+      {
+        "title": "The Static Semantics of Modules",
+        "start_index": 20,
+        "nodes": [
+          {
+            "title": "Elaboration",
+            "start_index": 20,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0022"
+          },
+          {
+            "title": "Names",
+            "start_index": 21,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0023"
+          },
+          {
+            "title": "Decorating Structures",
+            "start_index": 21,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0024"
+          },
+          {
+            "title": "Decorating Signatures",
+            "start_index": 22,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0025"
+          },
+          {
+            "title": "Signature Instantiation",
+            "start_index": 23,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0026"
+          },
+          {
+            "title": "Decorating Functors",
+            "start_index": 26,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0027"
+          },
+          {
+            "title": "External Sharing",
+            "start_index": 26,
+            "nodes": [],
+            "end_index": 53,
+            "node_id": "0028"
+          }
+        ],
+        "end_index": 53,
+        "node_id": "0021"
+      }
+    ]
+  },
+  "performance": {
+    "total_time": 169.70606660842896,
+    "tree_building": {
+      "duration": 118.79424662590026,
+      "items_processed": 29
+    },
+    "toc_detection": {
+      "duration": 16.970606660842897
+    },
+    "toc_transformation": {
+      "duration": 16.970606660842897
+    },
+    "verification": {
+      "duration": 16.970606660842897,
+      "accuracy": 0.8620689655172413
+    },
+    "summary": {
+      "total_nodes": 29,
+      "max_depth": 2,
+      "root_nodes": 4,
+      "mapping_accuracy": 0.0,
+      "verification_accuracy": 0.8620689655172413
+    }
+  }
+}

@@ -1,7 +1,7 @@
 import argparse
 import os
 import json
-from pageindex import *
+from pageindex_v2 import page_index_main, config, ConfigLoader
 from pageindex.page_index_md import md_to_tree
 
 if __name__ == "__main__":
@@ -92,7 +92,7 @@ if __name__ == "__main__":
         import asyncio
         
         # Use ConfigLoader to get consistent defaults (matching PDF behavior)
-        from pageindex.utils import ConfigLoader
+        # Already imported at top: from pageindex_v2 import ConfigLoader
         config_loader = ConfigLoader()
         
         # Create options dict with user args

@@ -1,0 +1,33 @@
+# Test files
+*.log
+test_*.py
+*_test.py
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Output files
+output/
+results/
+*.json
+
+# Large test PDFs (keep small ones for quick tests)
+PRML.pdf
+pages-178.pdf
+
+# Environment
+.env
+*.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

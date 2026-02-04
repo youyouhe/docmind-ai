@@ -1,0 +1,188 @@
+{
+  "result": {
+    "doc_name": "2023-annual-report.pdf",
+    "structure": [
+      {
+        "title": "Preface / 前言",
+        "start_index": 1,
+        "end_index": 4,
+        "node_id": "0000",
+        "nodes": []
+      },
+      {
+        "title": "About the Federal Reserve",
+        "start_index": 5,
+        "nodes": [],
+        "end_index": 6,
+        "node_id": "0001"
+      },
+      {
+        "title": "1  Overview",
+        "start_index": 7,
+        "nodes": [],
+        "end_index": 8,
+        "node_id": "0002"
+      },
+      {
+        "title": "2  Monetary Policy and Economic Developments",
+        "start_index": 9,
+        "nodes": [
+          {
+            "title": "Monetary Policy and Economic Developments",
+            "start_index": 9,
+            "nodes": [
+              {
+                "title": "March 2024 Summary",
+                "start_index": 9,
+                "nodes": [],
+                "end_index": 12,
+                "node_id": "0005"
+              },
+              {
+                "title": "Recent Economic and Financial Developments",
+                "start_index": 10,
+                "nodes": [],
+                "end_index": 12,
+                "node_id": "0006"
+              },
+              {
+                "title": "Monetary Policy",
+                "start_index": 12,
+                "nodes": [],
+                "end_index": 12,
+                "node_id": "0007"
+              },
+              {
+                "title": "Special Topics",
+                "start_index": 13,
+                "nodes": [],
+                "end_index": 13,
+                "node_id": "0008"
+              },
+              {
+                "title": "June 2023 Summary",
+                "start_index": 15,
+                "nodes": [],
+                "end_index": 15,
+                "node_id": "0009"
+              }
+            ],
+            "end_index": 15,
+            "node_id": "0004"
+          }
+        ],
+        "end_index": 15,
+        "node_id": "0003"
+      },
+      {
+        "title": "3  Financial Stability",
+        "start_index": 21,
+        "nodes": [
+          {
+            "title": "Monitoring Financial Vulnerabilities",
+            "start_index": 22,
+            "nodes": [],
+            "end_index": 30,
+            "node_id": "0011"
+          },
+          {
+            "title": "Domestic and International Cooperation and Coordination",
+            "start_index": 28,
+            "nodes": [],
+            "end_index": 30,
+            "node_id": "0012"
+          }
+        ],
+        "end_index": 30,
+        "node_id": "0010"
+      },
+      {
+        "title": "4  Supervision and Regulation",
+        "start_index": 31,
+        "nodes": [],
+        "end_index": 58,
+        "node_id": "0013"
+      },
+      {
+        "title": "5  Payment System and Reserve Bank Oversight",
+        "start_index": 59,
+        "nodes": [],
+        "end_index": 88,
+        "node_id": "0014"
+      },
+      {
+        "title": "6  Consumer and Community Affairs",
+        "start_index": 89,
+        "nodes": [],
+        "end_index": 108,
+        "node_id": "0015"
+      },
+      {
+        "title": "A  Federal Reserve System Organization",
+        "start_index": 109,
+        "nodes": [],
+        "end_index": 146,
+        "node_id": "0016"
+      },
+      {
+        "title": "B  Minutes of Federal Open Market Committee Meetings",
+        "start_index": 147,
+        "nodes": [],
+        "end_index": 148,
+        "node_id": "0017"
+      },
+      {
+        "title": "C  Federal Reserve System Audits",
+        "start_index": 149,
+        "nodes": [],
+        "end_index": 152,
+        "node_id": "0018"
+      },
+      {
+        "title": "D  Federal Reserve System Budgets",
+        "start_index": 153,
+        "nodes": [],
+        "end_index": 174,
+        "node_id": "0019"
+      },
+      {
+        "title": "E  Record of Policy Actions of the Board of Governors",
+        "start_index": 175,
+        "nodes": [],
+        "end_index": 184,
+        "node_id": "0020"
+      },
+      {
+        "title": "F  Litigation",
+        "start_index": 185,
+        "nodes": [],
+        "end_index": 185,
+        "node_id": "0021"
+      }
+    ]
+  },
+  "performance": {
+    "total_time": 29.04882526397705,
+    "tree_building": {
+      "duration": 20.334177684783935,
+      "items_processed": 22
+    },
+    "toc_detection": {
+      "duration": 2.904882526397705
+    },
+    "toc_transformation": {
+      "duration": 2.904882526397705
+    },
+    "verification": {
+      "duration": 2.904882526397705,
+      "accuracy": 0.15384615384615385
+    },
+    "summary": {
+      "total_nodes": 22,
+      "max_depth": 3,
+      "root_nodes": 14,
+      "mapping_accuracy": 1.0,
+      "verification_accuracy": 0.15384615384615385
+    }
+  }
+}

@@ -613,8 +613,8 @@ class ParseService:
         Returns:
             PageIndex format tree structure
         """
-        from pageindex import page_index_main
-        from pageindex.utils import ConfigLoader
+        from pageindex_v2 import page_index_main
+        from pageindex_v2 import ConfigLoader
         from pageindex.progress_callback import register_callback
 
         # Use provider's configured model if not specified
