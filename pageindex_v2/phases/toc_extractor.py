@@ -88,7 +88,8 @@ Output: {"table_of_contents": [{"structure": "1.1", "title": "...", "page": 5}]}
 Rules:
 - structure: "1" (chapter), "1.1" (section), "1.1.1" (subsection)
 - Chinese chapters: "第一章" → structure="1", keep title as-is
-- Preserve exact titles, extract page numbers, maintain hierarchy
+- ⚠️ **CRITICAL**: Copy exact title text from PDF - DO NOT modify, translate, or rewrite any text
+- Extract page numbers as-is, maintain hierarchy
 - Include ALL sections
 
 Return JSON only."""

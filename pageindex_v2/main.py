@@ -11,6 +11,7 @@ import os
 import sys
 import asyncio
 import json
+import logging
 from typing import Optional, List, Dict, Any
 from dataclasses import dataclass
 
@@ -47,6 +48,7 @@ class ProcessingOptions:
     max_tokens_per_node: int = 25000  # Token limit for nodes
     max_verify_count: int = 100  # Maximum nodes to verify (reduced from 200 for speed)
     verification_concurrency: int = 20  # Concurrent LLM calls during verification
+    normalize_titles: bool = True  # Normalize titles with hierarchical numbering (1, 1.1, 1.1.1)
 
 
 class PageIndexV2:
@@ -54,13 +56,38 @@ class PageIndexV2:
     Main orchestrator for PDF index generation
     """
     
-    def __init__(self, options: Optional[ProcessingOptions] = None):
+    def __init__(self, options: Optional[ProcessingOptions] = None, document_id: Optional[str] = None):
         self.opt = options or ProcessingOptions()
         self.llm: Optional[LLMClient] = None
         self.debug = self.opt.debug
         self.progress = self.opt.progress
+        self.document_id = document_id
+        
+        # Setup logger
+        if document_id:
+            # Use file logger for API calls
+            try:
+                # Import logger_utils (relative to project root)
+                sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+                from api.logger_utils import create_document_logger
+                self.logger = create_document_logger(document_id, "pageindex_v2")
+            except Exception:
+                # Fallback to standard logger
+                self.logger = logging.getLogger(f"pageindex_v2.{document_id}")
+        else:
+            # Use standard console logger for standalone usage
+            self.logger = logging.getLogger("pageindex_v2")
         
         if self.debug:
+            self.logger.info("=" * 70)
+            self.logger.info("PageIndex V2 - Document Structure Extractor")
+            self.logger.info("=" * 70)
+            self.logger.info(f"Provider: {self.opt.provider}")
+            self.logger.info(f"Model: {self.opt.model}")
+            self.logger.info(f"Max Depth: {self.opt.max_depth}")
+            self.logger.info(f"Debug Mode: {self.opt.debug}")
+            self.logger.info("=" * 70)
+            
             print("=" * 70)
             print("PageIndex V2 - Document Structure Extractor")
             print("=" * 70)
@@ -74,6 +101,10 @@ class PageIndexV2:
         """Print progress message (shown even in quiet mode unless force=False)"""
         if self.progress or force:
             import sys
+            # Log to file if document_id is set
+            if self.document_id:
+                self.logger.info(message)
+            
             # Handle Unicode characters on Windows (gbk encoding)
             try:
                 print(message, flush=True)
@@ -151,23 +182,42 @@ class PageIndexV2:
                 print(f"[PHASE 2] → Using embedded TOC (instant extraction)")
                 print("="*70)
             
-            # Convert embedded TOC to our structure format
+            # Convert embedded TOC to our structure format (with quality filtering)
             structure = self._convert_embedded_toc_to_structure(embedded_toc)
-            has_page_numbers = True
-            toc_pages = []  # No text-based TOC pages
-            toc_info = {}
             
-            if self.debug:
-                print(f"[PHASE 2] Converted {len(structure)} items from embedded TOC")
-                print(f"[PHASE 2] Sample entries:")
-                for i, item in enumerate(structure[:5]):
-                    print(f"  {i+1}. [{item['level']}] {item['title']} → Page {item['page']}")
+            # Quality threshold check: if too many entries were filtered, fall back to text-based detection
+            quality_ratio = len(structure) / len(embedded_toc) if len(embedded_toc) > 0 else 0
             
-            self.log_progress(f"   ✓ Extracted {len(structure)} items from embedded TOC")
-            
-            # Skip text-based TOC detection
-            candidate_pages_for_parsing = []
-        else:
+            if quality_ratio < 0.5 and len(structure) < 5:
+                # More than 50% filtered OR too few valid entries remain
+                if self.debug:
+                    print(f"[PHASE 2] ⚠ Embedded TOC quality too poor ({quality_ratio:.1%} valid entries)")
+                    print(f"[PHASE 2] → Only {len(structure)}/{len(embedded_toc)} entries survived filtering")
+                    print(f"[PHASE 2] → Falling back to text-based TOC detection")
+                
+                # Clear structure and fall through to text-based detection
+                structure = []
+                embedded_toc = []
+            else:
+                # Quality is acceptable, use embedded TOC
+                has_page_numbers = True
+                toc_pages = []  # No text-based TOC pages
+                toc_info = {}
+                
+                if self.debug:
+                    print(f"[PHASE 2] Converted {len(structure)} items from embedded TOC")
+                    print(f"[PHASE 2] Quality: {quality_ratio:.1%} ({len(structure)}/{len(embedded_toc)} entries valid)")
+                    print(f"[PHASE 2] Sample entries:")
+                    for i, item in enumerate(structure[:5]):
+                        print(f"  {i+1}. [{item['level']}] {item['title']} → Page {item['page']}")
+                
+                self.log_progress(f"   ✓ Extracted {len(structure)} items from embedded TOC")
+                
+                # Skip text-based TOC detection
+                candidate_pages_for_parsing = []
+        
+        # If embedded TOC was not used (either missing, insufficient, or poor quality), use text-based detection
+        if not embedded_toc or len(embedded_toc) < 5:
             # No embedded TOC or too few entries - use text-based detection
             if self.debug:
                 if embedded_toc:
@@ -527,6 +577,20 @@ class PageIndexV2:
         # Get statistics
         stats = builder.get_tree_statistics(tree)
         
+        # Phase 6.5: Title Normalization (NEW!)
+        if self.opt.normalize_titles:
+            self.log_progress(f"\n🔤 [6.5/7] Title Normalization...")
+            if self.debug:
+                print("\n🔤 PHASE 6.5: Title Normalization")
+            
+            from .utils.title_normalizer import normalize_tree_list
+            
+            # Normalize all root nodes (tree is a List[Dict])
+            tree = normalize_tree_list(tree, debug=self.debug)
+            
+            if self.debug:
+                print("✓ Title normalization complete")
+        
         elapsed_time = time.time() - start_time
         self.log_progress(f"\n{'='*70}")
         self.log_progress(f"✅ Processing Complete!")
@@ -602,6 +666,10 @@ class PageIndexV2:
                 print(f"🔧 Gap Fill: {gap_info['original_coverage']} pages covered ({gap_info['coverage_percentage']:.1f}%)")
                 if gap_info['gaps_found'] > 0:
                     print(f"   ⚠ Filled {gap_info['gaps_found']} gap(s): {gap_info['gaps_filled']}")
+        
+        # Clean up LLM client
+        if self.llm:
+            await self.llm.close()
         
         return result
     
@@ -764,6 +832,11 @@ class PageIndexV2:
         Analyze the document content and extract its hierarchical structure.
         {context_instruction}
         
+        ⚠️ **CRITICAL RULE - Title Text Integrity**:
+        ALL title text MUST be copied EXACTLY as it appears in the PDF.
+        DO NOT modify, translate, rewrite, standardize, or correct any heading text.
+        Preserve original language, punctuation, typos, and special characters.
+        
         IMPORTANT - Only extract section/chapter headings that are:
         1. **Clearly identifiable** as major structural divisions
         2. **Explicitly present** in the text (no inference or guessing)
@@ -851,7 +924,7 @@ class PageIndexV2:
         
         Rules:
         - Only extract items that CLEARLY appear in THIS segment
-        - Use exact title text as it appears in the document
+        - ⚠️ **Use exact title text** - copy character-by-character from the PDF without ANY modifications
         - Assign physical_index based on <physical_index_X> tags
         - When you see a parent heading with a structured list of children (any numbering format), ALWAYS extract ALL children
         - Be conservative for paragraph content, but NOT for structured lists following section titles
@@ -874,7 +947,7 @@ class PageIndexV2:
         """
         
         try:
-            result = await self.llm.chat_json(prompt, system=system_prompt)
+            result = await self.llm.chat_json(prompt, system=system_prompt, max_tokens=4000)
             structure = result.get("table_of_contents", [])
             
             if self.debug:
@@ -922,21 +995,50 @@ class PageIndexV2:
     
     def _convert_embedded_toc_to_structure(self, embedded_toc: List) -> List[Dict[str, Any]]:
         """
-        Convert PyMuPDF embedded TOC to our structure format.
+        Convert PyMuPDF's get_toc() result to internal structure format with quality filtering.
         
-        PyMuPDF TOC format: [(level, title, page), ...]
-        Our format: [{"structure": "1.1", "title": "...", "page": 5}, ...]
+        Improvements:
+        - Smart chapter detection: recognize "第X章" patterns as top-level
+        - Hierarchy normalization: fix incorrect level assignments
+        - Title validation: filter out garbage entries
         
         Args:
             embedded_toc: PyMuPDF TOC list [(level, title, page), ...]
         
         Returns:
-            List of structured items
+            List of structured items (filtered for quality)
         """
+        import re
+        
         structure = []
         level_counters = {}  # Track counter for each level
+        filtered_count = 0
+        chapter_counter = 0  # Track chapters separately
         
         for level, title, page in embedded_toc:
+            title = title.strip()
+            
+            # Quality filtering: skip invalid TOC titles
+            if not self._is_valid_toc_title(title):
+                if self.debug:
+                    preview = title[:50] + "..." if len(title) > 50 else title
+                    print(f"  [FILTER] Skipping invalid TOC entry: '{preview}'")
+                filtered_count += 1
+                continue
+            
+            # OPTIMIZATION 1: Smart chapter detection
+            # Recognize common chapter patterns and force them to level 1
+            is_chapter = self._is_chapter_title(title)
+            
+            if is_chapter:
+                # Force chapters to be level 1, regardless of embedded level
+                original_level = level
+                level = 1
+                chapter_counter += 1
+                
+                if self.debug and original_level != 1:
+                    print(f"  [NORMALIZE] Promoted '{title}' from L{original_level} to L1 (chapter)")
+            
             # Update counters: increment current level, reset deeper levels
             if level not in level_counters:
                 level_counters[level] = 0
@@ -957,12 +1059,112 @@ class PageIndexV2:
             # Tree builder will convert 'page' to 'start_index'/'end_index'
             structure.append({
                 "structure": structure_code,
-                "title": title.strip(),
+                "title": title,
                 "page": page,  # Physical page number from PDF metadata
-                "level": level  # Keep level for debugging
+                "level": level,  # Keep level for debugging
+                "is_chapter": is_chapter  # Mark chapters for post-processing
             })
         
+        if self.debug:
+            if filtered_count > 0:
+                print(f"  [FILTER] Filtered out {filtered_count} invalid TOC entries")
+            if chapter_counter > 0:
+                print(f"  [CHAPTER] Detected {chapter_counter} chapter(s)")
+        
         return structure
+    
+    def _is_chapter_title(self, title: str) -> bool:
+        """
+        Detect if a title represents a chapter/main section.
+        
+        Common Chinese tender document chapter patterns:
+        - "第一章 xxx", "第二章 xxx", etc.
+        - "第1章 xxx", "第2章 xxx", etc.
+        - "Chapter X", "CHAPTER X"
+        - Sometimes just "第X章" without following text
+        
+        Returns:
+            True if title is a chapter, False otherwise
+        """
+        import re
+        
+        # Pattern 1: 第X章 (Chinese numeral or digit)
+        if re.match(r'^第[一二三四五六七八九十0-9]+章', title):
+            return True
+        
+        # Pattern 2: Chapter X / CHAPTER X (English)
+        if re.match(r'^(?:chapter|CHAPTER)\s*[0-9IVX]+', title, re.IGNORECASE):
+            return True
+        
+        return False
+    
+    def _is_valid_toc_title(self, title: str) -> bool:
+        """
+        Validate if a TOC title looks reasonable and not content fragments.
+        
+        Filters out:
+        - Single characters or very short strings (likely parsing errors)
+        - Very long strings (>100 chars, likely content not titles)
+        - Sentences with punctuation (content fragments)
+        - Form-like entries (e.g., "地    址：", "供应商全称（公章）：")
+        - Known garbage patterns
+        
+        Args:
+            title: The TOC title to validate
+            
+        Returns:
+            True if title appears valid, False otherwise
+        """
+        title = title.strip()
+        
+        # 1. Length check
+        if len(title) <= 1:
+            # Single character titles are usually parsing errors
+            return False
+        
+        if len(title) > 80:
+            # Titles over 80 characters are likely content fragments
+            return False
+        
+        # 2. Sentence pattern check - content usually has mid-sentence punctuation
+        # Chinese punctuation that indicates content (not titles)
+        content_indicators = ['。', '，', '！', '？']
+        if any(p in title for p in content_indicators):
+            # Exception: Some legitimate title formats exist like "（一）适用范围"
+            # These typically start with specific patterns
+            legitimate_prefixes = ['第', '（', '(', '附件', '表', '图']
+            if not any(title.startswith(prefix) for prefix in legitimate_prefixes):
+                return False
+        
+        # 3. Check for known garbage patterns (single repeated characters)
+        single_char_words = ['报', '价', '文', '件', '供', '应', '商', '称', '章']
+        if title in single_char_words:
+            return False
+        
+        # 4. Check if title is just punctuation or special characters
+        if all(not c.isalnum() for c in title):
+            return False
+        
+        # 5. Filter out form-like entries (lines with colons and spaces indicating form fields)
+        # Examples: "地    址：", "供应商全称（公章）：", "时    间："
+        # These have colon at end and multiple spaces or look like form labels
+        if title.endswith('：') or title.endswith(':'):
+            # Check if it looks like a form field label (has multiple spaces or contains form keywords)
+            form_keywords = ['地址', '时间', '日期', '名称', '公章', '签字', '盖章', '电话', '传真', '邮编']
+            has_form_keyword = any(kw in title for kw in form_keywords)
+            has_multiple_spaces = '  ' in title  # Two or more consecutive spaces
+            
+            if has_form_keyword or has_multiple_spaces:
+                return False
+        
+        # 6. Filter entries that start with single letters (usually list markers from content)
+        # Examples: "G.存在共同直接或间接投资..."
+        if len(title) > 2 and title[0].isalpha() and title[1] == '.':
+            # Exception: legitimate chapter formats like "A.附录"
+            if not any(title[2:].strip().startswith(prefix) for prefix in ['附', '补', '表', '图']):
+                return False
+        
+        return True
     
     async def _process_large_node_recursively(
         self,

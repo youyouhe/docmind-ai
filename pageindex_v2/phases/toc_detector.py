@@ -77,6 +77,8 @@ class TOCDetector:
         system_prompt = """
         You are a document analysis expert. Determine if the given page contains a Table of Contents (目录).
 
+        ⚠️ **CRITICAL**: When extracting TOC titles, copy exact text from PDF - DO NOT modify any text.
+
         **What counts as TOC:**
         - Explicit "目录", "Table of Contents", "目次" headings
         - List of chapters/sections with or without page numbers
@@ -365,6 +367,8 @@ class TOCDetector:
         
         system_prompt = """
         You are analyzing pages to identify nested Table of Contents (TOCs).
+        
+        ⚠️ **CRITICAL**: When identifying nested TOCs, preserve exact text from PDF - DO NOT modify.
         
         **What is a Nested TOC:**
         A nested TOC appears at the start of a major section and lists its subsections.
