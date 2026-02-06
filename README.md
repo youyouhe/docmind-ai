@@ -1,100 +1,325 @@
-<div align="center">
-  
-<a href="https://vectify.ai/pageindex" target="_blank">
-  <img src="https://github.com/user-attachments/assets/46201e72-675b-43bc-bfbd-081cc6b65a1d" alt="PageIndex Banner" />
-</a>
+# DocMind-AI Backend for BidSmart
 
-<br/>
-<br/>
+[![Based on PageIndex](https://img.shields.io/badge/Based%20on-PageIndex-blue)](https://github.com/VectifyAI/PageIndex)
+[![Python](https://img.shields.io/badge/Python-3.8+-blue.svg)](https://www.python.org/)
+[![FastAPI](https://img.shields.io/badge/FastAPI-0.100+-green.svg)](https://fastapi.tiangolo.com/)
+[![LangChain](https://img.shields.io/badge/LangChain-0.1+-orange.svg)](https://www.langchain.com/)
 
-<p align="center">
-  <a href="https://trendshift.io/repositories/14736" target="_blank"><img src="https://trendshift.io/api/badge/repositories/14736" alt="VectifyAI%2FPageIndex | Trendshift" style="width: 250px; height: 55px;" width="250" height="55"/></a>
-</p>
+This is the **backend service** for [BidSmart](https://github.com/youyouhe/BidSmart), an intelligent document structure auditing system for tender/bidding documents. It's built on top of the [PageIndex](https://github.com/VectifyAI/PageIndex) framework with extensive customizations for document structure analysis and AI-powered auditing.
 
-<p align="center"><b>Reasoning-based RAG&nbsp; ◦ &nbsp;No Vector DB&nbsp; ◦ &nbsp;No Chunking&nbsp; ◦ &nbsp;Human-like Retrieval</b></p>
+## Overview
 
-<h4 align="center">
-  <a href="https://vectify.ai">🏠 Homepage</a>&nbsp; • &nbsp;
-  <a href="https://chat.pageindex.ai">🖥️ Chat Platform</a>&nbsp; • &nbsp;
-  <a href="https://pageindex.ai/mcp">🔌 MCP</a>&nbsp; • &nbsp;
-  <a href="https://docs.pageindex.ai">📚 Docs</a>&nbsp; • &nbsp;
-  <a href="https://discord.com/invite/VuXuf29EUj">💬 Discord</a>&nbsp; • &nbsp;
-  <a href="https://ii2abc2jejf.typeform.com/to/tK3AXl8T">✉️ Contact</a>&nbsp;
-</h4>
-  
-</div>
-
-
-<details open>
-<summary><h2>📢 Latest Updates</h2></summary>
-
- **🔥 Releases:**
-- [**PageIndex Chat**](https://chat.pageindex.ai): The first human-like document-analysis agent [platform](https://chat.pageindex.ai) built for professional long documents. Can also be integrated via [MCP](https://pageindex.ai/mcp) or [API](https://docs.pageindex.ai/quickstart) (beta).
-<!-- - [**PageIndex Chat API**](https://docs.pageindex.ai/quickstart): An API that brings PageIndex's advanced long-document intelligence directly into your applications and workflows. -->
-<!-- - [PageIndex MCP](https://pageindex.ai/mcp): Bring PageIndex into Claude, Cursor, or any MCP-enabled agent. Chat with long PDFs in a reasoning-based, human-like way. -->
- 
- **📝 Articles:**
-- [**PageIndex Framework**](https://pageindex.ai/blog/pageindex-intro): Introduces the PageIndex framework — an *agentic, in-context* *tree index* that enables LLMs to perform *reasoning-based*, *human-like retrieval* over long documents, without vector DB or chunking.
-<!-- - [Do We Still Need OCR?](https://pageindex.ai/blog/do-we-need-ocr): Explores how vision-based, reasoning-native RAG challenges the traditional OCR pipeline, and why the future of document AI might be *vectorless* and *vision-based*. -->
-
- **🧪 Cookbooks:**
-- [Vectorless RAG](https://docs.pageindex.ai/cookbook/vectorless-rag-pageindex): A minimal, hands-on example of reasoning-based RAG using PageIndex. No vectors, no chunking, and human-like retrieval.
-- [Vision-based Vectorless RAG](https://docs.pageindex.ai/cookbook/vision-rag-pageindex): OCR-free, vision-only RAG with PageIndex's reasoning-native retrieval workflow that works directly over PDF page images.
-</details>
+DocMind-AI extends PageIndex's hierarchical tree indexing capabilities with:
+- **Document Structure Auditing**: AI-powered analysis of document hierarchy, numbering, and formatting
+- **Progressive Audit System**: 5-phase audit workflow with real-time progress tracking
+- **Backup & Recovery**: Automatic backup creation before applying structural changes
+- **RESTful API**: FastAPI-based endpoints for document management and audit operations
+- **WebSocket Support**: Real-time progress updates during parsing and auditing
 
 ---
 
-# 📑 Introduction to PageIndex
+## Key Features
 
-Are you frustrated with vector database retrieval accuracy for long professional documents? Traditional vector-based RAG relies on semantic *similarity* rather than true *relevance*. But **similarity ≠ relevance** — what we truly need in retrieval is **relevance**, and that requires **reasoning**. When working with professional documents that demand domain expertise and multi-step reasoning, similarity search often falls short.
+### 🎯 Document Structure Auditing
+- **TreeAuditorV2**: Advanced 5-phase progressive audit system
+  - Phase 1: Numbering system analysis
+  - Phase 2: Format consistency check
+  - Phase 3: Logical hierarchy validation
+  - Phase 4: Completeness evaluation
+  - Phase 5: Overall recommendations
+- **Confidence Scoring**: High/Medium/Low confidence levels for each suggestion
+- **Action Types**: DELETE, ADD, MODIFY_FORMAT, MODIFY_PAGE operations
+- **node_info Extraction**: Proper handling of ADD suggestions with parent_id and insert_position
 
-Inspired by AlphaGo, we propose **[PageIndex](https://vectify.ai/pageindex)** — a **vectorless**, **reasoning-based RAG** system that builds a **hierarchical tree index** from long documents and uses LLMs to **reason** *over that index* for **agentic, context-aware retrieval**.
-It simulates how *human experts* navigate and extract knowledge from complex documents through *tree search*, enabling LLMs to *think* and *reason* their way to the most relevant document sections. PageIndex performs retrieval in two steps:
+### 🔄 Backup & Recovery System
+- **Automatic Backups**: Creates backup before applying structural changes
+- **Backup Metadata**: Stores operation type, change summary, and timestamps
+- **One-Click Restore**: Restore document to any previous state
+- **Safety Protection**: Creates safety backup before restoration
 
-1. Generate a “Table-of-Contents” **tree structure index** of documents
-2. Perform reasoning-based retrieval through **tree search**
+### 🚀 API Endpoints
 
-<div align="center">
-  <a href="https://pageindex.ai/blog/pageindex-intro" target="_blank" title="The PageIndex Framework">
-    <img src="https://docs.pageindex.ai/images/cookbook/vectorless-rag.png" width="70%">
-  </a>
-</div>
+#### Document Management
+- `POST /api/documents/upload` - Upload and parse PDF document
+- `GET /api/documents` - List all documents
+- `GET /api/documents/{doc_id}` - Get document details with tree structure
+- `DELETE /api/documents/{doc_id}` - Delete document and associated data
 
-### 🎯 Features 
+#### Audit Operations
+- `POST /api/documents/{doc_id}/audit` - Start audit process with progress tracking
+- `GET /api/documents/{doc_id}/audit/suggestions` - Get all audit suggestions
+- `POST /api/documents/{doc_id}/audit/suggestions/{suggestion_id}/review` - Accept/reject suggestion
+- `POST /api/documents/{doc_id}/audit/suggestions/batch-review` - Batch operations by confidence/action
+- `POST /api/documents/{doc_id}/audit/suggestions/apply` - Apply accepted suggestions with backup
 
-Compared to traditional vector-based RAG, **PageIndex** features:
-- **No Vector DB**: Uses document structure and LLM reasoning for retrieval, instead of vector similarity search.
-- **No Chunking**: Documents are organized into natural sections, not artificial chunks.
-- **Human-like Retrieval**: Simulates how human experts navigate and extract knowledge from complex documents.
-- **Better Explainability and Traceability**: Retrieval is based on reasoning — traceable and interpretable, with page and section references. No more opaque, approximate vector search (“vibe retrieval”).
+#### Backup Management
+- `GET /api/documents/{doc_id}/audit/backups` - List all backups for document
+- `POST /api/documents/{doc_id}/audit/backups/{backup_id}/restore` - Restore from backup
 
-PageIndex powers a reasoning-based RAG system that achieved **state-of-the-art** [98.7% accuracy](https://github.com/VectifyAI/Mafin2.5-FinanceBench) on FinanceBench, demonstrating superior performance over vector-based RAG solutions in professional document analysis (see our [blog post](https://vectify.ai/blog/Mafin2.5) for details).
+#### WebSocket
+- `WS /ws` - Real-time updates for parsing and audit progress
 
-### 📍 Explore PageIndex
+### 📊 Database Schema
 
-To learn more, please see a detailed introduction of the [PageIndex framework](https://pageindex.ai/blog/pageindex-intro). Check out this GitHub repo for open-source code, and the [cookbooks](https://docs.pageindex.ai/cookbook), [tutorials](https://docs.pageindex.ai/tutorials), and [blog](https://pageindex.ai/blog) for additional usage guides and examples. 
+Built on SQLAlchemy with the following models:
+- **Document**: Document metadata and tree structure
+- **AuditSuggestion**: AI-generated suggestions with confidence and reasoning
+- **AuditBackup**: Backup snapshots with metadata and change summaries
 
-The PageIndex service is available as a ChatGPT-style [chat platform](https://chat.pageindex.ai), or can be integrated via [MCP](https://pageindex.ai/mcp) or [API](https://docs.pageindex.ai/quickstart).
+---
 
-### 🛠️ Deployment Options
-- Self-host — run locally with this open-source repo.
-- Cloud Service — try instantly with our [Chat Platform](https://chat.pageindex.ai/), or integrate with [MCP](https://pageindex.ai/mcp) or [API](https://docs.pageindex.ai/quickstart).
-- _Enterprise_ — private or on-prem deployment. [Contact us](https://ii2abc2jejf.typeform.com/to/tK3AXl8T) or [book a demo](https://calendly.com/pageindex/meet) for more details.
+## Installation
 
-### 🧪 Quick Hands-on
+### Prerequisites
+- Python 3.8+
+- OpenAI API key or Azure OpenAI credentials
 
-- Try the [**Vectorless RAG**](https://github.com/VectifyAI/PageIndex/blob/main/cookbook/pageindex_RAG_simple.ipynb) notebook — a *minimal*, hands-on example of reasoning-based RAG using PageIndex.
-- Experiment with [*Vision-based Vectorless RAG*](https://github.com/VectifyAI/PageIndex/blob/main/cookbook/vision_RAG_pageindex.ipynb) — no OCR; a minimal, reasoning-native RAG pipeline that works directly over page images.
+### Setup
+
+1. Install dependencies:
+```bash
+pip install -r requirements.txt
+```
+
+2. Create `.env` file:
+```bash
+cp .env.example .env
+```
+
+3. Configure environment variables:
+```env
+# OpenAI Configuration
+OPENAI_API_KEY=your_openai_api_key
+OPENAI_BASE_URL=https://api.openai.com/v1
+
+# Or Azure OpenAI Configuration
+AZURE_OPENAI_API_KEY=your_azure_api_key
+AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
+AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4
+AZURE_OPENAI_API_VERSION=2024-02-01
+
+# Database
+DATABASE_URL=sqlite:///./data/bidsmart.db
+
+# Storage paths
+UPLOAD_DIR=./data/uploads
+PARSED_DIR=./data/parsed
+```
+
+4. Run the server:
+```bash
+python -m uvicorn api.index:app --reload --port 8000
+```
+
+The API will be available at `http://localhost:8000`
+
+### API Documentation
+
+Once running, access interactive API documentation at:
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+---
+
+## Architecture
+
+```
+docmind-ai/
+├── api/
+│   ├── index.py              # FastAPI app entry point
+│   ├── document_routes.py    # Document CRUD + parsing endpoints
+│   ├── audit_routes.py       # Audit and backup endpoints
+│   ├── database.py           # SQLAlchemy models and queries
+│   ├── websocket_manager.py  # WebSocket connection management
+│   ├── models.py             # Pydantic models for request/response
+│   ├── services.py           # Business logic services
+│   └── storage.py            # File storage utilities
+│
+├── pageindex_v2/
+│   ├── phases/
+│   │   ├── tree_builder.py       # PDF parsing and tree construction
+│   │   ├── tree_auditor_v2.py    # 5-phase progressive audit system
+│   │   ├── advice_executor.py    # Apply suggestions to tree structure
+│   │   ├── document_classifier.py # Document type classification
+│   │   └── pdf_verifier.py       # PDF validation
+│   ├── core/
+│   │   └── llm_client.py         # LLM interaction wrapper
+│   ├── utils/
+│   │   └── title_normalizer.py   # Title normalization utilities
+│   └── main.py                   # PageIndex pipeline orchestrator
+│
+└── data/
+    ├── uploads/              # Uploaded PDF files
+    ├── parsed/               # Generated tree structures
+    └── bidsmart.db           # SQLite database
+```
+
+---
+
+## Key Customizations from PageIndex
+
+This fork extends the original [PageIndex](https://github.com/VectifyAI/PageIndex) framework with:
+
+### 1. Document Structure Auditing (`tree_auditor_v2.py`)
+- **Progressive Audit System**: 5-phase workflow with incremental analysis
+- **Real-time Progress**: WebSocket broadcasting for each audit phase
+- **Confidence Scoring**: High/Medium/Low classification for suggestions
+- **Action Types**: DELETE, ADD, MODIFY_FORMAT, MODIFY_PAGE operations
+- **Reasoning-based Suggestions**: AI-generated explanations for each recommendation
+
+### 2. Suggestion Execution (`advice_executor.py`)
+- **Safe Application**: Apply structural changes with validation
+- **node_info Handling**: Proper extraction of parent_id and insert_position for ADD operations
+- **Batch Operations**: Accept/reject multiple suggestions by confidence or action type
+- **Tree Reconstruction**: Rebuild document tree after applying changes
+
+### 3. Backup Management (`audit_routes.py`, `database.py`)
+- **Automatic Backups**: Create backup before any structural changes
+- **Backup Metadata**: Track operation type, change count, and timestamps
+- **Restore Functionality**: One-click restoration to any previous state
+- **Safety Protection**: Creates safety backup before restoration
+
+### 4. API Layer (`document_routes.py`, `audit_routes.py`)
+- **RESTful Endpoints**: Comprehensive API for document and audit operations
+- **WebSocket Support**: Real-time progress updates during long-running operations
+- **Batch Operations**: Bulk accept/reject by confidence level or action type
+- **Error Handling**: Proper error responses with detailed messages
+
+### 5. node_info Fix (`document_routes.py` lines 1509-1537)
+- **Problem**: ADD suggestions were saved with `node_info: null`
+- **Solution**: Extract top-level `parent_id`, `insert_position`, etc., and assemble into `node_info` object
+- **Impact**: Proper display of ADD suggestions in frontend tree view
+
+---
+
+## Usage Examples
+
+### 1. Upload and Parse Document
+
+```python
+import requests
+
+# Upload PDF
+with open('document.pdf', 'rb') as f:
+    response = requests.post(
+        'http://localhost:8000/api/documents/upload',
+        files={'file': f}
+    )
+
+doc_id = response.json()['id']
+print(f"Document ID: {doc_id}")
+```
+
+### 2. Run Audit
+
+```python
+# Start audit
+response = requests.post(
+    f'http://localhost:8000/api/documents/{doc_id}/audit'
+)
+
+# Get suggestions
+suggestions = requests.get(
+    f'http://localhost:8000/api/documents/{doc_id}/audit/suggestions'
+).json()
+
+for suggestion in suggestions:
+    print(f"{suggestion['action']}: {suggestion['reason']}")
+```
+
+### 3. Batch Operations
+
+```python
+# Batch accept high confidence suggestions
+requests.post(
+    f'http://localhost:8000/api/documents/{doc_id}/audit/suggestions/batch-review',
+    json={
+        'filter_confidence': 'high',
+        'decision': 'accept'
+    }
+)
+
+# Apply accepted suggestions
+requests.post(
+    f'http://localhost:8000/api/documents/{doc_id}/audit/suggestions/apply'
+)
+```
+
+### 4. Backup & Restore
+
+```python
+# List backups
+backups = requests.get(
+    f'http://localhost:8000/api/documents/{doc_id}/audit/backups'
+).json()
+
+# Restore from backup
+backup_id = backups[0]['id']
+requests.post(
+    f'http://localhost:8000/api/documents/{doc_id}/audit/backups/{backup_id}/restore'
+)
+```
+
+---
+
+## WebSocket Progress Tracking
+
+Connect to WebSocket for real-time updates:
+
+```javascript
+const ws = new WebSocket('ws://localhost:8000/ws');
+
+ws.onmessage = (event) => {
+  const message = JSON.parse(event.data);
   
-<div align="center">
-  <a href="https://colab.research.google.com/github/VectifyAI/PageIndex/blob/main/cookbook/pageindex_RAG_simple.ipynb" target="_blank" rel="noopener">
-    <img src="https://img.shields.io/badge/Open_In_Colab-Vectorless_RAG-orange?style=for-the-badge&logo=googlecolab" alt="Open in Colab: Vectorless RAG" />
-  </a>
-  &nbsp;&nbsp;
-  <a href="https://colab.research.google.com/github/VectifyAI/PageIndex/blob/main/cookbook/vision_RAG_pageindex.ipynb" target="_blank" rel="noopener">
-    <img src="https://img.shields.io/badge/Open_In_Colab-Vision_RAG-orange?style=for-the-badge&logo=googlecolab" alt="Open in Colab: Vision RAG" />
-  </a>
-</div>
+  if (message.type === 'audit_progress') {
+    console.log(`Phase ${message.phase_number}/5: ${message.message}`);
+    console.log(`Progress: ${message.progress}%`);
+  }
+};
+```
+
+---
+
+## Development
+
+### Run Tests
+```bash
+pytest tests/
+```
+
+### Code Style
+```bash
+# Format code
+black api/ pageindex_v2/
+
+# Lint
+flake8 api/ pageindex_v2/
+```
+
+---
+
+## Acknowledgments
+
+This project is built on top of the excellent [PageIndex](https://github.com/VectifyAI/PageIndex) framework by [Vectify AI](https://vectify.ai). PageIndex provides the foundational tree indexing and reasoning-based retrieval capabilities.
+
+**Key PageIndex Features We Use:**
+- Hierarchical tree structure generation from PDFs
+- LLM-based document understanding
+- Tree search and navigation
+- No vector DB, no chunking approach
+
+**Our Extensions:**
+- Document structure auditing system
+- Progressive multi-phase audit workflow
+- Backup and recovery system
+- RESTful API and WebSocket support
+- Batch operations and filtering
+
+For more information about PageIndex:
+- [PageIndex Framework Introduction](https://pageindex.ai/blog/pageindex-intro)
+- [PageIndex Documentation](https://docs.pageindex.ai)
+- [PageIndex GitHub](https://github.com/VectifyAI/PageIndex)
 
 ---
 
@@ -229,21 +454,18 @@ Explore the full [benchmark results](https://github.com/VectifyAI/Mafin2.5-Finan
 
 ---
 
-# ⭐ Support Us
+## License
 
-Leave us a star 🌟 if you like our project. Thank you!  
-
-<p>
-  <img src="https://github.com/user-attachments/assets/eae4ff38-48ae-4a7c-b19f-eab81201d794" width="80%">
-</p>
-
-### Connect with Us
-
-[![Twitter](https://img.shields.io/badge/Twitter-000000?style=for-the-badge&logo=x&logoColor=white)](https://x.com/VectifyAI)&nbsp;
-[![LinkedIn](https://img.shields.io/badge/LinkedIn-0077B5?style=for-the-badge&logo=linkedin&logoColor=white)](https://www.linkedin.com/company/vectify-ai/)&nbsp;
-[![Discord](https://img.shields.io/badge/Discord-5865F2?style=for-the-badge&logo=discord&logoColor=white)](https://discord.com/invite/VuXuf29EUj)&nbsp;
-[![Contact Us](https://img.shields.io/badge/Contact_Us-3B82F6?style=for-the-badge&logo=envelope&logoColor=white)](https://ii2abc2jejf.typeform.com/to/tK3AXl8T)
+This project inherits the license from the original [PageIndex](https://github.com/VectifyAI/PageIndex) project.
 
 ---
 
-© 2025 [Vectify AI](https://vectify.ai)
+## Links
+
+- **Main Project**: [BidSmart](https://github.com/youyouhe/BidSmart)
+- **Original Framework**: [PageIndex by Vectify AI](https://github.com/VectifyAI/PageIndex)
+- **Backend Repository**: [docmind-ai](https://github.com/youyouhe/docmind-ai)
+
+---
+
+© 2025 Based on [PageIndex](https://github.com/VectifyAI/PageIndex) by [Vectify AI](https://vectify.ai)
