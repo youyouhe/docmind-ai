@@ -192,7 +192,59 @@ async def parse_document_background(
         # Convert to API format
         api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
 
-        # Stage 3: Saving results
+        # Stage 3: Tree Quality Audit (if enabled)
+        audit_report = None
+        if parse_config.get("enable_audit", False) and file_type == "pdf":
+            await manager.broadcast_status_update(
+                document_id,
+                "processing",
+                progress=95.0,
+                metadata={"stage": "Auditing tree quality..."}
+            )
+            
+            try:
+                from pageindex_v2.phases.tree_auditor_v2 import TreeAuditorV2
+                from pageindex_v2.core.llm_client import LLMClient
+                
+                # Create LLM client for auditor
+                audit_llm = LLMClient(
+                    provider=llm_provider.provider,
+                    model=model,
+                    api_key=llm_provider.api_key,
+                    debug=False
+                )
+                
+                # Create auditor
+                auditor = TreeAuditorV2(
+                    llm=audit_llm,
+                    pdf_path=file_path,
+                    mode=parse_config.get("audit_mode", "progressive"),
+                    debug=False
+                )
+                
+                # Run audit
+                optimized_tree, audit_report = await auditor.audit_and_optimize(
+                    tree=page_index_tree,
+                    confidence_threshold=parse_config.get("audit_confidence", 0.7)
+                )
+                
+                # Use optimized tree
+                api_tree = ParseService.convert_page_index_to_api_format(optimized_tree)
+                
+                # Log audit summary
+                if audit_report:
+                    summary = audit_report.get("summary", {})
+                    print(f"\n[AUDIT] Quality Score: {summary.get('quality_score', 0):.1f}/100")
+                    print(f"[AUDIT] Nodes: {summary.get('original_nodes', 0)} → {summary.get('optimized_nodes', 0)}")
+                    print(f"[AUDIT] Changes: {summary.get('changes_applied', {})}\n")
+                    
+            except Exception as e:
+                print(f"[AUDIT] Warning: Audit failed - {e}")
+                print("[AUDIT] Continuing with original tree...")
+                # Continue with non-audited tree
+                audit_report = {"error": str(e)}
+
+        # Stage 4: Saving results
         await manager.broadcast_status_update(
             document_id,
             "processing",
@@ -209,6 +261,12 @@ async def parse_document_background(
             tree_data=api_tree,
             stats_data=stats_dict,
         )
+        
+        # Save audit report if available
+        if audit_report:
+            audit_path = storage.save_audit_report(document_id, audit_report)
+            if audit_path:
+                print(f"[AUDIT] Report saved: {audit_path}")
 
         # Calculate duration
         duration_ms = int((time.time() - start_time) * 1000)
@@ -304,6 +362,10 @@ async def upload_document(
     auto_parse: bool = Form(default=True, description="Automatically parse after upload"),
     # Custom prompt for TOC extraction
     custom_prompt: Optional[str] = Form(default=None, description="Custom prompt to guide TOC extraction (helps LLM better identify document structure)"),
+    # Tree Auditor V2 options
+    enable_audit: bool = Form(default=False, description="Run intelligent tree auditor after parsing to fix quality issues"),
+    audit_mode: str = Form(default="progressive", description="Audit mode: 'progressive' (5-round, recommended) or 'standard' (1-round)"),
+    audit_confidence: float = Form(default=0.7, description="Confidence threshold for applying audit suggestions (0.0-1.0)", ge=0.0, le=1.0),
 ):
     """
     Upload a new document.
@@ -320,6 +382,9 @@ async def upload_document(
     - **if_add_node_summary**: Add LLM-generated summaries (default: true)
     - **if_add_node_text**: Include full text content (default: false)
     - **auto_parse**: Automatically start parsing after upload (default: true)
+    - **enable_audit**: Run intelligent tree quality auditor after parsing (default: false)
+    - **audit_mode**: Audit mode - 'progressive' (5-round, recommended) or 'standard' (1-round) (default: progressive)
+    - **audit_confidence**: Confidence threshold for applying suggestions, 0.0-1.0 (default: 0.7)
     """
     llm = get_llm_provider()
     storage = get_storage()
@@ -344,6 +409,10 @@ async def upload_document(
         "if_add_node_summary": if_add_node_summary,
         "if_add_node_text": if_add_node_text,
         "custom_prompt": custom_prompt,
+        # Audit config
+        "enable_audit": enable_audit,
+        "audit_mode": audit_mode,
+        "audit_confidence": audit_confidence,
     }
 
     # Create document record
@@ -778,6 +847,125 @@ async def get_document_tree(document_id: str):
     return tree_data
 
 
+class UpdateNodeTitleRequest(BaseModel):
+    """Model for updating a node's title."""
+    new_title: str
+
+
+@router.patch("/{document_id}/nodes/{node_id}/title")
+async def update_node_title(
+    document_id: str,
+    node_id: str,
+    request: UpdateNodeTitleRequest
+):
+    """
+    Update the title of a specific node in the document tree.
+
+    This endpoint allows editing of node titles in the parsed tree structure.
+    The updated tree is saved back to the storage.
+
+    - **document_id**: Document ID
+    - **node_id**: Node ID to update
+    - **new_title**: New title for the node
+
+    Returns:
+        The updated tree structure
+    """
+    storage = get_storage()
+    db = get_db()
+
+    # Get document
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Check parse status
+    if doc.parse_status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Document not parsed yet. Current status: {doc.parse_status}"
+        )
+
+    # Load current tree data
+    tree_data = await storage.load_parse_result(document_id)
+    if tree_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Tree data file not found"
+        )
+
+    # Helper function to recursively find and update the node
+    def update_node_recursive(node: Dict[str, Any], target_id: str, new_title: str) -> bool:
+        """
+        Recursively search and update the node with target_id.
+        Returns True if node was found and updated.
+        """
+        if node.get("id") == target_id:
+            node["title"] = new_title
+            return True
+        
+        # Search in children
+        if "children" in node and isinstance(node["children"], list):
+            for child in node["children"]:
+                if update_node_recursive(child, target_id, new_title):
+                    return True
+        
+        return False
+
+    # Update the node in the tree
+    node_found = False
+    if isinstance(tree_data, dict):
+        # Single root node
+        node_found = update_node_recursive(tree_data, node_id, request.new_title)
+    elif isinstance(tree_data, list):
+        # Multiple root nodes
+        for root_node in tree_data:
+            if update_node_recursive(root_node, node_id, request.new_title):
+                node_found = True
+                break
+
+    if not node_found:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Node not found: {node_id}"
+        )
+
+    # Save the updated tree back to storage
+    try:
+        # Get parse result to find tree path
+        parse_result = db.get_parse_result(document_id)
+        if parse_result is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Parse result not found"
+            )
+
+        # Save updated tree (reuse existing paths)
+        tree_path, _ = storage.save_parse_result(
+            document_id=document_id,
+            tree_data=tree_data,
+            stats_data=None,  # Don't update stats
+        )
+
+        return {
+            "success": True,
+            "message": f"Node title updated successfully",
+            "document_id": document_id,
+            "node_id": node_id,
+            "new_title": request.new_title,
+            "tree": tree_data
+        }
+
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save updated tree: {str(e)}"
+        )
+
+
 @router.get("/{document_id}/stats")
 async def get_document_stats(document_id: str):
     """
@@ -1181,3 +1369,212 @@ async def categorize_document(
         "provider": llm.provider,
         "model": llm.model
     }
+
+
+@router.post("/{document_id}/audit")
+async def audit_document_tree(
+    document_id: str,
+    mode: str = "progressive",  # "progressive" or "standard"
+    confidence_threshold: float = 0.7
+):
+    """
+    Run tree quality audit on a document.
+    
+    This endpoint triggers the TreeAuditorV2 to analyze and optimize
+    the document's tree structure. The audit identifies issues like:
+    - Redundant nodes
+    - Incorrect formatting
+    - Missing structure elements
+    - Page number errors
+    
+    Args:
+        document_id: Document ID
+        mode: Audit mode - "progressive" (5-round, recommended) or "standard" (1-round)
+        confidence_threshold: Threshold for applying suggestions (0.0-1.0)
+    
+    Returns:
+        Audit report with suggestions and optimized tree
+    """
+    llm = get_llm_provider()
+    storage = get_storage()
+    db = get_db()
+    
+    # Get document
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+    
+    # Check parse status
+    if doc.parse_status != "completed":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Document not parsed yet. Current status: {doc.parse_status}"
+        )
+    
+    # Check if file exists (for PDF verification)
+    file_path = None
+    if doc.file_type == "pdf" and storage.file_exists(doc.file_path):
+        file_path = str(storage.get_upload_path(doc.file_path))
+    
+    # Load tree data
+    tree_data = await storage.load_parse_result(document_id)
+    if tree_data is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Tree data file not found"
+        )
+    
+    # Convert tree to PageIndex format if needed
+    from api.services import ParseService
+    page_index_tree = ParseService.convert_api_to_page_index_format(tree_data)
+    
+    try:
+        # Create LLM client for auditor
+        from pageindex_v2.core.llm_client import LLMClient
+        from pageindex_v2.phases.tree_auditor_v2 import TreeAuditorV2
+        
+        audit_llm = LLMClient(
+            provider=llm.provider,
+            model=llm.model,
+            api_key=llm.api_key,
+            debug=False
+        )
+        
+        # Create auditor with progress callback
+        async def progress_callback(phase, phase_number, total_phases, message, progress, metadata):
+            """Send progress updates via WebSocket"""
+            await manager.broadcast_audit_progress(
+                document_id=document_id,
+                phase=phase,
+                phase_number=phase_number,
+                total_phases=total_phases,
+                message=message,
+                progress=progress,
+                metadata=metadata
+            )
+        
+        auditor = TreeAuditorV2(
+            llm=audit_llm,
+            pdf_path=file_path,
+            mode=mode,
+            debug=True,
+            progress_callback=progress_callback
+        )
+        
+        # Run audit
+        print(f"\n[AUDIT] Starting tree audit for document: {document_id}")
+        print(f"[AUDIT] Mode: {mode}, Confidence threshold: {confidence_threshold}")
+        
+        optimized_tree, audit_report = await auditor.audit_and_optimize(
+            tree=page_index_tree,
+            confidence_threshold=confidence_threshold
+        )
+        
+        # Convert optimized tree back to API format
+        api_tree = ParseService.convert_page_index_to_api_format(optimized_tree)
+        
+        # Save the audit report
+        audit_path = storage.save_audit_report(document_id, audit_report)
+        print(f"[AUDIT] Report saved: {audit_path}")
+        
+        # Get summary
+        summary = audit_report.get("summary", {})
+        
+        # Extract suggestions for frontend
+        advice_phase = audit_report.get("phases", {}).get("advice_generation", {})
+        advice_list = advice_phase.get("advice", [])
+        
+        # Generate audit ID
+        audit_id = document_id + "_audit_" + str(int(time.time()))
+        
+        # Create audit report in database
+        db.create_audit_report(
+            audit_id=audit_id,
+            doc_id=document_id,
+            document_type=audit_report.get("phases", {}).get("classification", {}).get("type", "Unknown"),
+            quality_score=int(summary.get("quality_score", 0)),
+            total_suggestions=len(advice_list),
+        )
+        
+        # Format and save suggestions to database
+        import uuid
+        suggestions = []
+        for idx, advice in enumerate(advice_list):
+            # Generate unique suggestion ID if not present
+            suggestion_id = advice.get("advice_id") or f"sugg_{document_id}_{idx}_{uuid.uuid4().hex[:8]}"
+            
+            # Prepare suggestion data
+            # For ADD actions, extract parent_id and insert_position from advice
+            node_info = advice.get("node_info", {})
+            if advice.get("action") == "ADD":
+                # Build node_info from ADD-specific fields
+                if "parent_id" in advice:
+                    node_info["parent_id"] = advice["parent_id"]
+                if "insert_position" in advice:
+                    node_info["insert_position"] = advice["insert_position"]
+                if "after_node_id" in advice:
+                    node_info["after_node_id"] = advice["after_node_id"]
+                if "before_node_id" in advice:
+                    node_info["before_node_id"] = advice["before_node_id"]
+                if "suggested_level" in advice:
+                    node_info["suggested_level"] = advice["suggested_level"]
+                if "suggested_pages" in advice:
+                    node_info["suggested_pages"] = advice["suggested_pages"]
+            
+            suggestion_data = {
+                "suggestion_id": suggestion_id,
+                "action": advice.get("action", ""),
+                "node_id": advice.get("node_id", ""),
+                "confidence": advice.get("confidence", "medium"),
+                "reason": advice.get("reason", ""),
+                "current_title": advice.get("current_title", ""),
+                "suggested_title": advice.get("new_title") or advice.get("suggested_format") or advice.get("suggested_title", ""),
+                "status": "pending",
+                "node_info": node_info,
+            }
+            
+            # Save to database
+            db.create_audit_suggestion(
+                suggestion_id=suggestion_id,
+                audit_id=audit_id,
+                doc_id=document_id,
+                action=suggestion_data["action"],
+                node_id=suggestion_data["node_id"],
+                confidence=suggestion_data["confidence"],
+                reason=suggestion_data["reason"],
+                current_title=suggestion_data["current_title"],
+                suggested_title=suggestion_data["suggested_title"],
+                node_info=suggestion_data["node_info"],
+            )
+            
+            suggestions.append(suggestion_data)
+        
+        print(f"[AUDIT] Saved {len(suggestions)} suggestions to database")
+        
+        return {
+            "success": True,
+            "document_id": document_id,
+            "mode": mode,
+            "audit_id": audit_id,
+            "quality_score": summary.get("quality_score", 0),
+            "summary": {
+                "original_nodes": summary.get("original_nodes", 0),
+                "optimized_nodes": summary.get("optimized_nodes", 0),
+                "total_suggestions": len(suggestions),
+                "changes_applied": summary.get("changes_applied", {}),
+            },
+            "suggestions": suggestions,
+            "message": f"Audit completed. Found {len(suggestions)} suggestions."
+        }
+        
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(
+            status_code=500,
+            detail=f"Audit failed: {str(e)}"
+        )
+

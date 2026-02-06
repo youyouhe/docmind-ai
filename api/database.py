@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, JSON
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -166,6 +166,131 @@ class Conversation(Base):
         }
 
 
+class AuditReport(Base):
+    """
+    Audit report table - stores metadata for document structure audits.
+    
+    The actual audit content is stored in filesystem at data/parsed/{doc_id}_audit_report.json
+    """
+    __tablename__ = "audit_reports"
+    
+    audit_id = Column(String, primary_key=True)  # UUID v4
+    doc_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    document_type = Column(String, nullable=True)  # e.g., "招标文件"
+    quality_score = Column(Integer, nullable=True)  # Overall quality score (0-100)
+    total_suggestions = Column(Integer, nullable=False, default=0)
+    status = Column(String, nullable=False, default="pending")  # pending/applied/rolled_back
+    applied_at = Column(DateTime, nullable=True)  # When suggestions were applied
+    backup_id = Column(String, nullable=True)  # Reference to backup snapshot
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relationship to document
+    document = relationship("Document")
+    
+    # Relationship to suggestions
+    suggestions = relationship("AuditSuggestion", back_populates="audit_report", cascade="all, delete-orphan")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "audit_id": self.audit_id,
+            "doc_id": self.doc_id,
+            "document_type": self.document_type,
+            "quality_score": self.quality_score,
+            "total_suggestions": self.total_suggestions,
+            "status": self.status,
+            "applied_at": self.applied_at.isoformat() if self.applied_at else None,
+            "backup_id": self.backup_id,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class AuditSuggestion(Base):
+    """
+    Audit suggestion table - stores individual suggestions for tree modifications.
+    
+    Tracks user review status and actions for each suggestion.
+    """
+    __tablename__ = "audit_suggestions"
+    
+    suggestion_id = Column(String, primary_key=True)  # UUID v4
+    audit_id = Column(String, ForeignKey("audit_reports.audit_id", ondelete="CASCADE"), nullable=False)
+    doc_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    action = Column(String, nullable=False)  # DELETE, ADD, MODIFY_FORMAT, MODIFY_PAGE
+    node_id = Column(String, nullable=True)  # Target node ID (null for ADD actions)
+    status = Column(String, nullable=False, default="pending")  # pending/accepted/rejected/applied
+    confidence = Column(String, nullable=True)  # high, medium, low
+    reason = Column(Text, nullable=True)  # Explanation for the suggestion
+    current_title = Column(Text, nullable=True)  # Current title (for MODIFY actions)
+    suggested_title = Column(Text, nullable=True)  # Suggested title (for MODIFY/ADD actions)
+    node_info = Column(Text, nullable=True)  # JSON: additional context (siblings, parent, etc.)
+    user_action = Column(String, nullable=True)  # accept/reject (set by user)
+    user_comment = Column(Text, nullable=True)  # Optional user comment
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    reviewed_at = Column(DateTime, nullable=True)  # When user reviewed
+    
+    # Relationships
+    audit_report = relationship("AuditReport", back_populates="suggestions")
+    document = relationship("Document")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        
+        node_info_dict = None
+        if self.node_info:
+            try:
+                node_info_dict = json.loads(self.node_info)
+            except:
+                node_info_dict = {}
+        
+        return {
+            "suggestion_id": self.suggestion_id,
+            "audit_id": self.audit_id,
+            "doc_id": self.doc_id,
+            "action": self.action,
+            "node_id": self.node_id,
+            "status": self.status,
+            "confidence": self.confidence,
+            "reason": self.reason,
+            "current_title": self.current_title,
+            "suggested_title": self.suggested_title,
+            "node_info": node_info_dict,
+            "user_action": self.user_action,
+            "user_comment": self.user_comment,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "reviewed_at": self.reviewed_at.isoformat() if self.reviewed_at else None,
+        }
+
+
+class AuditBackup(Base):
+    """
+    Audit backup table - stores tree snapshots for rollback functionality.
+    
+    Backup data is stored in filesystem at data/parsed/{doc_id}_audit_backup_{backup_id}.json
+    """
+    __tablename__ = "audit_backups"
+    
+    backup_id = Column(String, primary_key=True)  # UUID v4
+    doc_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    audit_id = Column(String, ForeignKey("audit_reports.audit_id", ondelete="CASCADE"), nullable=False)
+    backup_path = Column(String, nullable=False)  # Path to backup JSON file
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relationships
+    document = relationship("Document")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "backup_id": self.backup_id,
+            "doc_id": self.doc_id,
+            "audit_id": self.audit_id,
+            "backup_path": self.backup_path,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
 # =============================================================================
 # Database Manager
 # =============================================================================
@@ -252,6 +377,70 @@ class DatabaseManager:
                 conn.execute(text("ALTER TABLE parse_results ADD COLUMN performance_stats TEXT"))
                 conn.commit()
                 print("[Migration] Done: performance_stats column added")
+            
+            # Migration 4-6: Create audit tables if missing
+            tables = inspector.get_table_names()
+            
+            if 'audit_reports' not in tables:
+                print("[Migration] Creating audit_reports table...")
+                conn.execute(text("""
+                    CREATE TABLE audit_reports (
+                        audit_id VARCHAR PRIMARY KEY,
+                        doc_id VARCHAR NOT NULL,
+                        document_type VARCHAR,
+                        quality_score INTEGER,
+                        total_suggestions INTEGER NOT NULL DEFAULT 0,
+                        status VARCHAR NOT NULL DEFAULT 'pending',
+                        applied_at TIMESTAMP,
+                        backup_id VARCHAR,
+                        created_at TIMESTAMP NOT NULL,
+                        FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: audit_reports table created")
+            
+            if 'audit_suggestions' not in tables:
+                print("[Migration] Creating audit_suggestions table...")
+                conn.execute(text("""
+                    CREATE TABLE audit_suggestions (
+                        suggestion_id VARCHAR PRIMARY KEY,
+                        audit_id VARCHAR NOT NULL,
+                        doc_id VARCHAR NOT NULL,
+                        action VARCHAR NOT NULL,
+                        node_id VARCHAR,
+                        status VARCHAR NOT NULL DEFAULT 'pending',
+                        confidence VARCHAR,
+                        reason TEXT,
+                        current_title TEXT,
+                        suggested_title TEXT,
+                        node_info TEXT,
+                        user_action VARCHAR,
+                        user_comment TEXT,
+                        created_at TIMESTAMP NOT NULL,
+                        reviewed_at TIMESTAMP,
+                        FOREIGN KEY (audit_id) REFERENCES audit_reports(audit_id) ON DELETE CASCADE,
+                        FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: audit_suggestions table created")
+            
+            if 'audit_backups' not in tables:
+                print("[Migration] Creating audit_backups table...")
+                conn.execute(text("""
+                    CREATE TABLE audit_backups (
+                        backup_id VARCHAR PRIMARY KEY,
+                        doc_id VARCHAR NOT NULL,
+                        audit_id VARCHAR NOT NULL,
+                        backup_path VARCHAR NOT NULL,
+                        created_at TIMESTAMP NOT NULL,
+                        FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE,
+                        FOREIGN KEY (audit_id) REFERENCES audit_reports(audit_id) ON DELETE CASCADE
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: audit_backups table created")
 
     def drop_all(self):
         """Drop all tables (use with caution!)."""
@@ -680,6 +869,413 @@ class DatabaseManager:
             ).delete()
             session.commit()
             return count
+
+    # -------------------------------------------------------------------------
+    # Audit Report Operations
+    # -------------------------------------------------------------------------
+
+    def create_audit_report(
+        self,
+        audit_id: str,
+        doc_id: str,
+        document_type: Optional[str] = None,
+        quality_score: Optional[int] = None,
+        total_suggestions: int = 0,
+    ) -> AuditReport:
+        """
+        Create a new audit report record.
+
+        Args:
+            audit_id: Unique audit ID (UUID)
+            doc_id: Document ID
+            document_type: Type of document (e.g., "招标文件")
+            quality_score: Overall quality score (0-100)
+            total_suggestions: Total number of suggestions
+
+        Returns:
+            Created AuditReport instance
+        """
+        with self.get_session() as session:
+            report = AuditReport(
+                audit_id=audit_id,
+                doc_id=doc_id,
+                document_type=document_type,
+                quality_score=quality_score,
+                total_suggestions=total_suggestions,
+                status="pending",
+            )
+            session.add(report)
+            session.commit()
+            session.refresh(report)
+            
+            # Return detached copy
+            return AuditReport(
+                audit_id=report.audit_id,
+                doc_id=report.doc_id,
+                document_type=report.document_type,
+                quality_score=report.quality_score,
+                total_suggestions=report.total_suggestions,
+                status=report.status,
+                applied_at=report.applied_at,
+                backup_id=report.backup_id,
+                created_at=report.created_at,
+            )
+
+    def get_audit_report(self, doc_id: str) -> Optional[AuditReport]:
+        """Get the latest audit report for a document."""
+        with self.get_session() as session:
+            report = session.query(AuditReport).filter(
+                AuditReport.doc_id == doc_id
+            ).order_by(AuditReport.created_at.desc()).first()
+            
+            if report is None:
+                return None
+            
+            # Return detached copy
+            return AuditReport(
+                audit_id=report.audit_id,
+                doc_id=report.doc_id,
+                document_type=report.document_type,
+                quality_score=report.quality_score,
+                total_suggestions=report.total_suggestions,
+                status=report.status,
+                applied_at=report.applied_at,
+                backup_id=report.backup_id,
+                created_at=report.created_at,
+            )
+
+    def update_audit_report_status(
+        self,
+        audit_id: str,
+        status: str,
+        backup_id: Optional[str] = None,
+    ) -> bool:
+        """
+        Update audit report status (e.g., mark as applied).
+
+        Args:
+            audit_id: Audit report ID
+            status: New status ('pending', 'applied', 'rolled_back')
+            backup_id: Optional backup ID reference
+
+        Returns:
+            True if updated, False if not found
+        """
+        with self.get_session() as session:
+            report = session.query(AuditReport).filter(
+                AuditReport.audit_id == audit_id
+            ).first()
+            
+            if report is None:
+                return False
+            
+            report.status = status
+            if backup_id:
+                report.backup_id = backup_id
+            if status == "applied":
+                report.applied_at = datetime.utcnow()
+            
+            session.commit()
+            return True
+
+    # -------------------------------------------------------------------------
+    # Audit Suggestion Operations
+    # -------------------------------------------------------------------------
+
+    def create_audit_suggestion(
+        self,
+        suggestion_id: str,
+        audit_id: str,
+        doc_id: str,
+        action: str,
+        node_id: Optional[str] = None,
+        confidence: Optional[str] = None,
+        reason: Optional[str] = None,
+        current_title: Optional[str] = None,
+        suggested_title: Optional[str] = None,
+        node_info: Optional[Dict[str, Any]] = None,
+    ) -> AuditSuggestion:
+        """
+        Create a new audit suggestion record.
+
+        Args:
+            suggestion_id: Unique suggestion ID (UUID)
+            audit_id: Audit report ID
+            doc_id: Document ID
+            action: Action type (DELETE, ADD, MODIFY_FORMAT, MODIFY_PAGE)
+            node_id: Target node ID
+            confidence: Confidence level (high, medium, low)
+            reason: Explanation for the suggestion
+            current_title: Current title (for MODIFY actions)
+            suggested_title: Suggested title (for MODIFY/ADD actions)
+            node_info: Additional context as dictionary
+
+        Returns:
+            Created AuditSuggestion instance
+        """
+        import json
+        
+        with self.get_session() as session:
+            suggestion = AuditSuggestion(
+                suggestion_id=suggestion_id,
+                audit_id=audit_id,
+                doc_id=doc_id,
+                action=action,
+                node_id=node_id,
+                status="pending",
+                confidence=confidence,
+                reason=reason,
+                current_title=current_title,
+                suggested_title=suggested_title,
+                node_info=json.dumps(node_info) if node_info else None,
+            )
+            session.add(suggestion)
+            session.commit()
+            session.refresh(suggestion)
+            
+            # Return detached copy
+            return AuditSuggestion(
+                suggestion_id=suggestion.suggestion_id,
+                audit_id=suggestion.audit_id,
+                doc_id=suggestion.doc_id,
+                action=suggestion.action,
+                node_id=suggestion.node_id,
+                status=suggestion.status,
+                confidence=suggestion.confidence,
+                reason=suggestion.reason,
+                current_title=suggestion.current_title,
+                suggested_title=suggestion.suggested_title,
+                node_info=suggestion.node_info,
+                user_action=suggestion.user_action,
+                user_comment=suggestion.user_comment,
+                created_at=suggestion.created_at,
+                reviewed_at=suggestion.reviewed_at,
+            )
+
+    def get_suggestions(
+        self,
+        audit_id: str,
+        action: Optional[str] = None,
+        status: Optional[str] = None,
+        confidence: Optional[str] = None,
+    ) -> List[AuditSuggestion]:
+        """
+        Get suggestions for an audit report with optional filters.
+
+        Args:
+            audit_id: Audit report ID
+            action: Filter by action type (DELETE, ADD, MODIFY_FORMAT, MODIFY_PAGE)
+            status: Filter by status (pending, accepted, rejected, applied)
+            confidence: Filter by confidence (high, medium, low)
+
+        Returns:
+            List of AuditSuggestion instances
+        """
+        with self.get_session() as session:
+            query = session.query(AuditSuggestion).filter(
+                AuditSuggestion.audit_id == audit_id
+            )
+            
+            if action:
+                query = query.filter(AuditSuggestion.action == action)
+            if status:
+                query = query.filter(AuditSuggestion.status == status)
+            if confidence:
+                query = query.filter(AuditSuggestion.confidence == confidence)
+            
+            suggestions = query.order_by(AuditSuggestion.created_at.asc()).all()
+            
+            # Return detached copies
+            return [
+                AuditSuggestion(
+                    suggestion_id=s.suggestion_id,
+                    audit_id=s.audit_id,
+                    doc_id=s.doc_id,
+                    action=s.action,
+                    node_id=s.node_id,
+                    status=s.status,
+                    confidence=s.confidence,
+                    reason=s.reason,
+                    current_title=s.current_title,
+                    suggested_title=s.suggested_title,
+                    node_info=s.node_info,
+                    user_action=s.user_action,
+                    user_comment=s.user_comment,
+                    created_at=s.created_at,
+                    reviewed_at=s.reviewed_at,
+                )
+                for s in suggestions
+            ]
+
+    def get_suggestion(self, suggestion_id: str) -> Optional[AuditSuggestion]:
+        """Get a single suggestion by ID."""
+        with self.get_session() as session:
+            s = session.query(AuditSuggestion).filter(
+                AuditSuggestion.suggestion_id == suggestion_id
+            ).first()
+            
+            if s is None:
+                return None
+            
+            return AuditSuggestion(
+                suggestion_id=s.suggestion_id,
+                audit_id=s.audit_id,
+                doc_id=s.doc_id,
+                action=s.action,
+                node_id=s.node_id,
+                status=s.status,
+                confidence=s.confidence,
+                reason=s.reason,
+                current_title=s.current_title,
+                suggested_title=s.suggested_title,
+                node_info=s.node_info,
+                user_action=s.user_action,
+                user_comment=s.user_comment,
+                created_at=s.created_at,
+                reviewed_at=s.reviewed_at,
+            )
+
+    def update_suggestion_review(
+        self,
+        suggestion_id: str,
+        user_action: str,
+        user_comment: Optional[str] = None,
+    ) -> bool:
+        """
+        Update suggestion with user review (accept/reject).
+
+        Args:
+            suggestion_id: Suggestion ID
+            user_action: User action ('accept' or 'reject')
+            user_comment: Optional user comment
+
+        Returns:
+            True if updated, False if not found
+        """
+        with self.get_session() as session:
+            suggestion = session.query(AuditSuggestion).filter(
+                AuditSuggestion.suggestion_id == suggestion_id
+            ).first()
+            
+            if suggestion is None:
+                return False
+            
+            suggestion.user_action = user_action
+            suggestion.user_comment = user_comment
+            suggestion.status = "accepted" if user_action == "accept" else "rejected"
+            suggestion.reviewed_at = datetime.utcnow()
+            
+            session.commit()
+            return True
+
+    def update_suggestions_status(
+        self,
+        suggestion_ids: List[str],
+        status: str,
+    ) -> int:
+        """
+        Batch update suggestion status (e.g., mark as applied).
+
+        Args:
+            suggestion_ids: List of suggestion IDs
+            status: New status
+
+        Returns:
+            Number of suggestions updated
+        """
+        with self.get_session() as session:
+            count = session.query(AuditSuggestion).filter(
+                AuditSuggestion.suggestion_id.in_(suggestion_ids)
+            ).update({"status": status}, synchronize_session=False)
+            session.commit()
+            return count
+
+    # -------------------------------------------------------------------------
+    # Audit Backup Operations
+    # -------------------------------------------------------------------------
+
+    def create_audit_backup(
+        self,
+        backup_id: str,
+        doc_id: str,
+        audit_id: str,
+        backup_path: str,
+    ) -> AuditBackup:
+        """
+        Create a backup snapshot for rollback.
+
+        Args:
+            backup_id: Unique backup ID (UUID)
+            doc_id: Document ID
+            audit_id: Audit report ID
+            backup_path: Path to backup JSON file (relative to data dir)
+
+        Returns:
+            Created AuditBackup instance
+        """
+        with self.get_session() as session:
+            backup = AuditBackup(
+                backup_id=backup_id,
+                doc_id=doc_id,
+                audit_id=audit_id,
+                backup_path=backup_path,
+            )
+            session.add(backup)
+            session.commit()
+            session.refresh(backup)
+            
+            # Return detached copy
+            return AuditBackup(
+                backup_id=backup.backup_id,
+                doc_id=backup.doc_id,
+                audit_id=backup.audit_id,
+                backup_path=backup.backup_path,
+                created_at=backup.created_at,
+            )
+
+    def get_audit_backup(self, backup_id: str) -> Optional[AuditBackup]:
+        """Get a backup by ID."""
+        with self.get_session() as session:
+            backup = session.query(AuditBackup).filter(
+                AuditBackup.backup_id == backup_id
+            ).first()
+            
+            if backup is None:
+                return None
+            
+            return AuditBackup(
+                backup_id=backup.backup_id,
+                doc_id=backup.doc_id,
+                audit_id=backup.audit_id,
+                backup_path=backup.backup_path,
+                created_at=backup.created_at,
+            )
+
+    def get_backups_by_document(self, doc_id: str) -> List[AuditBackup]:
+        """
+        Get all backups for a document, ordered by creation time (newest first).
+        
+        Args:
+            doc_id: Document ID
+            
+        Returns:
+            List of AuditBackup instances
+        """
+        with self.get_session() as session:
+            backups = session.query(AuditBackup).filter(
+                AuditBackup.doc_id == doc_id
+            ).order_by(AuditBackup.created_at.desc()).all()
+            
+            return [
+                AuditBackup(
+                    backup_id=b.backup_id,
+                    doc_id=b.doc_id,
+                    audit_id=b.audit_id,
+                    backup_path=b.backup_path,
+                    created_at=b.created_at,
+                )
+                for b in backups
+            ]
 
 
 # =============================================================================

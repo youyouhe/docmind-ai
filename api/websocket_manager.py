@@ -240,6 +240,66 @@ class ConnectionManager:
             logger.warning(f"Removing failed connection: {connection_id}")
             await self.disconnect(connection_id)
 
+    async def broadcast_audit_progress(
+        self,
+        document_id: str,
+        phase: str,
+        phase_number: int,
+        total_phases: int,
+        message: str,
+        progress: float,
+        metadata: Optional[dict] = None
+    ):
+        """
+        Broadcast audit progress update to all subscribers of a document.
+
+        Args:
+            document_id: The document ID
+            phase: The current phase name
+            phase_number: The current phase number (1-based)
+            total_phases: Total number of phases
+            message: Human-readable progress message
+            progress: Progress percentage (0-100)
+            metadata: Optional additional metadata
+        """
+        if document_id not in self.document_subscribers:
+            logger.debug(
+                f"No subscribers for document {document_id}, skipping audit progress broadcast"
+            )
+            return
+
+        payload = {
+            "type": "audit_progress",
+            "document_id": document_id,
+            "phase": phase,
+            "phase_number": phase_number,
+            "total_phases": total_phases,
+            "message": message,
+            "progress": progress,
+        }
+
+        if metadata:
+            payload["metadata"] = metadata
+
+        # Create a set of connections to notify
+        subscribers = self.document_subscribers[document_id].copy()
+
+        logger.debug(
+            f"Broadcasting audit progress ({phase} - {progress:.1f}%) for document {document_id} "
+            f"to {len(subscribers)} subscriber(s)"
+        )
+
+        failed_connections = set()
+        for connection_id in subscribers:
+            success = await self._send_to_connection(connection_id, payload)
+            if not success:
+                failed_connections.add(connection_id)
+
+        # Clean up failed connections
+        for connection_id in failed_connections:
+            logger.warning(f"Removing failed connection: {connection_id}")
+            await self.disconnect(connection_id)
+
     async def send_heartbeat(self, connection_id: str):
         """
         Send a ping heartbeat to a specific connection.
