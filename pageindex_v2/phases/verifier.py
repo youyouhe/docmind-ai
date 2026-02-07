@@ -137,20 +137,17 @@ class Verifier:
                 page_content = pages[local_index].text[:2000]  # First 2000 chars
                 
                 system_prompt = """
-                Check if the given section title appears in the page content AS A REAL SECTION HEADING.
-                
-                IMPORTANT: Distinguish between:
-                1. **Real section heading** - The title appears as an actual chapter/section start (e.g., at page top, followed by content)
-                2. **TOC reference** - The title appears in a table of contents list (e.g., "一、XX 二、YY 三、ZZ" with no content after)
-                
-                ONLY return "yes" if it's a REAL section heading with actual content.
-                Return "no" if it's just a TOC reference/listing.
-                
-                Do fuzzy matching - ignore minor spacing or formatting differences.
-                
+                Check if the section title appears in the page content as a real section heading.
+
+                Distinguish between:
+                - Real section heading (actual chapter/section start with content)
+                - TOC reference (listing in table of contents without content)
+
+                Use fuzzy matching for minor spacing/formatting differences.
+
                 Reply JSON:
                 {
-                    "reasoning": "Is this a real section heading or just a TOC reference?",
+                    "reasoning": "Brief explanation",
                     "exists": "yes" or "no",
                     "is_toc_page": "yes" or "no"
                 }

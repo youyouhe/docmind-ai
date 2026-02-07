@@ -6,7 +6,7 @@ import random
 from datetime import datetime
 import time
 import json
-from typing import Optional, List
+from typing import Optional, List, Callable, Dict, Any
 import PyPDF2
 import copy
 import asyncio
@@ -18,6 +18,18 @@ import logging
 import yaml
 from pathlib import Path
 from types import SimpleNamespace as config
+
+# Global callback for LLM logging (set by parse_document_background)
+_llm_log_callback: Optional[Callable] = None
+
+def set_llm_log_callback(callback: Optional[Callable]):
+    """Set global callback for logging LLM calls."""
+    global _llm_log_callback
+    _llm_log_callback = callback
+
+def get_llm_log_callback() -> Optional[Callable]:
+    """Get the current LLM log callback."""
+    return _llm_log_callback
 
 # Unified LLM configuration (same as API service)
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "deepseek")
@@ -128,6 +140,7 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
                 input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
                 output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
                 duration = time.time() - start_time
+                duration_ms = int(duration * 1000)
 
                 # Debug: Log token usage
                 print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
@@ -141,6 +154,23 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
                     success=(i == 0),
                     retry=(i > 0)
                 )
+                
+                # Log to database if callback is set
+                if _llm_log_callback:
+                    try:
+                        finish_reason = response.choices[0].finish_reason
+                        _llm_log_callback(
+                            operation_type=stage,
+                            prompt=prompt,
+                            response=response.choices[0].message.content,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=True,
+                            error_msg=None,
+                            metadata={"retry_count": i, "finish_reason": finish_reason}
+                        )
+                    except Exception as log_error:
+                        print(f"[LLM] Failed to log to database: {log_error}")
             except Exception:
                 pass  # Silently fail if monitor not available
 
@@ -169,7 +199,24 @@ def ChatGPT_API_with_finish_reason(model, prompt, api_key=CHATGPT_API_KEY, chat_
                 time.sleep(wait_time)
             else:
                 logging.error(f"ChatGPT_API_with_finish_reason failed after {max_retries} attempts. Error: {e}")
+                # Log final failure to database
+                if _llm_log_callback:
+                    try:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        _llm_log_callback(
+                            operation_type=stage,
+                            prompt=prompt,
+                            response=None,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata={"retry_count": max_retries}
+                        )
+                    except Exception:
+                        pass
                 return "Error", "error"
+
 
 
 
@@ -209,6 +256,7 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None, base_
                 input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
                 output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
                 duration = time.time() - start_time
+                duration_ms = int(duration * 1000)
 
                 # Debug: Log token usage
                 print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
@@ -222,6 +270,22 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None, base_
                     success=(i == 0),
                     retry=(i > 0)
                 )
+                
+                # Log to database if callback is set
+                if _llm_log_callback:
+                    try:
+                        _llm_log_callback(
+                            operation_type=stage,
+                            prompt=prompt,
+                            response=response.choices[0].message.content,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=True,
+                            error_msg=None,
+                            metadata={"retry_count": i}
+                        )
+                    except Exception as log_error:
+                        print(f"[LLM] Failed to log to database: {log_error}")
             except Exception:
                 pass  # Silently fail if monitor not available
 
@@ -247,8 +311,24 @@ def ChatGPT_API(model, prompt, api_key=CHATGPT_API_KEY, chat_history=None, base_
                 time.sleep(wait_time)
             else:
                 logging.error(f"ChatGPT_API failed after {max_retries} attempts. Error: {e}")
+                # Log final failure to database
+                if _llm_log_callback:
+                    try:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        _llm_log_callback(
+                            operation_type=stage,
+                            prompt=prompt,
+                            response=None,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata={"retry_count": max_retries}
+                        )
+                    except Exception:
+                        pass
                 return "Error"
-            
+             
 
 async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY, base_url=OPENAI_BASE_URL):
     """
@@ -281,6 +361,7 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY, base_url=OPE
                     input_tokens = response.usage.prompt_tokens if hasattr(response, 'usage') and response.usage else 0
                     output_tokens = response.usage.completion_tokens if hasattr(response, 'usage') and response.usage else 0
                     duration = time.time() - start_time
+                    duration_ms = int(duration * 1000)
 
                     # Debug: Log token usage
                     print(f"[LLM] stage={stage} in={input_tokens} out={output_tokens} time={duration:.2f}s")
@@ -294,6 +375,22 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY, base_url=OPE
                         success=(i == 0),
                         retry=(i > 0)
                     )
+                    
+                    # Log to database if callback is set
+                    if _llm_log_callback:
+                        try:
+                            _llm_log_callback(
+                                operation_type=stage,
+                                prompt=prompt,
+                                response=response.choices[0].message.content,
+                                model=model,
+                                duration_ms=duration_ms,
+                                success=True,
+                                error_msg=None,
+                                metadata={"retry_count": i}
+                            )
+                        except Exception as log_error:
+                            print(f"[LLM] Failed to log to database: {log_error}")
                 except Exception:
                     pass  # Silently fail if monitor not available
 
@@ -319,8 +416,24 @@ async def ChatGPT_API_async(model, prompt, api_key=CHATGPT_API_KEY, base_url=OPE
                 await asyncio.sleep(wait_time)
             else:
                 logging.error(f"ChatGPT_API_async failed after {max_retries} attempts. Error: {e}")
+                # Log final failure to database
+                if _llm_log_callback:
+                    try:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        _llm_log_callback(
+                            operation_type=stage,
+                            prompt=prompt,
+                            response=None,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata={"retry_count": max_retries}
+                        )
+                    except Exception:
+                        pass
                 return "Error"
-            
+             
 def get_json_content(response):
     start_idx = response.find("```json")
     if start_idx != -1:

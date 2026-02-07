@@ -83,10 +83,10 @@ class TreeBuilder:
                 print(f"[TREE] Merged nodes exceeding depth {self.max_depth}")
         
         # Step 5: Calculate end indices
-        tree = self._calculate_end_indices(tree, len(pages))
+        tree = self._calculate_end_indices(tree, pages)
         
-        # Step 6: Add node IDs
-        add_node_ids(tree)
+        # Step 6: Add node IDs with multi-level numbering (1, 1.1, 1.1.1, etc.)
+        add_node_ids(tree, use_hierarchical=True)
         
         # Step 7: Optional - add summaries or text
         # tree = self._add_node_texts(tree, pages)  # If needed
@@ -104,18 +104,26 @@ class TreeBuilder:
     def _calculate_end_indices(
         self,
         tree: List[Dict],
-        total_pages: int
+        pages: List
     ) -> List[Dict]:
         """
         Calculate end_index for each node based on next sibling or child
         
-        Improved strategy:
-        - Use next sibling's start - 1 if available
-        - Otherwise, use parent's boundary or reasonable estimate
-        - Avoid defaulting all leaf nodes to total_pages
+        Strategy:
+        - Allow adjacent sections to share pages (end = next_start)
+        - This handles common cases where:
+          1. A section's content extends to the next section's start page
+          2. Page headers may contain the next section's title
+          3. Multiple sections can start/end on the same page
         """
-        def process_node(node: Dict, next_sibling_start: Optional[int] = None, parent_end: Optional[int] = None):
+        total_pages = len(pages)
+        def process_node(
+            node: Dict, 
+            next_sibling_start: Optional[int] = None, 
+            parent_end: Optional[int] = None
+        ):
             """Process single node and its children"""
+            title = node.get('title', '')
             start = node.get('start_index') or node.get('physical_index', 1)
             
             # Calculate end
@@ -136,7 +144,8 @@ class TreeBuilder:
                     # Next sibling's start (or None if last)
                     next_start = None
                     if i + 1 < len(children):
-                        next_start = children[i + 1].get('physical_index')
+                        # Use start_index (already set by list_to_tree) instead of physical_index
+                        next_start = children[i + 1].get('start_index') or children[i + 1].get('physical_index')
                     
                     process_node(child, next_start, node_boundary)
                 
@@ -144,10 +153,11 @@ class TreeBuilder:
                 last_child = children[-1]
                 end = last_child.get('end_index', start)
             else:
-                # Leaf node - use smarter heuristics
+                # Leaf node - allow sharing pages with next sibling
                 if next_sibling_start:
-                    # Next sibling available - use it
-                    end = next_sibling_start - 1
+                    # Allow current node to extend to next sibling's start page
+                    # This handles cases where content spans across page boundaries
+                    end = next_sibling_start
                 elif parent_end:
                     # Use parent's boundary
                     end = parent_end
@@ -173,7 +183,8 @@ class TreeBuilder:
         for i, node in enumerate(tree):
             next_start = None
             if i + 1 < len(tree):
-                next_start = tree[i + 1].get('physical_index') or tree[i + 1].get('start_index')
+                # Use start_index (already set by list_to_tree) instead of physical_index
+                next_start = tree[i + 1].get('start_index') or tree[i + 1].get('physical_index')
             
             process_node(node, next_start, total_pages)
         
@@ -243,8 +254,8 @@ class TreeBuilder:
             # Insert at beginning
             tree.insert(0, preface)
             
-            # Re-assign IDs
-            add_node_ids(tree)
+            # Re-assign IDs with multi-level numbering
+            add_node_ids(tree, use_hierarchical=True)
             
             if self.debug:
                 print(f"[TREE] Added preface node (pages 1-{first_start - 1})")

@@ -86,11 +86,10 @@ class TOCExtractor:
 Output: {"table_of_contents": [{"structure": "1.1", "title": "...", "page": 5}]}
 
 Rules:
-- structure: "1" (chapter), "1.1" (section), "1.1.1" (subsection)
-- Chinese chapters: "第一章" → structure="1", keep title as-is
-- ⚠️ **CRITICAL**: Copy exact title text from PDF - DO NOT modify, translate, or rewrite any text
-- Extract page numbers as-is, maintain hierarchy
-- Include ALL sections
+- structure: hierarchical numbering (1, 1.1, 1.1.1)
+- Copy titles exactly as they appear - DO NOT modify or translate
+- Maintain proper parent-child relationships in structure codes
+- Include ALL sections from the TOC
 
 Return JSON only."""
         

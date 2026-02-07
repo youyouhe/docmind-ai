@@ -310,10 +310,15 @@ Please respond in JSON format."""
         # Append gap patches to original structure
         updated_structure = tree_structure + gap_patches
         
+        # CRITICAL FIX: Sort by start_index to maintain page order
+        # Gap patches may have earlier page numbers than some original nodes
+        updated_structure.sort(key=lambda node: node.get('start_index', 0))
+        
         if self.debug:
             print(f"[GAP FILLER] ✓ Added {len(gap_patches)} patch nodes to structure")
             print(f"[GAP FILLER] Original nodes: {len(tree_structure)}")
             print(f"[GAP FILLER] Updated nodes: {len(updated_structure)}")
+            print(f"[GAP FILLER] ✓ Sorted nodes by start_index (ascending page order)")
         
         return updated_structure, analysis
 

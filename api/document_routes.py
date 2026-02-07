@@ -26,6 +26,7 @@ from pydantic import BaseModel
 logger = logging.getLogger("pageindex.api.documents")
 
 from api.database import get_db, DatabaseManager
+from api.logger_utils import create_document_logger, get_document_logger
 from api.storage import StorageService
 from api.services import LLMProvider, ParseService
 from api.models import (
@@ -110,12 +111,77 @@ async def parse_document_background(
             }
         )
 
+    # Create document-specific logger
+    doc_logger = create_document_logger(document_id, "parse")
+    
+    # Create LLM logging callback for parse debugging
+    def llm_log_callback(operation_type: str, prompt: str, response: str, 
+                        model: str, duration_ms: int, success: bool,
+                        error_msg: Optional[str], metadata: Optional[dict]):
+        """Callback to log LLM calls during parsing."""
+        try:
+            # Extract token info from metadata if available
+            prompt_tokens = metadata.get('prompt_tokens') if metadata else None
+            completion_tokens = metadata.get('completion_tokens') if metadata else None
+            total_tokens = metadata.get('total_tokens') if metadata else None
+            
+            # Clean metadata for storage (remove token counts since we store them separately)
+            clean_metadata = {k: v for k, v in (metadata or {}).items() 
+                             if k not in ['prompt_tokens', 'completion_tokens', 'total_tokens']}
+            
+            db.save_parse_debug_log(
+                document_id=document_id,
+                operation_type=operation_type,
+                prompt=prompt[:2000] if prompt else None,  # Limit prompt length
+                response=response[:1000] if response else None,  # Truncate response
+                model_used=model,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                duration_ms=duration_ms,
+                success=success,
+                error_message=error_msg,
+                metadata=clean_metadata if clean_metadata else None
+            )
+            doc_logger.debug(f"Saved LLM debug log: {operation_type} | {model} | {duration_ms}ms | tokens={total_tokens}")
+        except Exception as e:
+            doc_logger.warning(f"Failed to save LLM debug log: {e}")
+    
+    # Set the global callback in pageindex utils
     try:
+        from pageindex.utils import set_llm_log_callback
+        set_llm_log_callback(llm_log_callback)
+        doc_logger.info("LLM debug logging enabled for parse session")
+    except Exception as e:
+        doc_logger.warning(f"Failed to set LLM log callback: {e}")
+    
+    # Create LLM provider with logging callback for this parse session
+    try:
+        global llm_provider
+        if llm_provider:
+            parse_llm = LLMProvider(
+                provider=llm_provider.provider,
+                api_key=llm_provider.api_key,
+                model=model or llm_provider.model,
+                log_callback=llm_log_callback
+            )
+        else:
+            parse_llm = None
+    except Exception as e:
+        doc_logger.warning(f"Failed to create LLM provider with logging: {e}")
+        parse_llm = None
+    
+    try:
+        doc_logger.info(f"开始解析文档: {file_path}")
+        doc_logger.info(f"文件类型: {file_type}, 模型: {model}")
+        doc_logger.info(f"解析配置: {json.dumps(parse_config, indent=2, ensure_ascii=False)}")
+        
         # Clear any previous PDF performance data
         ParseService.clear_last_pdf_performance()
 
         # Update status to processing
         db.update_document_status(document_id, "processing")
+        doc_logger.debug("数据库状态已更新为 processing")
 
         # Broadcast status update via WebSocket
         await manager.broadcast_status_update(document_id, "processing", progress=0.0)
@@ -133,6 +199,7 @@ async def parse_document_background(
 
         # Parse the document
         if file_type == "pdf":
+            doc_logger.info("开始 PDF 解析流程")
             # Stage 1: Analyzing document structure
             await manager.broadcast_status_update(
                 document_id,
@@ -152,7 +219,9 @@ async def parse_document_background(
                 if_add_node_text=parse_config.get("if_add_node_text", False),
                 custom_prompt=parse_config.get("custom_prompt"),
                 progress_callback=progress_callback,
+                llm_provider=parse_llm,
             )
+            doc_logger.info("PDF 解析完成")
 
             # Stage 2: Building tree structure
             await manager.broadcast_status_update(
@@ -162,6 +231,7 @@ async def parse_document_background(
                 metadata={"stage": "Finalizing tree structure..."}
             )
         else:  # markdown
+            doc_logger.info("开始 Markdown 解析流程")
             # Stage 1: Analyzing markdown structure
             await manager.broadcast_status_update(
                 document_id,
@@ -179,7 +249,9 @@ async def parse_document_background(
                     model=model,
                     if_add_node_summary=parse_config.get("if_add_node_summary", True),
                     if_add_node_text=parse_config.get("if_add_node_text", True),
+                    llm_provider=parse_llm,
                 )
+            doc_logger.info("Markdown 解析完成")
 
             # Stage 2: Building tree structure
             await manager.broadcast_status_update(
@@ -195,6 +267,7 @@ async def parse_document_background(
         # Stage 3: Tree Quality Audit (if enabled)
         audit_report = None
         if parse_config.get("enable_audit", False) and file_type == "pdf":
+            doc_logger.info("开始树结构质量审计")
             await manager.broadcast_status_update(
                 document_id,
                 "processing",
@@ -234,11 +307,16 @@ async def parse_document_background(
                 # Log audit summary
                 if audit_report:
                     summary = audit_report.get("summary", {})
+                    doc_logger.info(f"审计质量分数: {summary.get('quality_score', 0):.1f}/100")
+                    doc_logger.info(f"节点数变化: {summary.get('original_nodes', 0)} → {summary.get('optimized_nodes', 0)}")
+                    doc_logger.info(f"应用的更改: {summary.get('changes_applied', {})}")
                     print(f"\n[AUDIT] Quality Score: {summary.get('quality_score', 0):.1f}/100")
                     print(f"[AUDIT] Nodes: {summary.get('original_nodes', 0)} → {summary.get('optimized_nodes', 0)}")
                     print(f"[AUDIT] Changes: {summary.get('changes_applied', {})}\n")
                     
             except Exception as e:
+                doc_logger.warning(f"审计失败: {e}")
+                doc_logger.info("继续使用原始树结构")
                 print(f"[AUDIT] Warning: Audit failed - {e}")
                 print("[AUDIT] Continuing with original tree...")
                 # Continue with non-audited tree
@@ -293,6 +371,14 @@ async def parse_document_background(
         db.update_parse_performance_stats(document_id, perf_summary)
 
         # Log performance summary
+        doc_logger.info("=" * 50)
+        doc_logger.info(f"解析完成: {document_id}")
+        doc_logger.info(f"总耗时: {duration_ms}ms ({perf_summary.get('total_duration_seconds', 0):.2f}s)")
+        doc_logger.info(f"LLM 调用次数: {perf_summary.get('total_llm_calls', 0)}")
+        doc_logger.info(f"Token 使用量: {perf_summary.get('total_input_tokens', 0):,} input, {perf_summary.get('total_output_tokens', 0):,} output")
+        doc_logger.info(f"树结构统计: {json.dumps(stats_dict, indent=2, ensure_ascii=False)}")
+        doc_logger.info("=" * 50)
+        
         print("\n" + "=" * 50)
         print(f"Parse completed for document: {document_id}")
         print(f"Duration: {duration_ms}ms ({perf_summary.get('total_duration_seconds', 0):.2f}s)")
@@ -302,6 +388,7 @@ async def parse_document_background(
 
         # Update document status to completed
         db.update_document_status(document_id, "completed")
+        doc_logger.info("文档状态已更新为 completed")
 
         # Broadcast completion status via WebSocket
         await manager.broadcast_status_update(
@@ -310,11 +397,19 @@ async def parse_document_background(
             progress=100.0,
             metadata={"duration_ms": duration_ms}
         )
+        
+        # Close document logger
+        get_document_logger().close_logger(document_id)
 
     except Exception as e:
         # Update document status to failed
         error_msg = f"Parse failed: {str(e)}"
         db.update_document_status(document_id, "failed", error_message=error_msg)
+        
+        # Log error to document logger
+        doc_logger.error(f"解析失败: {error_msg}")
+        doc_logger.error(f"错误堆栈:\n{traceback.format_exc()}")
+        
         traceback.print_exc()
 
         # Broadcast failed status via WebSocket
@@ -323,6 +418,9 @@ async def parse_document_background(
             "failed",
             error_message=error_msg
         )
+        
+        # Close document logger
+        get_document_logger().close_logger(document_id)
 
 
 def get_llm_provider() -> LLMProvider:
@@ -905,14 +1003,37 @@ async def update_node_title(
         """
         if node.get("id") == target_id:
             node["title"] = new_title
+
+            # Also update display_title if it exists
+            # display_title format is typically "{node_id} {title}"
+            # We need to preserve the node_id prefix and update the title
+            if "display_title" in node:
+                # First, try to use node_id if available
+                node_id = node.get("node_id", "")
+                if node_id:
+                    # Reconstruct display_title with the new title
+                    node["display_title"] = f"{node_id} {new_title}"
+                else:
+                    # Fallback: try to extract the prefix from old display_title
+                    # Format: "1 Title" or "1.1 Title" or "1.1.1 Title"
+                    old_display_title = node["display_title"]
+                    parts = old_display_title.split(" ", 1)
+                    if len(parts) > 1 and parts[0].replace(".", "").isdigit():
+                        # First part looks like a node_id (e.g., "1", "1.1", "1.1.1")
+                        node_id_prefix = parts[0]
+                        node["display_title"] = f"{node_id_prefix} {new_title}"
+                    else:
+                        # Can't determine pattern, just use the new title
+                        node["display_title"] = new_title
+
             return True
-        
+
         # Search in children
         if "children" in node and isinstance(node["children"], list):
             for child in node["children"]:
                 if update_node_recursive(child, target_id, new_title):
                     return True
-        
+
         return False
 
     # Update the node in the tree
@@ -1078,6 +1199,7 @@ class ConversationMessage(BaseModel):
     created_at: str
     sources: Optional[str] = None  # JSON string
     debug_path: Optional[str] = None  # JSON string
+    # Note: Debug info is stored separately in conversation_debugs table
 
 
 class ConversationHistory(BaseModel):
@@ -1093,6 +1215,18 @@ class SaveConversationRequest(BaseModel):
     content: str
     sources: Optional[List[Dict[str, Any]]] = None
     debug_path: Optional[List[str]] = None
+    # Note: Debug info should be saved separately via conversation debug endpoint
+
+
+class SaveConversationDebugRequest(BaseModel):
+    """Model for saving conversation debug information."""
+    message_id: str
+    system_prompt: Optional[str] = None  # System prompt used for this message
+    raw_output: Optional[str] = None  # Raw LLM output
+    model_used: Optional[str] = None  # LLM model name
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
 
 
 @router.get("/{document_id}/conversations", response_model=ConversationHistory)
@@ -1195,6 +1329,157 @@ async def save_conversation_message(
         "document_id": document_id,
         "role": request.role,
         "created": True
+    }
+
+
+@router.get("/{document_id}/conversations/{message_id}/debug")
+async def get_conversation_debug(
+    document_id: str,
+    message_id: str
+):
+    """
+    Get debug information for a specific conversation message.
+
+    Returns detailed debug data including system prompt and raw LLM output
+    stored separately in the conversation_debugs table.
+
+    - **document_id**: Document ID
+    - **message_id**: Message ID
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Get debug info
+    debug = db.get_conversation_debug(message_id)
+    if debug is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Debug information not found for message: {message_id}"
+        )
+
+    return debug.to_dict()
+
+
+@router.post("/{document_id}/conversations/{message_id}/debug")
+async def save_conversation_debug(
+    document_id: str,
+    message_id: str,
+    request: SaveConversationDebugRequest
+):
+    """
+    Save debug information for a conversation message.
+
+    Stores detailed debug data including system prompt and raw LLM output
+    in a separate table to keep the main conversation data clean.
+
+    - **document_id**: Document ID
+    - **message_id**: Message ID
+    - **system_prompt**: System prompt used for this message
+    - **raw_output**: Raw LLM output (will be truncated to 500 chars)
+    - **model_used**: LLM model name
+    - **prompt_tokens**: Number of tokens in prompt
+    - **completion_tokens**: Number of tokens in completion
+    - **total_tokens**: Total tokens used
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Save debug info
+    debug = db.save_conversation_debug(
+        message_id=message_id,
+        document_id=document_id,
+        system_prompt=request.system_prompt,
+        raw_output=request.raw_output,
+        model_used=request.model_used,
+        prompt_tokens=request.prompt_tokens,
+        completion_tokens=request.completion_tokens,
+        total_tokens=request.total_tokens,
+    )
+
+    return {
+        "id": debug.id,
+        "message_id": message_id,
+        "document_id": document_id,
+        "created": True
+    }
+
+
+@router.get("/{document_id}/parse-debug")
+async def get_parse_debug_logs(
+    document_id: str,
+    operation_type: Optional[str] = Query(None, description="Filter by operation type"),
+    limit: int = Query(100, description="Maximum number of logs", ge=1, le=1000)
+):
+    """
+    Get parse debug logs for a document.
+
+    Returns LLM call logs recorded during document parsing,
+    including prompts, responses, timing, and token usage.
+
+    - **document_id**: Document ID
+    - **operation_type**: Optional filter (e.g., 'toc_extraction', 'node_summary')
+    - **limit**: Maximum number of logs to return
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Get parse debug logs
+    logs = db.get_parse_debug_logs(document_id, operation_type, limit)
+
+    return {
+        "document_id": document_id,
+        "logs": [log.to_dict() for log in logs],
+        "count": len(logs)
+    }
+
+
+@router.delete("/{document_id}/parse-debug")
+async def delete_parse_debug_logs(document_id: str):
+    """
+    Delete all parse debug logs for a document.
+
+    Use this endpoint to clear the parse debug logs for a document.
+
+    **This action cannot be undone.**
+    """
+    db = get_db()
+
+    # Verify document exists
+    doc = db.get_document(document_id)
+    if doc is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Document not found: {document_id}"
+        )
+
+    # Delete parse debug logs
+    count = db.delete_parse_debug_logs(document_id)
+
+    return {
+        "document_id": document_id,
+        "deleted": count,
+        "message": f"Deleted {count} parse debug log(s)"
     }
 
 

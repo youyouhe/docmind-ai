@@ -206,23 +206,61 @@ def validate_structure_depth(tree: List[Dict], max_depth: int = 4) -> Tuple[bool
     return len(errors) == 0, errors
 
 
-def add_node_ids(tree: List[Dict], prefix: str = "") -> None:
+def add_node_ids(tree: List[Dict], prefix: str = "", use_hierarchical: bool = True) -> None:
     """
-    Add sequential IDs to tree nodes (0000, 0001, etc.)
+    Add IDs to tree nodes.
+
+    Args:
+        tree: Tree structure to add IDs to
+        prefix: Prefix for IDs (for recursive calls)
+        use_hierarchical: If True, use multi-level numbering (1, 1.1, 1.1.1).
+                         If False, use sequential IDs (0000, 0001, etc.)
     """
-    counter = [0]
-    
-    def assign_id(node, parent_id=""):
-        current_id = f"{parent_id}{counter[0]:04d}"
-        node['node_id'] = current_id
-        counter[0] += 1
-        
-        if 'nodes' in node:
-            for child in node['nodes']:
-                assign_id(child, current_id)
-    
-    for node in tree:
-        assign_id(node)
+    if use_hierarchical:
+        # Multi-level numbering (1, 1.1, 1.1.1, etc.)
+        def assign_hierarchical_id(node, parent_number=""):
+            # Increment counter at this level
+            level = len(parent_number.split('.')) if parent_number else 0
+            if level >= len(counters):
+                counters.append(1)
+            else:
+                counters[level] += 1
+
+            # Reset counters for deeper levels
+            while len(counters) > level + 1:
+                counters.pop()
+
+            # Build multi-level ID
+            if parent_number:
+                current_id = f"{parent_number}.{counters[level]}"
+            else:
+                current_id = str(counters[level])
+
+            node['node_id'] = current_id
+
+            # Recurse to children
+            if 'nodes' in node:
+                for child in node['nodes']:
+                    assign_hierarchical_id(child, current_id)
+
+        counters = []
+        for node in tree:
+            assign_hierarchical_id(node)
+    else:
+        # Original sequential numbering (0000, 0001, etc.)
+        counter = [0]
+
+        def assign_id(node, parent_id=""):
+            current_id = f"{parent_id}{counter[0]:04d}"
+            node['node_id'] = current_id
+            counter[0] += 1
+
+            if 'nodes' in node:
+                for child in node['nodes']:
+                    assign_id(child, current_id)
+
+        for node in tree:
+            assign_id(node)
 
 
 def calculate_tree_depth(node: Dict) -> int:

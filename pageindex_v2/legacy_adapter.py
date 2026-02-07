@@ -101,11 +101,11 @@ def page_index_main(doc: Union[str, BytesIO], opt: Optional[SimpleNamespace] = N
         from .main import PageIndexV2
         
         # 设置 document_id（用于 progress callback）
-        _setup_progress_callback()
+        doc_id = _setup_progress_callback()
         
         # 调用新算法
         start_time = time.time()
-        processor = PageIndexV2(options)
+        processor = PageIndexV2(options, document_id=doc_id)
         
         # 包装进度报告
         _wrap_progress_reporting(processor)
@@ -163,12 +163,23 @@ def _convert_old_opt_to_v2(opt: SimpleNamespace):
     """
     from .main import ProcessingOptions
     
-    # 确定 provider（根据 model 推断）
+    # 确定 provider（根据 model 推断或从环境变量读取）
+    import os
     model = getattr(opt, 'model', 'gpt-4o-2024-11-20')
-    if 'deepseek' in model.lower():
+    model_lower = model.lower()
+
+    # 根据 model 名称识别 provider
+    if 'deepseek' in model_lower:
         provider = 'deepseek'
+    elif 'openrouter' in model_lower or any(x in model_lower for x in ['arcee-ai', 'mimo', 'xiaomi']):
+        provider = 'openrouter'
+    elif 'gemini' in model_lower:
+        provider = 'gemini'
+    elif 'glm' in model_lower or 'zhipu' in model_lower:
+        provider = 'zhipu'
     else:
-        provider = 'openai'
+        # 默认从环境变量读取
+        provider = os.getenv('LLM_PROVIDER', 'deepseek')
     
     return ProcessingOptions(
         provider=provider,
@@ -381,22 +392,32 @@ def _convert_v2_to_old_format(v2_result: Dict, opt: SimpleNamespace, total_time:
 # 辅助函数：添加 node_id, text, summary
 # ============================================================================
 
-def _add_node_ids(structure: list, node_id: int = 0):
+def _add_node_ids(structure: list, node_id: int = 0, use_hierarchical: bool = True):
     """
-    递归添加 node_id（格式：0000, 0001, 0002...）
-    
+    递归添加 node_id
+
     Args:
         structure: 树结构（列表）
-        node_id: 当前节点ID计数器
+        node_id: 当前节点ID计数器（仅用于顺序模式）
+        use_hierarchical: 是否使用多级编号 (1, 1.1, 1.1.1)
+                          False 则使用顺序编号 (0000, 0001, 0002)
     """
-    for item in structure:
-        item['node_id'] = str(node_id).zfill(4)
-        node_id += 1
-        
-        if 'nodes' in item and item['nodes']:
-            node_id = _add_node_ids(item['nodes'], node_id)
-    
-    return node_id
+    if use_hierarchical:
+        # Use the hierarchical numbering from helpers.py
+        from .utils.helpers import add_node_ids
+        add_node_ids(structure, use_hierarchical=True)
+        # Return a dummy value (not used in hierarchical mode)
+        return 0
+    else:
+        # Original sequential numbering
+        for item in structure:
+            item['node_id'] = str(node_id).zfill(4)
+            node_id += 1
+
+            if 'nodes' in item and item['nodes']:
+                node_id = _add_node_ids(item['nodes'], node_id, use_hierarchical=False)
+
+        return node_id
 
 
 def _add_node_text(structure: list, pdf_path: str):
@@ -461,12 +482,21 @@ async def _add_node_summaries(structure: list, model: str):
     """
     from .core.llm_client import LLMClient
     
-    # 初始化 LLM client
-    if 'deepseek' in model.lower():
+    # 初始化 LLM client - 根据 model 名称识别 provider
+    model_lower = model.lower()
+    if 'deepseek' in model_lower:
         provider = 'deepseek'
+    elif 'openrouter' in model_lower or any(x in model_lower for x in ['arcee-ai', 'mimo', 'xiaomi']):
+        provider = 'openrouter'
+    elif 'gemini' in model_lower:
+        provider = 'gemini'
+    elif 'glm' in model_lower or 'zhipu' in model_lower:
+        provider = 'zhipu'
     else:
-        provider = 'openai'
-    
+        # 默认从环境变量读取
+        import os
+        provider = os.getenv('LLM_PROVIDER', 'deepseek')
+
     llm = LLMClient(provider=provider, model=model, debug=False)
     
     async def generate_summary(node):
@@ -510,6 +540,9 @@ Provide a concise summary that captures the main points."""
     # 并发处理所有根节点
     tasks = [process_node_recursive(root) for root in structure]
     await asyncio.gather(*tasks)
+    
+    # Clean up LLM client
+    await llm.close()
 
 
 def _remove_node_text(structure: list):

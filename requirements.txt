@@ -2,9 +2,16 @@
 openai==1.101.0
 
 # ========== PDF Parsing ==========
-markitdown[pdf]>=0.0.1
+# Three-tier fallback strategy for PDF parsing
+# Tier 1: pdfplumber (best for tables)
+pdfplumber>=0.10.0
+# Tier 2: pdfminer.six (best text quality) - installed as dependency of pdfplumber
+# Tier 3: pypdfium2 (Chrome engine, ultimate fallback)
+pypdfium2>=4.28.0
+# Always available: PyMuPDF (final fallback)
 pymupdf>=1.24.0
 PyPDF2==3.0.1
+markitdown[pdf]>=0.0.1
 
 # ========== Web Framework ==========
 fastapi>=0.104.0
@@ -23,7 +30,7 @@ requests>=2.31.0
 
 # ========== Accuracy Improvements (v2.0.0) ==========
 fuzzywuzzy==0.18.0
-python-Levenshtein==0.21.0
+python-Levenshtein>=0.25.0  # Updated for Python 3.12+ compatibility
 
 # ========== Testing ==========
 pytest>=7.4.0

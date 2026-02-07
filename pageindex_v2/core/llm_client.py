@@ -6,6 +6,7 @@ Features: Async calls, debug logging, retry mechanism
 import os
 import json
 import asyncio
+import time
 from typing import Any, Dict, Optional, List
 from openai import AsyncOpenAI
 
@@ -32,34 +33,67 @@ class LLMClient:
         self.client = None
         self._init_client()
     
+    async def __aenter__(self):
+        """Async context manager entry"""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with proper cleanup"""
+        await self.close()
+    
+    async def close(self):
+        """Properly close the async client"""
+        if self.client:
+            try:
+                await self.client.close()
+                if self.debug:
+                    print(f"[LLM] Closed {self.provider} client")
+            except Exception as e:
+                if self.debug:
+                    print(f"[LLM] Error closing client: {e}")
+            finally:
+                self.client = None
+    
     def _get_default_model(self) -> str:
         """Get default model for provider"""
         defaults = {
             "deepseek": "deepseek-chat",
             "openai": "gpt-4o",
+            "openrouter": "deepseek/deepseek-chat",
+            "gemini": "gemini-2.0-flash-exp",
+            "zhipu": "glm-4.7",
         }
         return defaults.get(self.provider, "deepseek-chat")
-    
+
     def _get_api_key(self) -> str:
         """Get API key from environment"""
         env_vars = {
             "deepseek": "DEEPSEEK_API_KEY",
             "openai": "OPENAI_API_KEY",
+            "openrouter": "OPENROUTER_API_KEY",
+            "gemini": "GEMINI_API_KEY",
+            "zhipu": "ZHIPU_API_KEY",
         }
-        env_var = env_vars.get(self.provider, "OPENAI_API_KEY")
+        env_var = env_vars.get(self.provider)
+        if not env_var:
+            print(f"[LLM] Warning: Unknown provider '{self.provider}'")
+            return ""
         key = os.getenv(env_var, "")
-        
+
         if self.debug and key:
             masked = key[:10] + "..." + key[-4:] if len(key) > 14 else "***"
             print(f"[LLM] Loaded {self.provider.upper()} API Key: {masked}")
-        
+
         return key
-    
+
     def _get_base_url(self) -> Optional[str]:
         """Get base URL for provider"""
         urls = {
             "deepseek": "https://api.deepseek.com/v1",
             "openai": None,  # Use default
+            "openrouter": "https://openrouter.ai/api/v1",
+            "gemini": None,  # Uses Google's client library
+            "zhipu": "https://open.bigmodel.cn/api/paas/v4",
         }
         return urls.get(self.provider)
     
@@ -121,35 +155,97 @@ class LLMClient:
             print(f"[PARAMS] temp={temperature}, retries={max_retries}, format={response_format}")
         
         for attempt in range(max_retries):
+            start_time = time.time()
             try:
                 params = {
                     "model": self.model,
                     "messages": messages,
                     "temperature": temperature,
                 }
-                
+
                 # Only use JSON mode if explicitly requested
                 if response_format == "json_object" and self._supports_json():
                     params["response_format"] = {"type": "json_object"}
-                
+
                 if max_tokens:
                     params["max_tokens"] = max_tokens
-                
+
                 response = await self.client.chat.completions.create(**params)
-                
+
                 content = response.choices[0].message.content
-                
+                duration_ms = int((time.time() - start_time) * 1000)
+
                 if self.debug:
                     usage = response.usage
                     print(f"\n[LLM RESPONSE] Tokens: {usage.prompt_tokens} → {usage.completion_tokens} (total: {usage.total_tokens})")
                     content_preview = content[:200].replace('\n', ' ')
                     print(f"[CONTENT] {content_preview}...")
                     print(f"{'='*60}")
-                
+
+                # Log to database if callback is available
+                try:
+                    import sys
+                    from pathlib import Path
+                    api_dir = Path(__file__).parent.parent.parent / "api"
+                    if str(api_dir) not in sys.path:
+                        sys.path.insert(0, str(api_dir))
+                    from pageindex.utils import get_llm_log_callback
+                    log_callback = get_llm_log_callback()
+                    if log_callback:
+                        usage = response.usage
+                        log_callback(
+                            operation_type="pageindex_v2_chat",
+                            prompt=prompt[:2000] if prompt else None,
+                            response=content[:1000] if content else None,
+                            model=self.model,
+                            duration_ms=duration_ms,
+                            success=True,
+                            error_msg=None,
+                            metadata={
+                                "provider": self.provider,
+                                "prompt_tokens": usage.prompt_tokens if usage else 0,
+                                "completion_tokens": usage.completion_tokens if usage else 0,
+                                "total_tokens": usage.total_tokens if usage else 0,
+                                "attempt": attempt
+                            }
+                        )
+                except Exception as log_error:
+                    if self.debug:
+                        print(f"[LLM] Failed to log to database: {log_error}")
+
                 return content
-                
+
             except Exception as e:
+                duration_ms = int((time.time() - start_time) * 1000)
                 print(f"[LLM ERROR] Attempt {attempt + 1}/{max_retries}: {e}")
+
+                # Log error to database if callback is available
+                try:
+                    import sys
+                    from pathlib import Path
+                    api_dir = Path(__file__).parent.parent.parent / "api"
+                    if str(api_dir) not in sys.path:
+                        sys.path.insert(0, str(api_dir))
+                    from pageindex.utils import get_llm_log_callback
+                    log_callback = get_llm_log_callback()
+                    if log_callback:
+                        log_callback(
+                            operation_type="pageindex_v2_chat",
+                            prompt=prompt[:2000] if prompt else None,
+                            response=None,
+                            model=self.model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata={
+                                "provider": self.provider,
+                                "attempt": attempt,
+                                "max_retries": max_retries
+                            }
+                        )
+                except Exception:
+                    pass
+
                 if attempt < max_retries - 1:
                     await asyncio.sleep(1 * (attempt + 1))
                 else:
@@ -204,7 +300,9 @@ class LLMClient:
             return json.loads(content)
         except json.JSONDecodeError as e:
             print(f"[JSON ERROR] Failed to parse: {e}")
-            print(f"[RAW CONTENT] {content[:500]}")
+            print(f"[RAW CONTENT] {content}")
+            print(f"[INFO] Full response length: {len(content)} chars")
+            print(f"[INFO] This may indicate the response was truncated. Consider increasing max_tokens.")
             return {}
 
 

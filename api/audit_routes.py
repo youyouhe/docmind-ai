@@ -461,9 +461,9 @@ async def apply_suggestions(
         
         return True
     
-    # Sort suggestions by priority: DELETE first, then MODIFY, then ADD
-    action_priority = {"DELETE": 1, "MODIFY_FORMAT": 2, "MODIFY_PAGE": 3, "ADD": 4}
-    sorted_suggestions = sorted(suggestions_to_apply, key=lambda s: action_priority.get(s.action, 5))
+    # Sort suggestions by priority: DELETE first, then MODIFY, then ADD, then EXPAND
+    action_priority = {"DELETE": 1, "MODIFY_FORMAT": 2, "MODIFY_PAGE": 3, "ADD": 4, "EXPAND": 5}
+    sorted_suggestions = sorted(suggestions_to_apply, key=lambda s: action_priority.get(s.action, 6))
     
     for suggestion in sorted_suggestions:
         try:
@@ -512,6 +512,42 @@ async def apply_suggestions(
                     applied_count += 1
                 else:
                     warnings.append(f"无法添加节点到父节点 {parent_id}")
+            
+            elif suggestion.action == "EXPAND":
+                # Execute EXPAND operation - re-analyze PDF content for fine-grained structure
+                try:
+                    from ..pageindex_v2.phases.expand_executor import ExpandExecutor
+                    from ..pageindex_v2.core.llm_client import LLMClient
+                    from .storage import StorageService
+                    
+                    # Get PDF path
+                    doc = db.get_document(doc_id)
+                    if not doc or not doc.file_path:
+                        warnings.append(f"EXPAND操作需要PDF文件，但文档 {doc_id} 没有文件路径")
+                        continue
+                    
+                    storage = StorageService()
+                    pdf_full_path = storage.get_upload_path(doc.file_path)
+                    
+                    # Initialize LLM client
+                    llm = LLMClient()
+                    
+                    # Execute EXPAND
+                    executor = ExpandExecutor(llm=llm, pdf_path=str(pdf_full_path), debug=True)
+                    success, message = await executor.execute_expand(
+                        tree=tree_data,
+                        suggestion=suggestion.to_dict()
+                    )
+                    
+                    if success:
+                        applied_count += 1
+                    else:
+                        warnings.append(f"EXPAND操作失败: {message}")
+                
+                except ImportError as ie:
+                    warnings.append(f"EXPAND功能需要安装相关依赖: {str(ie)}")
+                except Exception as e:
+                    warnings.append(f"执行EXPAND时出错: {str(e)}")
         
         except Exception as e:
             warnings.append(f"应用建议 {suggestion.suggestion_id} 时出错: {str(e)}")

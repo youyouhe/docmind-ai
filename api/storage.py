@@ -7,12 +7,16 @@ Uses UUID-based naming for safe concurrent access.
 
 import os
 import uuid
+import logging
 from pathlib import Path
 from typing import Optional, Tuple
 from datetime import datetime
 
 import aiofiles
 from fastapi import UploadFile, HTTPException
+
+# Configure logging
+logger = logging.getLogger("pageindex.api.storage")
 
 
 # =============================================================================
@@ -156,6 +160,9 @@ class StorageService:
                 detail=f"Invalid file type. Allowed: .pdf, .md, .markdown"
             )
 
+        # Ensure directory exists (in case it was deleted)
+        self.uploads_dir.mkdir(parents=True, exist_ok=True)
+
         # Generate UUID for document
         document_id = str(uuid.uuid4())
         extension = self.get_file_extension(file_type)
@@ -229,6 +236,9 @@ class StorageService:
         """
         import json
 
+        # Ensure directory exists (in case it was deleted)
+        self.parsed_dir.mkdir(parents=True, exist_ok=True)
+
         tree_filename = f"{document_id}_tree.json"
         stats_filename = f"{document_id}_stats.json"
 
@@ -244,6 +254,35 @@ class StorageService:
             json.dump(stats_data, f, ensure_ascii=False, indent=2)
 
         return f"parsed/{tree_filename}", f"parsed/{stats_filename}"
+
+    def save_audit_report(
+        self,
+        document_id: str,
+        audit_data: dict,
+    ) -> str:
+        """
+        Save tree audit report to storage.
+
+        Args:
+            document_id: Document ID
+            audit_data: Audit report dictionary
+
+        Returns:
+            Audit report path relative to data directory
+        """
+        import json
+
+        # Ensure directory exists (in case it was deleted)
+        self.parsed_dir.mkdir(parents=True, exist_ok=True)
+
+        audit_filename = f"{document_id}_audit_report.json"
+        audit_path = self.parsed_dir / audit_filename
+
+        # Write audit data
+        with open(audit_path, "w", encoding="utf-8") as f:
+            json.dump(audit_data, f, ensure_ascii=False, indent=2)
+
+        return f"parsed/{audit_filename}"
 
     async def load_parse_result(self, document_id: str) -> Optional[dict]:
         """
@@ -289,7 +328,12 @@ class StorageService:
 
     def delete_parse_results(self, document_id: str) -> bool:
         """
-        Delete parse result files for a document.
+        Delete ALL parse result files for a document, including:
+        - tree.json
+        - stats.json
+        - audit_report.json
+        - All audit backup files (audit_backup_*.json)
+        - All other document-related JSON files
 
         Args:
             document_id: Document ID
@@ -297,16 +341,37 @@ class StorageService:
         Returns:
             True if any files were deleted
         """
-        tree_path = self.parsed_dir / f"{document_id}_tree.json"
-        stats_path = self.parsed_dir / f"{document_id}_stats.json"
-
         deleted = False
-        if tree_path.exists():
-            tree_path.unlink()
+        deleted_files = []
+        
+        # Define specific file patterns to delete
+        file_patterns = [
+            f"{document_id}_tree.json",
+            f"{document_id}_stats.json",
+            f"{document_id}_audit_report.json",
+        ]
+        
+        # Delete specific files
+        for filename in file_patterns:
+            file_path = self.parsed_dir / filename
+            if file_path.exists():
+                file_path.unlink()
+                deleted = True
+                deleted_files.append(filename)
+        
+        # Delete all audit backup files (using glob pattern)
+        # Pattern: {document_id}_audit_backup_*.json
+        audit_backup_pattern = f"{document_id}_audit_backup_*.json"
+        for backup_file in self.parsed_dir.glob(audit_backup_pattern):
+            backup_file.unlink()
             deleted = True
-        if stats_path.exists():
-            stats_path.unlink()
-            deleted = True
+            deleted_files.append(backup_file.name)
+        
+        # Log deleted files for debugging
+        if deleted_files:
+            logger.info(f"Deleted {len(deleted_files)} parse result files for document {document_id}: {deleted_files}")
+        else:
+            logger.debug(f"No parse result files found for document {document_id}")
 
         return deleted
 
@@ -369,7 +434,10 @@ class StorageService:
 
     def delete_all_document_data(self, document_id: str) -> dict:
         """
-        Delete all files associated with a document.
+        Delete all files associated with a document, including:
+        - Upload file (PDF/Markdown)
+        - Parse results (tree, stats, audit reports, backups)
+        - Debug logs
 
         Args:
             document_id: Document ID
@@ -380,6 +448,7 @@ class StorageService:
         results = {
             "upload_deleted": False,
             "parse_results_deleted": False,
+            "debug_log_deleted": False,
         }
 
         # Find and delete upload file
@@ -388,9 +457,17 @@ class StorageService:
             if upload_path.exists():
                 upload_path.unlink()
                 results["upload_deleted"] = True
+                logger.info(f"Deleted upload file: {upload_path.name}")
                 break
 
-        # Delete parse results
+        # Delete parse results (tree, stats, audit reports, backups)
         results["parse_results_deleted"] = self.delete_parse_results(document_id)
+
+        # Delete debug log file
+        debug_log_path = self.data_dir.parent / "debug_logs" / f"{document_id}.log"
+        if debug_log_path.exists():
+            debug_log_path.unlink()
+            results["debug_log_deleted"] = True
+            logger.info(f"Deleted debug log file: {debug_log_path.name}")
 
         return results

@@ -6,14 +6,18 @@ File contents are stored in the filesystem.
 """
 
 import os
+import logging
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, JSON
+from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, JSON, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
+
+# Initialize logger
+logger = logging.getLogger("pageindex.api.database")
 
 
 # =============================================================================
@@ -149,6 +153,7 @@ class Conversation(Base):
     # Optional metadata
     sources = Column(Text, nullable=True)  # JSON: source information
     debug_path = Column(Text, nullable=True)  # JSON: debug path for highlighting
+    # Note: Debug information is stored separately in conversation_debugs table
 
     # Relationship to document
     document = relationship("Document")
@@ -163,6 +168,97 @@ class Conversation(Base):
             "created_at": self.created_at.isoformat() if self.created_at else None,
             "sources": self.sources,
             "debug_path": self.debug_path,
+            # Note: Debug info is stored separately in conversation_debugs table
+        }
+
+
+class ConversationDebug(Base):
+    """
+    Conversation debug information table - stores detailed debug data for conversation messages.
+    
+    This table is separate from the main conversations table to keep business data clean.
+    Debug information can be deleted without affecting conversation history.
+    """
+    __tablename__ = "conversation_debugs"
+    
+    id = Column(String, primary_key=True)  # UUID v4
+    message_id = Column(String, ForeignKey("conversations.id", ondelete="CASCADE"), nullable=False)
+    document_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    system_prompt = Column(Text, nullable=True)  # Complete system prompt used
+    raw_output = Column(Text, nullable=True)  # Raw LLM output (truncated to 500 chars)
+    model_used = Column(String, nullable=True)  # LLM model name (e.g., 'gpt-4')
+    prompt_tokens = Column(Integer, nullable=True)  # Number of tokens in prompt
+    completion_tokens = Column(Integer, nullable=True)  # Number of tokens in completion
+    total_tokens = Column(Integer, nullable=True)  # Total tokens used
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relationship to conversation message
+    conversation = relationship("Conversation")
+    # Relationship to document
+    document = relationship("Document")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        return {
+            "id": self.id,
+            "message_id": self.message_id,
+            "document_id": self.document_id,
+            "system_prompt": self.system_prompt,
+            "raw_output": self.raw_output,
+            "model_used": self.model_used,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+        }
+
+
+class ParseDebugLog(Base):
+    """
+    Parse debug log table - stores LLM call logs during document parsing.
+    
+    This table records all LLM interactions during the parsing process,
+    including prompts, responses, tokens used, and timing information.
+    Useful for debugging parse quality and LLM performance.
+    """
+    __tablename__ = "parse_debug_logs"
+    
+    id = Column(String, primary_key=True)  # UUID v4
+    document_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    operation_type = Column(String, nullable=False)  # e.g., 'toc_extraction', 'node_summary', 'structure_analysis'
+    prompt = Column(Text, nullable=True)  # The prompt sent to LLM
+    response = Column(Text, nullable=True)  # The LLM response (truncated)
+    model_used = Column(String, nullable=True)  # LLM model name
+    prompt_tokens = Column(Integer, nullable=True)  # Number of tokens in prompt
+    completion_tokens = Column(Integer, nullable=True)  # Number of tokens in response
+    total_tokens = Column(Integer, nullable=True)  # Total tokens used
+    duration_ms = Column(Integer, nullable=True)  # Call duration in milliseconds
+    success = Column(Boolean, nullable=False, default=True)  # Whether the call succeeded
+    error_message = Column(Text, nullable=True)  # Error message if failed
+    metadata_json = Column(Text, nullable=True)  # Additional metadata as JSON (e.g., node_id, page_range)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    
+    # Relationship to document
+    document = relationship("Document")
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        return {
+            "id": self.id,
+            "document_id": self.document_id,
+            "operation_type": self.operation_type,
+            "prompt": self.prompt,
+            "response": self.response,
+            "model_used": self.model_used,
+            "prompt_tokens": self.prompt_tokens,
+            "completion_tokens": self.completion_tokens,
+            "total_tokens": self.total_tokens,
+            "duration_ms": self.duration_ms,
+            "success": self.success,
+            "error_message": self.error_message,
+            "metadata": json.loads(self.metadata_json) if self.metadata_json else None,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
         }
 
 
@@ -649,6 +745,15 @@ class DatabaseManager:
         with self.get_session() as session:
             doc = session.query(Document).filter(Document.id == document_id).first()
             if doc:
+                # Explicitly delete audit backup records first
+                # This is needed because the foreign key constraint is NO ACTION instead of CASCADE
+                backup_count = session.query(AuditBackup).filter(
+                    AuditBackup.doc_id == document_id
+                ).delete()
+                if backup_count > 0:
+                    logger.info(f"Deleted {backup_count} audit backup records for document {document_id}")
+                
+                # Now delete the document
                 session.delete(doc)
                 session.commit()
                 return True
@@ -823,6 +928,55 @@ class DatabaseManager:
             session.refresh(message)
             return message
 
+    def save_conversation_debug(
+        self,
+        message_id: str,
+        document_id: str,
+        system_prompt: Optional[str] = None,
+        raw_output: Optional[str] = None,
+        model_used: Optional[str] = None,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+    ) -> ConversationDebug:
+        """
+        Save conversation debug information to separate table.
+
+        Args:
+            message_id: Associated message ID (UUID)
+            document_id: Document ID
+            system_prompt: System prompt used for this message
+            raw_output: Raw LLM output (will be truncated to 500 chars)
+            model_used: LLM model name used
+            prompt_tokens: Number of tokens in prompt
+            completion_tokens: Number of tokens in completion
+            total_tokens: Total tokens used
+
+        Returns:
+            Created ConversationDebug instance
+        """
+        import uuid
+
+        # Truncate raw_output to 500 characters if provided
+        truncated_output = raw_output[:500] if raw_output else None
+
+        with self.get_session() as session:
+            debug = ConversationDebug(
+                id=str(uuid.uuid4()),
+                message_id=message_id,
+                document_id=document_id,
+                system_prompt=system_prompt,
+                raw_output=truncated_output,
+                model_used=model_used,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+            )
+            session.add(debug)
+            session.commit()
+            session.refresh(debug)
+            return debug
+
     def get_conversation_history(self, document_id: str, limit: int = 100) -> List[Conversation]:
         """
         Get conversation history for a document.
@@ -853,6 +1007,38 @@ class DatabaseManager:
                 for m in messages
             ]
 
+    def get_conversation_debug(self, message_id: str) -> Optional[ConversationDebug]:
+        """
+        Get debug information for a specific conversation message.
+
+        Args:
+            message_id: Message ID
+
+        Returns:
+            ConversationDebug instance or None if not found
+        """
+        with self.get_session() as session:
+            debug = session.query(ConversationDebug).filter(
+                ConversationDebug.message_id == message_id
+            ).first()
+            
+            if not debug:
+                return None
+            
+            # Return detached copy
+            return ConversationDebug(
+                id=debug.id,
+                message_id=debug.message_id,
+                document_id=debug.document_id,
+                system_prompt=debug.system_prompt,
+                raw_output=debug.raw_output,
+                model_used=debug.model_used,
+                prompt_tokens=debug.prompt_tokens,
+                completion_tokens=debug.completion_tokens,
+                total_tokens=debug.total_tokens,
+                created_at=debug.created_at,
+            )
+
     def delete_conversation_history(self, document_id: str) -> int:
         """
         Delete all conversation history for a document.
@@ -866,6 +1052,137 @@ class DatabaseManager:
         with self.get_session() as session:
             count = session.query(Conversation).filter(
                 Conversation.document_id == document_id
+            ).delete()
+            session.commit()
+            return count
+
+    # -------------------------------------------------------------------------
+    # Parse Debug Log Operations
+    # -------------------------------------------------------------------------
+
+    def save_parse_debug_log(
+        self,
+        document_id: str,
+        operation_type: str,
+        prompt: Optional[str] = None,
+        response: Optional[str] = None,
+        model_used: Optional[str] = None,
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        duration_ms: Optional[int] = None,
+        success: bool = True,
+        error_message: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> ParseDebugLog:
+        """
+        Save a parse debug log entry for LLM calls during document parsing.
+
+        Args:
+            document_id: Document ID
+            operation_type: Type of operation (e.g., 'toc_extraction', 'node_summary')
+            prompt: The prompt sent to LLM
+            response: The LLM response (will be truncated to 1000 chars)
+            model_used: LLM model name
+            prompt_tokens: Number of tokens in prompt
+            completion_tokens: Number of tokens in response
+            total_tokens: Total tokens used
+            duration_ms: Call duration in milliseconds
+            success: Whether the call succeeded
+            error_message: Error message if failed
+            metadata: Additional metadata as dict
+
+        Returns:
+            Created ParseDebugLog instance
+        """
+        import uuid
+        import json
+
+        # Truncate response to 1000 characters if provided
+        truncated_response = response[:1000] if response else None
+
+        with self.get_session() as session:
+            log = ParseDebugLog(
+                id=str(uuid.uuid4()),
+                document_id=document_id,
+                operation_type=operation_type,
+                prompt=prompt,
+                response=truncated_response,
+                model_used=model_used,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                total_tokens=total_tokens,
+                duration_ms=duration_ms,
+                success=success,
+                error_message=error_message,
+                metadata_json=json.dumps(metadata) if metadata else None,
+            )
+            session.add(log)
+            session.commit()
+            session.refresh(log)
+            return log
+
+    def get_parse_debug_logs(
+        self,
+        document_id: str,
+        operation_type: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[ParseDebugLog]:
+        """
+        Get parse debug logs for a document.
+
+        Args:
+            document_id: Document ID
+            operation_type: Optional filter by operation type
+            limit: Maximum number of logs to return
+
+        Returns:
+            List of ParseDebugLog instances
+        """
+        with self.get_session() as session:
+            query = session.query(ParseDebugLog).filter(
+                ParseDebugLog.document_id == document_id
+            )
+            
+            if operation_type:
+                query = query.filter(ParseDebugLog.operation_type == operation_type)
+            
+            logs = query.order_by(ParseDebugLog.created_at.asc()).limit(limit).all()
+            
+            # Return detached copies
+            return [
+                ParseDebugLog(
+                    id=log.id,
+                    document_id=log.document_id,
+                    operation_type=log.operation_type,
+                    prompt=log.prompt,
+                    response=log.response,
+                    model_used=log.model_used,
+                    prompt_tokens=log.prompt_tokens,
+                    completion_tokens=log.completion_tokens,
+                    total_tokens=log.total_tokens,
+                    duration_ms=log.duration_ms,
+                    success=log.success,
+                    error_message=log.error_message,
+                    metadata_json=log.metadata_json,
+                    created_at=log.created_at,
+                )
+                for log in logs
+            ]
+
+    def delete_parse_debug_logs(self, document_id: str) -> int:
+        """
+        Delete all parse debug logs for a document.
+
+        Args:
+            document_id: Document ID
+
+        Returns:
+            Number of logs deleted
+        """
+        with self.get_session() as session:
+            count = session.query(ParseDebugLog).filter(
+                ParseDebugLog.document_id == document_id
             ).delete()
             session.commit()
             return count
@@ -1200,19 +1517,26 @@ class DatabaseManager:
         doc_id: str,
         audit_id: str,
         backup_path: str,
+        max_backups: int = 10,
     ) -> AuditBackup:
         """
         Create a backup snapshot for rollback.
+        
+        Automatically cleans up old backups, keeping only the most recent max_backups.
 
         Args:
             backup_id: Unique backup ID (UUID)
             doc_id: Document ID
             audit_id: Audit report ID
             backup_path: Path to backup JSON file (relative to data dir)
+            max_backups: Maximum number of backups to keep per document (default: 10)
 
         Returns:
             Created AuditBackup instance
         """
+        import os
+        from pathlib import Path
+        
         with self.get_session() as session:
             backup = AuditBackup(
                 backup_id=backup_id,
@@ -1223,6 +1547,31 @@ class DatabaseManager:
             session.add(backup)
             session.commit()
             session.refresh(backup)
+            
+            # Auto-cleanup: Keep only the most recent max_backups backups for this document
+            all_backups = session.query(AuditBackup).filter(
+                AuditBackup.doc_id == doc_id
+            ).order_by(AuditBackup.created_at.desc()).all()
+            
+            if len(all_backups) > max_backups:
+                # Get backups to delete (oldest ones beyond max_backups limit)
+                backups_to_delete = all_backups[max_backups:]
+                data_dir = get_data_dir()
+                
+                for old_backup in backups_to_delete:
+                    # Delete backup file from filesystem
+                    backup_file = data_dir / old_backup.backup_path
+                    try:
+                        if backup_file.exists():
+                            os.remove(backup_file)
+                    except Exception as e:
+                        print(f"Warning: Failed to delete backup file {backup_file}: {e}")
+                    
+                    # Delete backup record from database
+                    session.delete(old_backup)
+                
+                session.commit()
+                print(f"Cleaned up {len(backups_to_delete)} old backups for document {doc_id}")
             
             # Return detached copy
             return AuditBackup(
@@ -1276,6 +1625,27 @@ class DatabaseManager:
                 )
                 for b in backups
             ]
+
+    def delete_audit_backups_by_document(self, doc_id: str) -> int:
+        """
+        Delete all audit backup records for a document.
+        
+        NOTE: This only deletes database records. Files should be deleted separately
+        via storage.delete_all_document_data().
+        
+        Args:
+            doc_id: Document ID
+            
+        Returns:
+            Number of backup records deleted
+        """
+        with self.get_session() as session:
+            count = session.query(AuditBackup).filter(
+                AuditBackup.doc_id == doc_id
+            ).delete()
+            session.commit()
+            logger.info(f"Deleted {count} audit backup records for document {doc_id}")
+            return count
 
 
 # =============================================================================

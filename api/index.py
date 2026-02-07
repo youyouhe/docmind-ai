@@ -68,6 +68,7 @@ from api.services import (
 from api.database import init_database, get_db
 from api.storage import StorageService
 from api.document_routes import router as document_router, initialize_services
+from api.audit_routes import router as audit_router
 
 # Initialize global storage service
 storage_service = StorageService()
@@ -130,6 +131,14 @@ async def startup_event():
     if llm_provider is not None:
         initialize_services(llm_provider, storage_service)
 
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Clean up resources on shutdown."""
+    logger.info("Shutting down server...")
+    # Close any open connections or release resources here
+    # This ensures clean exit when Ctrl+C is pressed
+
 # =============================================================================
 # Request Debugging Middleware
 # =============================================================================
@@ -179,6 +188,9 @@ app.add_middleware(RequestDebugMiddleware)
 
 # Include document management router
 app.include_router(document_router)
+
+# Include audit management router
+app.include_router(audit_router)
 
 # Include WebSocket router for real-time status updates
 app.include_router(websocket_router)
@@ -243,6 +255,10 @@ async def root() -> APIInfo:
             EndpointInfo(path="/api/documents/{id}/parse", method="POST", description="Re-parse document"),
             EndpointInfo(path="/api/documents/{id}/download", method="GET", description="Download original file"),
             EndpointInfo(path="/api/documents/{id}/tree", method="GET", description="Get parsed tree structure"),
+            EndpointInfo(path="/api/documents/{id}/audit", method="GET", description="Get audit report with suggestions"),
+            EndpointInfo(path="/api/documents/{id}/audit/suggestions/{sid}/review", method="POST", description="Review suggestion"),
+            EndpointInfo(path="/api/documents/{id}/audit/apply", method="POST", description="Apply accepted suggestions"),
+            EndpointInfo(path="/api/documents/{id}/audit/rollback", method="POST", description="Rollback to backup"),
         ] + ([
             EndpointInfo(path="/api/bid/projects", method="POST", description="Create bid writing project"),
             EndpointInfo(path="/api/bid/projects", method="GET", description="List all bid projects"),

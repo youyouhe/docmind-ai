@@ -14,7 +14,7 @@ import tempfile
 import logging
 import random
 import time
-from typing import Optional, List, Dict, Any, Literal
+from typing import Optional, List, Dict, Any, Literal, Callable
 from pathlib import Path
 
 import aiofiles
@@ -37,7 +37,8 @@ class LLMProvider:
 
     SUPPORTED_PROVIDERS = ["deepseek", "gemini", "openrouter", "openai", "zhipu"]
 
-    def __init__(self, provider: str, api_key: Optional[str] = None, model: Optional[str] = None):
+    def __init__(self, provider: str, api_key: Optional[str] = None, model: Optional[str] = None, 
+                 log_callback: Optional[Callable] = None):
         """
         Initialize LLM provider.
 
@@ -45,6 +46,10 @@ class LLMProvider:
             provider: Provider name (deepseek, gemini, openrouter, openai, zhipu)
             api_key: API key (if None, reads from environment)
             model: Model name (if None, uses default for provider)
+            log_callback: Optional callback function for logging LLM calls
+                         Signature: log_callback(operation_type: str, prompt: str, response: str, 
+                                                model: str, duration_ms: int, success: bool, 
+                                                error_msg: Optional[str], metadata: Optional[dict])
         """
         if provider not in self.SUPPORTED_PROVIDERS:
             raise ValueError(f"Unsupported provider: {provider}. Use one of: {self.SUPPORTED_PROVIDERS}")
@@ -52,6 +57,7 @@ class LLMProvider:
         self.provider = provider
         self.api_key = api_key or self._get_api_key_from_env(provider)
         self.model = model or self._get_default_model(provider)
+        self.log_callback = log_callback
 
         # Initialize OpenAI client (for compatible APIs)
         if provider != "gemini":
@@ -97,7 +103,8 @@ class LLMProvider:
         }
         return url_map.get(provider)
 
-    async def chat(self, prompt: str, model: Optional[str] = None, max_retries: int = 3) -> str:
+    async def chat(self, prompt: str, model: Optional[str] = None, max_retries: int = 3,
+                   operation_type: str = "chat", metadata: Optional[Dict[str, Any]] = None) -> str:
         """
         Send chat request to LLM with automatic retry on failure.
 
@@ -105,6 +112,8 @@ class LLMProvider:
             prompt: The prompt to send
             model: Override model name
             max_retries: Maximum number of retry attempts
+            operation_type: Type of operation for logging (e.g., 'toc_extraction', 'node_summary')
+            metadata: Additional metadata for logging
 
         Returns:
             LLM response text
@@ -114,13 +123,30 @@ class LLMProvider:
         """
         model = model or self.model
         last_error = None
+        start_time = time.time()
 
         for attempt in range(max_retries):
             try:
                 if self.provider == "gemini":
-                    return await self._chat_gemini(prompt, model)
+                    response = await self._chat_gemini(prompt, model)
                 else:
-                    return await self._chat_openai_compat(prompt, model)
+                    response = await self._chat_openai_compat(prompt, model)
+                
+                # Log successful call if callback is set
+                if self.log_callback:
+                    duration_ms = int((time.time() - start_time) * 1000)
+                    self.log_callback(
+                        operation_type=operation_type,
+                        prompt=prompt,
+                        response=response,
+                        model=model,
+                        duration_ms=duration_ms,
+                        success=True,
+                        error_msg=None,
+                        metadata=metadata
+                    )
+                
+                return response
 
             except Exception as e:
                 last_error = e
@@ -131,6 +157,19 @@ class LLMProvider:
                     "permission", "quota", "limit", "401", "403", "429"
                 ]):
                     logger.error(f"Non-retryable error in LLM chat: {e}")
+                    # Log the failed call
+                    if self.log_callback:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        self.log_callback(
+                            operation_type=operation_type,
+                            prompt=prompt,
+                            response=None,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata=metadata
+                        )
                     raise
 
                 if attempt < max_retries - 1:
@@ -141,6 +180,19 @@ class LLMProvider:
                     await asyncio.sleep(wait_time)
                 else:
                     logger.error(f"LLM chat failed after {max_retries} attempts. Last error: {e}")
+                    # Log the final failed call
+                    if self.log_callback:
+                        duration_ms = int((time.time() - start_time) * 1000)
+                        self.log_callback(
+                            operation_type=operation_type,
+                            prompt=prompt,
+                            response=None,
+                            model=model,
+                            duration_ms=duration_ms,
+                            success=False,
+                            error_msg=str(e),
+                            metadata=metadata
+                        )
 
         # All retries exhausted
         raise Exception(f"LLM chat failed after {max_retries} attempts. Last error: {last_error}")
@@ -458,6 +510,8 @@ class ParseService:
         - start_index -> page_start (PDF only)
         - end_index -> page_end (PDF only)
         - line_num -> line_start (Markdown only)
+        - display_title -> display_title (for UI, cleaned version of title)
+        - is_noise -> is_noise (boolean, marks invalid entries)
         """
         def convert_node(node: dict, level: int = 0) -> dict:
             api_node = {
@@ -472,6 +526,12 @@ class ParseService:
                 api_node["content"] = node["text"]
             if "summary" in node:
                 api_node["summary"] = node["summary"]
+
+            # Display enhancement fields (NEW)
+            if "display_title" in node:
+                api_node["display_title"] = node["display_title"]
+            if "is_noise" in node:
+                api_node["is_noise"] = node["is_noise"]
 
             # PDF-specific fields
             # Note: PageIndex already uses 1-based indexing, so no conversion needed
@@ -515,6 +575,72 @@ class ParseService:
                 "level": 0,
                 "children": [convert_node(s, 1) for s in structure]
             }
+
+    @staticmethod
+    def convert_api_to_page_index_format(api_tree: dict) -> dict:
+        """
+        Convert API format to PageIndex internal format.
+        
+        API format -> PageIndex format:
+        - id -> node_id
+        - title -> title
+        - content -> text
+        - summary -> summary
+        - children -> nodes
+        - page_start -> start_index (PDF only)
+        - page_end -> end_index (PDF only)
+        - line_start -> line_num (Markdown only)
+        """
+        def convert_node(node: dict) -> dict:
+            page_index_node = {
+                "node_id": node.get("id", ""),
+                "title": node.get("title", ""),
+                "nodes": []
+            }
+            
+            # Optional fields
+            if "content" in node:
+                page_index_node["text"] = node["content"]
+            if "summary" in node:
+                page_index_node["summary"] = node["summary"]
+            
+            # PDF-specific fields
+            if "page_start" in node:
+                page_index_node["start_index"] = node["page_start"]
+            if "page_end" in node:
+                page_index_node["end_index"] = node["page_end"]
+            
+            # Markdown-specific fields
+            if "line_start" in node:
+                page_index_node["line_num"] = node["line_start"]
+            
+            # Recursively convert children
+            for child in node.get("children", []):
+                page_index_node["nodes"].append(convert_node(child))
+            
+            return page_index_node
+        
+        # Convert to PageIndex structure format
+        if isinstance(api_tree, list):
+            # Multiple root nodes
+            return {
+                "doc_name": "Document",
+                "structure": [convert_node(node) for node in api_tree]
+            }
+        else:
+            # Single root node or virtual root
+            if api_tree.get("id") == "root" and api_tree.get("children"):
+                # Virtual root - extract children as structure
+                return {
+                    "doc_name": api_tree.get("title", "Document"),
+                    "structure": [convert_node(child) for child in api_tree["children"]]
+                }
+            else:
+                # Single real root
+                return {
+                    "doc_name": api_tree.get("title", "Document"),
+                    "structure": [convert_node(api_tree)]
+                }
 
     @staticmethod
     def calculate_tree_stats(tree: dict) -> dict:
@@ -860,7 +986,9 @@ class ChatService:
             "sources": sources,
             "debug_path": debug_path,
             "provider": self.llm.provider,
-            "model": self.llm.model
+            "model": self.llm.model,
+            "system_prompt": prompt,  # Return the complete system prompt
+            "raw_output": answer,  # Raw LLM output (same as answer in this case)
         }
 
     def _build_history_text(self, history: List[dict]) -> str:
