@@ -554,9 +554,10 @@ class PageIndexV2:
             print("\n🌳 PHASE 6: Tree Building")
         builder = TreeBuilder(max_depth=self.opt.max_depth, debug=self.debug)
         tree = builder.build_tree(verified, pages)
-        
-        # Add preface if needed
-        tree = builder.add_preface_if_needed(tree, pages)
+
+        # NOTE: Disabled add_preface_if_needed - we are parsing documents, not writing them.
+        # If a document doesn't have a preface in its TOC, we shouldn't add one artificially.
+        # tree = builder.add_preface_if_needed(tree, pages)
         
         # Phase 6a: Recursive Large Node Processing
         if self.opt.enable_recursive_processing:
@@ -584,12 +585,21 @@ class PageIndexV2:
                 print("\n🔤 PHASE 6.5: Title Normalization")
 
             from .utils.title_normalizer import normalize_tree_list, enhance_tree_list_display
+            from .utils.helpers import add_node_ids
 
             # Normalize all root nodes (tree is a List[Dict])
             tree = normalize_tree_list(tree, debug=self.debug)
 
             if self.debug:
                 print("✓ Title normalization complete")
+
+            # IMPORTANT: Re-assign hierarchical node_ids BEFORE display enhancement
+            # This ensures display_title uses the correct hierarchical ID (e.g., "5.1.1")
+            # instead of any sequential ID that may have been set during processing
+            add_node_ids(tree, use_hierarchical=True)
+
+            if self.debug:
+                print("✓ Re-assigned hierarchical node_ids for display enhancement")
 
             # Phase 6.6: Display Enhancement (add display_title and is_noise)
             self.log_progress(f"\n🎨 [6.6/8] Display Enhancement...")
