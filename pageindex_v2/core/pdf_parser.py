@@ -2,10 +2,12 @@
 PDF Parser - Extract text with table preservation and physical index labels
 Supports Chinese documents with table structure retention
 
-Three-tier fallback strategy:
+Five-tier fallback strategy:
 1. pdfplumber (best for tables)
 2. pdfminer.six (best text quality)
-3. pypdfium2 (Chrome engine, ultimate fallback)
+3. pypdfium2 (Chrome engine fallback)
+4. PyMuPDF (always available)
+5. DeepSeek-OCR-2 via OCR service (for scanned/image-based PDFs)
 """
 import os
 from typing import List, Tuple, Dict, Optional
@@ -53,20 +55,24 @@ class PDFPage:
 
 class PDFParser:
     """
-    Parse PDF with three-tier fallback strategy:
+    Parse PDF with five-tier fallback strategy:
     1. pdfplumber (best for tables)
-    2. pdfminer.six (best text quality)  
-    3. pypdfium2 (Chrome engine, ultimate fallback)
-    
+    2. pdfminer.six (best text quality)
+    3. pypdfium2 (Chrome engine fallback)
+    4. PyMuPDF (always available)
+    5. DeepSeek-OCR-2 via OCR service (for scanned PDFs)
+
     Features:
     - Table structure preservation
     - Physical index labeling
     - Chinese document support
     - Automatic quality detection
+    - Scanned PDF detection and OCR fallback
     """
-    
-    def __init__(self, debug: bool = True):
+
+    def __init__(self, debug: bool = True, ocr_client=None):
         self.debug = debug
+        self.ocr_client = ocr_client  # Optional OCRClient instance
     
     async def parse(
         self,
@@ -157,7 +163,22 @@ class PDFParser:
                 print("[PDF] 🔄 Using final fallback: PyMuPDF...")
             pages = await self._parse_with_pymupdf(pdf_path, limit)
             parser_used = "pymupdf"
-        
+
+        # Tier 5: OCR for scanned/image-based PDFs
+        if self._is_scanned_pdf(pages):
+            if self.ocr_client and self.ocr_client.is_available():
+                if self.debug:
+                    print("\n[PDF] 📸 Detected scanned/image-based PDF")
+                    print("[PDF] 🔄 Trying Tier 5: DeepSeek-OCR-2 via OCR service...")
+                ocr_pages = await self._parse_with_ocr(pdf_path, limit)
+                if ocr_pages:
+                    pages = ocr_pages
+                    parser_used = "deepseek-ocr-2"
+            else:
+                if self.debug:
+                    reason = "OCR service not configured" if not self.ocr_client else "OCR service not available"
+                    print(f"\n[PDF] ⚠️  Scanned PDF detected but {reason}")
+
         if self.debug:
             print(f"\n[PDF] ✅ Extraction complete using: {parser_used}")
             print(f"[PDF] Extracted: {len(pages)} pages")
@@ -456,6 +477,82 @@ class PDFParser:
         other_chars = len(text) - chinese_chars
         return (chinese_chars // 2) + (other_chars // 4)
     
+    def _is_scanned_pdf(self, pages: List[PDFPage]) -> bool:
+        """
+        Detect if pages represent a scanned/image-based PDF.
+        Returns True if most sampled pages have very little text (<50 chars).
+        """
+        if not pages:
+            return True
+        sample = pages[:min(5, len(pages))]
+        empty_count = sum(1 for p in sample if len(p.text.strip()) < 50)
+        return empty_count >= max(1, int(len(sample) * 0.8))
+
+    async def _parse_with_ocr(
+        self,
+        pdf_path: str,
+        max_pages: int,
+    ) -> List[PDFPage]:
+        """Tier 5: Parse using DeepSeek-OCR-2 via OCR service."""
+        # Try to import progress reporting for WebSocket updates
+        try:
+            from pageindex.progress_callback import get_document_id, report_progress
+            doc_id = get_document_id()
+        except Exception:
+            doc_id = None
+            report_progress = None
+
+        pages = []
+        doc = fitz.open(pdf_path)
+        total = min(max_pages, len(doc))
+        doc.close()
+
+        # Check how many pages are already cached
+        cached_count = self.ocr_client.get_cached_page_count(pdf_path)
+        if self.debug:
+            if cached_count > 0:
+                print(f"  [OCR] Cache hit: {cached_count}/{total} pages already cached")
+                if cached_count >= total:
+                    print(f"  [OCR] All pages cached, skipping OCR service calls")
+            else:
+                print(f"  [OCR] No cache found, will OCR {total} pages")
+
+        all_cached = cached_count >= total
+
+        for page_num in range(1, total + 1):
+            # Report OCR progress via WebSocket
+            if doc_id and report_progress:
+                progress = 5.0 + (page_num / total) * 20.0  # OCR uses 5%-25% range
+                report_progress(
+                    doc_id, "ocr", progress,
+                    message=f"加载缓存第 {page_num}/{total} 页..."
+                    if all_cached
+                    else f"OCR 识别第 {page_num}/{total} 页...",
+                )
+
+            md_text = self.ocr_client.ocr_page(pdf_path, page_num)
+            tokens = self._estimate_tokens(md_text)
+            labeled = f"<physical_index_{page_num}>\n{md_text}"
+            has_table = bool(md_text and "|" in md_text and "---" in md_text)
+
+            pages.append(PDFPage(
+                page_number=page_num,
+                text=md_text,
+                tokens=tokens,
+                has_table=has_table,
+                labeled_content=labeled,
+            ))
+
+            if self.debug and not all_cached:
+                print(f"  [OCR] Page {page_num}/{total}: {tokens} tokens")
+
+        if self.debug:
+            new_ocr = max(0, total - cached_count)
+            print(f"  [OCR] Complete: {len(pages)} pages "
+                  f"({min(cached_count, total)} from cache, {new_ocr} from OCR service)")
+
+        return pages
+
     def _is_poor_extraction(self, text: str) -> bool:
         """
         Detect if text extraction quality is poor

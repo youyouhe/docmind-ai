@@ -454,10 +454,10 @@ class ParseService:
 
     @staticmethod
     def _count_total_characters(tree: dict) -> int:
-        """Count total characters in tree content."""
+        """Count total characters in tree summary."""
         count = 0
-        if content := tree.get("content"):
-            count += len(content)
+        if summary := tree.get("summary"):
+            count += len(summary)
         for child in tree.get("children", []):
             count += ParseService._count_total_characters(child)
         return count
@@ -479,8 +479,8 @@ class ParseService:
 
     @staticmethod
     def _check_has_content(tree: dict) -> bool:
-        """Check if any node has content."""
-        if tree.get("content"):
+        """Check if any node has content (summary serves as content now)."""
+        if tree.get("summary"):
             return True
         for child in tree.get("children", []):
             if ParseService._check_has_content(child):
@@ -496,49 +496,43 @@ class ParseService:
         return count
 
     @staticmethod
-    def convert_page_index_to_api_format(page_index_tree: dict) -> dict:
+    def convert_page_index_to_api_format(page_index_tree: dict, doc_title: str = None) -> dict:
         """
-        Convert PageIndex internal format to API format.
+        Convert PageIndex internal format to API format (optimized for size).
 
         PageIndex format -> API format:
         - title -> title
         - node_id -> id
-        - text -> content
         - summary -> summary
         - nodes -> children
-        - (derived) -> level (based on nesting)
-        - start_index -> page_start (PDF only)
-        - end_index -> page_end (PDF only)
+        - start_index -> ps (PDF only, page start)
+        - end_index -> pe (PDF only, page end)
         - line_num -> line_start (Markdown only)
-        - display_title -> display_title (for UI, cleaned version of title)
-        - is_noise -> is_noise (boolean, marks invalid entries)
+
+        Removed fields (size optimization):
+        - level (implicit from tree nesting)
+        - content (use summary instead)
+        - display_title (use title directly)
+        - is_noise (not used by frontend)
         """
-        def convert_node(node: dict, level: int = 0) -> dict:
+        def convert_node(node: dict) -> dict:
             api_node = {
                 "id": node.get("node_id", ""),
                 "title": node.get("title", ""),
-                "level": level,
                 "children": []
             }
 
-            # Optional fields
-            if "text" in node:
-                api_node["content"] = node["text"]
-            if "summary" in node:
+            # Summary only (content excluded for size optimization)
+            # Skip empty summaries to save space
+            if node.get("summary"):
                 api_node["summary"] = node["summary"]
 
-            # Display enhancement fields (NEW)
-            if "display_title" in node:
-                api_node["display_title"] = node["display_title"]
-            if "is_noise" in node:
-                api_node["is_noise"] = node["is_noise"]
-
-            # PDF-specific fields
+            # PDF-specific fields (abbreviated keys)
             # Note: PageIndex already uses 1-based indexing, so no conversion needed
             if "start_index" in node:
-                api_node["page_start"] = node["start_index"]
+                api_node["ps"] = node["start_index"]
             if "end_index" in node:
-                api_node["page_end"] = node["end_index"]
+                api_node["pe"] = node["end_index"]
 
             # Markdown-specific fields
             if "line_num" in node:
@@ -546,9 +540,12 @@ class ParseService:
 
             # Recursively convert children
             for child in node.get("nodes", []):
-                api_node["children"].append(convert_node(child, level + 1))
+                api_node["children"].append(convert_node(child))
 
             return api_node
+
+        # Determine root title: prefer explicit doc_title, fallback to doc_name
+        root_title = doc_title or page_index_tree.get("doc_name", "Document")
 
         # PageIndex output wraps in "structure" array
         # For documents with TOC, there may be multiple root-level sections
@@ -559,21 +556,21 @@ class ParseService:
             # Empty document
             return {
                 "id": "root",
-                "title": page_index_tree.get("doc_name", "Document"),
-                "level": 0,
+                "title": root_title,
                 "children": []
             }
 
         if len(structure) == 1:
-            # Single root section - convert it directly
-            return convert_node(structure[0], 0)
+            # Single root section - use root_title as its title
+            result = convert_node(structure[0])
+            result["title"] = root_title
+            return result
         else:
             # Multiple root sections - create virtual root
             return {
                 "id": "root",
-                "title": page_index_tree.get("doc_name", "Document"),
-                "level": 0,
-                "children": [convert_node(s, 1) for s in structure]
+                "title": root_title,
+                "children": [convert_node(s) for s in structure]
             }
 
     @staticmethod
@@ -584,11 +581,10 @@ class ParseService:
         API format -> PageIndex format:
         - id -> node_id
         - title -> title
-        - content -> text
         - summary -> summary
         - children -> nodes
-        - page_start -> start_index (PDF only)
-        - page_end -> end_index (PDF only)
+        - ps -> start_index (PDF only)
+        - pe -> end_index (PDF only)
         - line_start -> line_num (Markdown only)
         """
         def convert_node(node: dict) -> dict:
@@ -597,19 +593,19 @@ class ParseService:
                 "title": node.get("title", ""),
                 "nodes": []
             }
-            
+
             # Optional fields
-            if "content" in node:
-                page_index_node["text"] = node["content"]
             if "summary" in node:
                 page_index_node["summary"] = node["summary"]
-            
-            # PDF-specific fields
-            if "page_start" in node:
-                page_index_node["start_index"] = node["page_start"]
-            if "page_end" in node:
-                page_index_node["end_index"] = node["page_end"]
-            
+
+            # PDF-specific fields (support both abbreviated and legacy keys)
+            ps = node.get("ps") or node.get("page_start")
+            pe = node.get("pe") or node.get("page_end")
+            if ps is not None:
+                page_index_node["start_index"] = ps
+            if pe is not None:
+                page_index_node["end_index"] = pe
+
             # Markdown-specific fields
             if "line_start" in node:
                 page_index_node["line_num"] = node["line_start"]
@@ -854,6 +850,13 @@ class ChatService:
         self.search_service = TreeSearchService(llm_provider)
         self.pdf_file_path = pdf_file_path
         self.storage_service = storage_service
+        self.pdf_paths: Dict[str, str] = {}  # document_id -> pdf_path mapping
+
+    def set_pdf_paths(self, pdf_paths: Dict[str, str]):
+        """Set multiple PDF paths for document set support."""
+        self.pdf_paths = pdf_paths
+        if pdf_paths:
+            self.pdf_file_path = list(pdf_paths.values())[0]  # Keep first as fallback
 
     def _get_node_by_id(self, tree: dict, node_id: str) -> Optional[dict]:
         """Find a node by its ID."""
@@ -865,16 +868,32 @@ class ChatService:
                 return result
         return None
 
+    def _get_pdf_for_node(self, node: dict) -> Optional[str]:
+        """Get the PDF path for a node based on its document prefix."""
+        # Check if node has document_id attribute
+        node_doc_id = node.get("document_id")
+        if node_doc_id and node_doc_id in self.pdf_paths:
+            return self.pdf_paths[node_doc_id]
+        
+        # Check parent document from node ID (e.g., "doc-xxx-nodeid")
+        node_id = node.get("id", "")
+        if node_id.startswith("doc-"):
+            parts = node_id.split("-")
+            if len(parts) >= 2:
+                doc_id = parts[1]
+                if doc_id in self.pdf_paths:
+                    return self.pdf_paths[doc_id]
+        
+        # Fallback to first PDF
+        return self.pdf_file_path
+
     def _build_context_from_nodes(self, tree: dict, node_ids: List[str]) -> str:
         """
         Build context string from relevant nodes.
 
         Strategy:
-        - If pdf_file_path is available: Load actual page content dynamically
-        - Otherwise: Use stored content (truncated) or summary
-
-        This allows the tree to be lightweight while still providing
-        full content during chat.
+        - If pdf_paths available: Load actual page content dynamically from correct PDF
+        - Otherwise: Use summary as fallback
         """
         context_parts = []
 
@@ -884,13 +903,15 @@ class ChatService:
                 title = node.get("title", "")
 
                 # Try to load actual page content if PDF is available
-                if self.pdf_file_path and self.storage_service:
-                    page_start = node.get("page_start")
-                    page_end = node.get("page_end")
+                pdf_path = self._get_pdf_for_node(node)
+                if pdf_path and self.storage_service:
+                    # Support both abbreviated (ps/pe) and legacy (page_start/page_end) keys
+                    page_start = node.get("ps") or node.get("page_start")
+                    page_end = node.get("pe") or node.get("page_end")
                     if page_start and page_end:
                         try:
                             pages = self.storage_service.get_pdf_pages(
-                                self.pdf_file_path, page_start, page_end
+                                pdf_path, page_start, page_end
                             )
                             content = "\n\n".join([p[1] for p in pages])
                             context_parts.append(f"# {title}\n\n{content}")
@@ -898,8 +919,8 @@ class ChatService:
                         except Exception as e:
                             logger.warning(f"Failed to load pages for {title}: {e}")
 
-                # Fallback to stored content (truncated) or summary
-                content = node.get("content") or node.get("summary", "")
+                # Fallback to summary
+                content = node.get("summary", "")
                 context_parts.append(f"# {title}\n\n{content}")
 
         return "\n\n---\n\n".join(context_parts)
@@ -920,12 +941,270 @@ class ChatService:
         question_lower = question.lower()
         return any(keyword in question or keyword.lower() in question_lower for keyword in list_keywords)
 
+    # Tool intent detection patterns
+    TOOL_PATTERNS = {
+        "extract_dates": ["有效时间", "关键日期", "提取日期", "截止日期", "投标时间", "有效期", "时间信息", "日期信息"],
+        "extract_budget": ["预算", "价格", "报价", "费用", "成本", "总价", "金额", "采购金额", "预算价", "控制价", "标底"],
+        "add_to_timeline": ["添加到时间线", "添加该项目到", "加入时间线", "项目管理时间线", "添加到项目管理", "加入项目管理"],
+    }
+
+    def _detect_tool_intent(self, question: str) -> Optional[str]:
+        """Detect if the user question implies a tool call."""
+        for tool_name, patterns in self.TOOL_PATTERNS.items():
+            if any(p in question for p in patterns):
+                return tool_name
+        return None
+
+    def _build_date_extraction_prompt(self, question: str, context: str, history_text: str) -> str:
+        """Build a prompt for extracting key dates from document content."""
+        history_section = f"\n对话历史：\n{history_text}\n" if history_text else ""
+
+        return f"""你是一个文档分析助手。请从以下文档内容中提取所有关键日期信息。
+
+文档内容：
+{context}
+{history_section}
+用户问题：{question}
+
+请按以下格式回答，首先用自然语言总结关键日期，然后在最后附上一个JSON代码块：
+
+[用自然语言总结所有发现的关键日期...]
+
+```json
+{{
+  "project_name": "项目名称",
+  "start_date": "YYYY-MM-DD 或 null",
+  "end_date": "YYYY-MM-DD 或 null",
+  "milestones": [
+    {{"name": "里程碑名称", "date": "YYYY-MM-DD", "type": "类型"}}
+  ],
+  "budget": 数字或null,
+  "budget_unit": "万元"
+}}
+```
+
+注意：
+1. 日期格式统一为YYYY-MM-DD
+2. 如果文档中没有明确的日期，使用null
+3. milestones 应尽可能列出文档中所有可识别的时间节点，type 从以下招投标全流程类型中选取：
+   - publish: 公告发布
+   - doc_deadline: 招标文件获取截止
+   - qa_deadline: 答疑截止
+   - bid_deadline: 投标截止
+   - opening: 开标
+   - evaluation: 评标
+   - award_notice: 中标公示
+   - contract_sign: 合同签订
+   - delivery: 交货
+   - acceptance: 验收
+   - warranty_start: 质保开始
+   - warranty_end: 质保结束
+   - payment: 付款
+   - custom: 其他自定义
+4. project_name 应从文档中提取项目名称
+5. start_date 一般为公告发布日期或项目开始日期
+6. end_date 一般为合同结束日期或项目有效期截止日期
+7. budget 为预算金额数字（不带单位），budget_unit 为金额单位，尽量统一为万元
+8. 即使只有一个日期也要尽量归类到正确的 milestone type"""
+
+    def _build_budget_extraction_prompt(self, question: str, context: str, history_text: str) -> str:
+        """Build a prompt for extracting budget/price info from document content."""
+        history_section = f"\n对话历史：\n{history_text}\n" if history_text else ""
+
+        return f"""你是一个文档分析助手。请从以下文档内容中提取预算、价格或成本相关的信息。
+
+文档内容：
+{context}
+{history_section}
+用户问题：{question}
+
+请按以下格式回答，首先用自然语言总结价格信息，然后在最后附上一个JSON代码块：
+
+[用自然语言总结所有发现的价格/预算信息...]
+
+```json
+{{
+  "budget": 数字或null,
+  "budget_unit": "万元 或 元 或其他单位",
+  "budget_details": "预算详情描述"
+}}
+```
+
+注意：
+1. budget 为数字，不要带单位
+2. 如果文档中有多个价格，取预算总价或采购控制价
+3. 尽量将金额统一转换为万元（如 500万元 → budget: 500, budget_unit: "万元"）
+4. 如果金额以"元"为单位且大于10000，转换为万元
+5. 如果文档中没有明确的价格信息，budget 使用 null"""
+
+    async def _handle_extract_budget(
+        self, question: str, tree: dict, history: List[dict],
+        context: str, sources: list, debug_path: list,
+        document_id: Optional[str] = None,
+    ) -> dict:
+        """Handle budget extraction and auto-update timeline if entry exists."""
+        import re
+        from api.database import get_db
+
+        history_text = self._build_history_text(history)
+        prompt = self._build_budget_extraction_prompt(question, context, history_text)
+        answer = await self.llm.chat(prompt)
+
+        # Try to parse budget JSON from the answer
+        budget_json = None
+        json_match = re.search(r'```json\s*(\{.*?\})\s*```', answer, re.DOTALL)
+        if json_match:
+            try:
+                budget_json = json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                pass
+
+        tool_call_result = {"name": "extract_budget", "status": "completed"}
+
+        # Auto-update timeline if entry exists for this document
+        if budget_json and budget_json.get("budget") is not None:
+            document_id = document_id or tree.get("id", "")
+            db = get_db()
+            existing_entries = db.get_timeline_entries(document_id)
+
+            if existing_entries:
+                # Update the first matching entry with budget info
+                entry = existing_entries[0]
+                updated = db.update_timeline_entry(
+                    entry["id"],
+                    budget=budget_json["budget"],
+                    budget_unit=budget_json.get("budget_unit", "万元"),
+                )
+                if updated:
+                    budget_val = budget_json["budget"]
+                    budget_unit = budget_json.get("budget_unit", "万元")
+                    answer += f"\n\n---\n已自动更新项目时间线中的预算信息：**{budget_val} {budget_unit}**"
+                    tool_call_result = {
+                        "name": "update_timeline_budget",
+                        "status": "completed",
+                        "result": updated,
+                    }
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "debug_path": debug_path,
+            "provider": self.llm.provider,
+            "model": self.llm.model,
+            "system_prompt": prompt,
+            "raw_output": answer,
+            "tool_call": tool_call_result,
+        }
+
+    async def _handle_add_to_timeline(
+        self, question: str, tree: dict, history: List[dict],
+        context: str, sources: list, debug_path: list,
+        document_id: Optional[str] = None,
+    ) -> dict:
+        """Handle 'add to timeline' tool call by parsing previous date extraction."""
+        import re
+        import uuid as uuid_module
+        from api.database import get_db
+
+        # Look for JSON block in recent history
+        date_json = None
+        for msg in reversed(history or []):
+            if msg.get("role") == "assistant":
+                json_match = re.search(r'```json\s*(\{.*?\})\s*```', msg["content"], re.DOTALL)
+                if json_match:
+                    try:
+                        date_json = json.loads(json_match.group(1))
+                        break
+                    except json.JSONDecodeError:
+                        continue
+
+        if not date_json:
+            # No previous extraction found, extract now
+            history_text = self._build_history_text(history)
+            extraction_prompt = self._build_date_extraction_prompt(question, context, history_text)
+            extraction_result = await self.llm.chat(extraction_prompt)
+            json_match = re.search(r'```json\s*(\{.*?\})\s*```', extraction_result, re.DOTALL)
+            if json_match:
+                try:
+                    date_json = json.loads(json_match.group(1))
+                except json.JSONDecodeError:
+                    pass
+
+        if not date_json:
+            return {
+                "answer": '抱歉，我无法从文档中提取到日期信息。请先让我分析文档的关键日期，例如问我"这个文档的有效时间是什么？"',
+                "sources": sources,
+                "debug_path": debug_path,
+                "provider": self.llm.provider,
+                "model": self.llm.model,
+                "system_prompt": "",
+                "raw_output": "",
+            }
+
+        # Use actual document_id, fall back to tree root id
+        document_id = document_id or tree.get("id", "")
+
+        # Create the timeline entry
+        db = get_db()
+        entry_id = str(uuid_module.uuid4())
+        budget_val = date_json.get("budget")
+        budget_unit = date_json.get("budget_unit", "万元")
+        # Convert budget to float if it's a string
+        if isinstance(budget_val, str):
+            try:
+                budget_val = float(budget_val)
+            except (ValueError, TypeError):
+                budget_val = None
+
+        entry = db.create_timeline_entry(
+            entry_id=entry_id,
+            document_id=document_id,
+            project_name=date_json.get("project_name", tree.get("title", "未命名项目")),
+            start_date=date_json.get("start_date"),
+            end_date=date_json.get("end_date"),
+            milestones=date_json.get("milestones", []),
+            budget=budget_val,
+            budget_unit=budget_unit if budget_val is not None else None,
+            notes=question,
+        )
+
+        # Build confirmation message
+        milestones_text = ""
+        for m in date_json.get("milestones", []):
+            milestones_text += f"\n- {m.get('name', '')}: {m.get('date', '')}"
+
+        budget_text = f"\n**预算**: {budget_val} {budget_unit}" if budget_val is not None else ""
+
+        answer = f"""已成功将该项目添加到时间线！
+
+**项目名称**: {entry.get('project_name')}
+**有效期**: {entry.get('start_date') or '未指定'} ~ {entry.get('end_date') or '未指定'}{budget_text}
+**关键里程碑**:{milestones_text if milestones_text else ' 无'}
+
+你可以在文档列表的"项目时间线"标签页查看所有项目的时间线。"""
+
+        return {
+            "answer": answer,
+            "sources": sources,
+            "debug_path": debug_path,
+            "provider": self.llm.provider,
+            "model": self.llm.model,
+            "system_prompt": "",
+            "raw_output": answer,
+            "tool_call": {
+                "name": "add_to_timeline",
+                "status": "completed",
+                "result": entry,
+            },
+        }
+
     async def answer_question(
         self,
         question: str,
         tree: dict,
         history: Optional[List[dict]] = None,
-        max_source_nodes: int = 8
+        max_source_nodes: int = 8,
+        document_id: Optional[str] = None,
     ) -> dict:
         """
         Answer a question based on document tree.
@@ -940,6 +1219,9 @@ class ChatService:
             Dictionary with answer, sources, and debug info
         """
         history = history or []
+
+        # Detect tool intent before normal flow
+        tool_intent = self._detect_tool_intent(question)
 
         # Detect if this is a list question
         is_list_question = self._is_list_question(question)
@@ -957,14 +1239,6 @@ class ChatService:
         # Build context from relevant nodes
         context = self._build_context_from_nodes(tree, node_ids)
 
-        # Build conversation history text
-        history_text = self._build_history_text(history)
-
-        # Generate answer with history awareness
-        prompt = self._build_chat_prompt(question, context, history_text)
-
-        answer = await self.llm.chat(prompt)
-
         # Build source nodes with relevance info
         sources = []
         for node_id in node_ids:
@@ -973,7 +1247,7 @@ class ChatService:
                 sources.append({
                     "id": node_id,
                     "title": node.get("title", ""),
-                    "relevance": 0.8  # Default relevance (could be refined)
+                    "relevance": 0.8
                 })
 
         # Build debug path
@@ -981,14 +1255,46 @@ class ChatService:
         for path in search_result.get("paths", []):
             debug_path.extend(path)
 
+        # Handle tool intents
+        if tool_intent == "extract_dates":
+            history_text = self._build_history_text(history)
+            prompt = self._build_date_extraction_prompt(question, context, history_text)
+            answer = await self.llm.chat(prompt)
+
+            return {
+                "answer": answer,
+                "sources": sources,
+                "debug_path": debug_path,
+                "provider": self.llm.provider,
+                "model": self.llm.model,
+                "system_prompt": prompt,
+                "raw_output": answer,
+                "tool_call": {"name": "extract_dates", "status": "completed"},
+            }
+
+        elif tool_intent == "extract_budget":
+            return await self._handle_extract_budget(
+                question, tree, history, context, sources, debug_path, document_id
+            )
+
+        elif tool_intent == "add_to_timeline":
+            return await self._handle_add_to_timeline(
+                question, tree, history, context, sources, debug_path, document_id
+            )
+
+        # Normal chat flow
+        history_text = self._build_history_text(history)
+        prompt = self._build_chat_prompt(question, context, history_text)
+        answer = await self.llm.chat(prompt)
+
         return {
             "answer": answer,
             "sources": sources,
             "debug_path": debug_path,
             "provider": self.llm.provider,
             "model": self.llm.model,
-            "system_prompt": prompt,  # Return the complete system prompt
-            "raw_output": answer,  # Raw LLM output (same as answer in this case)
+            "system_prompt": prompt,
+            "raw_output": answer,
         }
 
     def _build_history_text(self, history: List[dict]) -> str:

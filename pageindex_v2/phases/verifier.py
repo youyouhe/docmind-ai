@@ -2,6 +2,7 @@
 Verifier - Dual validation for TOC accuracy
 Validates: 1) Title existence, 2) Title appears at page start
 """
+import re
 import asyncio
 from typing import List, Dict, Tuple
 from ..core.llm_client import LLMClient
@@ -135,7 +136,25 @@ class Verifier:
                     return idx, False
                 
                 page_content = pages[local_index].text[:2000]  # First 2000 chars
-                
+
+                # Pre-check: fuzzy string matching before LLM call
+                # This handles OCR text with extra spaces/formatting differences
+                normalized_title = re.sub(r'\s+', '', title)
+                normalized_page = re.sub(r'\s+', '', page_content)
+
+                # Quick check: if title appears in page content (whitespace-insensitive),
+                # and page has substantial content (not just a TOC listing), mark as found
+                title_found_in_text = normalized_title in normalized_page
+                page_has_content = len(page_content.strip()) > 200  # More than just a listing
+
+                if title_found_in_text and page_has_content:
+                    # Title found via string matching and page has real content
+                    # Skip expensive LLM call
+                    completed += 1
+                    if self.debug and completed % 20 == 0:
+                        print(f"  Progress: {completed}/{total} ({completed*100//total}%)")
+                    return idx, True
+
                 system_prompt = """
                 Check if the section title appears in the page content as a real section heading.
 
@@ -144,6 +163,7 @@ class Verifier:
                 - TOC reference (listing in table of contents without content)
 
                 Use fuzzy matching for minor spacing/formatting differences.
+                Note: OCR-processed text may have extra spaces or slightly different formatting.
 
                 Reply JSON:
                 {
@@ -152,18 +172,18 @@ class Verifier:
                     "is_toc_page": "yes" or "no"
                 }
                 """
-                
+
                 prompt = f"""
                 Section title: "{title}"
-                
+
                 Page content (first 2000 chars):
                 ---
                 {page_content}
                 ---
-                
+
                 Does the title appear as a REAL section heading (not just in a TOC list)?
                 """
-                
+
                 try:
                     result = await self.llm.chat_json(prompt, system=system_prompt)
                     exists = result.get("exists", "no").lower() == "yes"

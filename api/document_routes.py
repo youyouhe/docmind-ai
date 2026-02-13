@@ -115,7 +115,7 @@ async def parse_document_background(
     doc_logger = create_document_logger(document_id, "parse")
     
     # Create LLM logging callback for parse debugging
-    def llm_log_callback(operation_type: str, prompt: str, response: str, 
+    def llm_log_callback(operation_type: str, prompt: str, response: str,
                         model: str, duration_ms: int, success: bool,
                         error_msg: Optional[str], metadata: Optional[dict]):
         """Callback to log LLM calls during parsing."""
@@ -124,11 +124,11 @@ async def parse_document_background(
             prompt_tokens = metadata.get('prompt_tokens') if metadata else None
             completion_tokens = metadata.get('completion_tokens') if metadata else None
             total_tokens = metadata.get('total_tokens') if metadata else None
-            
+
             # Clean metadata for storage (remove token counts since we store them separately)
-            clean_metadata = {k: v for k, v in (metadata or {}).items() 
+            clean_metadata = {k: v for k, v in (metadata or {}).items()
                              if k not in ['prompt_tokens', 'completion_tokens', 'total_tokens']}
-            
+
             db.save_parse_debug_log(
                 document_id=document_id,
                 operation_type=operation_type,
@@ -144,6 +144,20 @@ async def parse_document_background(
                 metadata=clean_metadata if clean_metadata else None
             )
             doc_logger.debug(f"Saved LLM debug log: {operation_type} | {model} | {duration_ms}ms | tokens={total_tokens}")
+
+            # Bridge to performance_monitor so aggregated stats are non-zero
+            try:
+                monitor = get_monitor()
+                monitor.track_llm_call(
+                    stage=operation_type or "pageindex_v2",
+                    model=model,
+                    input_tokens=prompt_tokens or 0,
+                    output_tokens=completion_tokens or 0,
+                    success=success
+                )
+            except Exception:
+                pass  # Non-critical: don't let counter failure break logging
+
         except Exception as e:
             doc_logger.warning(f"Failed to save LLM debug log: {e}")
     
@@ -261,8 +275,15 @@ async def parse_document_background(
                 metadata={"stage": "Building tree structure..."}
             )
 
+        # Get original filename for root title (strip extension)
+        doc_record = db.get_document(document_id)
+        doc_title = None
+        if doc_record and doc_record.filename:
+            import os as _os
+            doc_title = _os.path.splitext(doc_record.filename)[0]
+
         # Convert to API format
-        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree, doc_title=doc_title)
 
         # Stage 3: Tree Quality Audit (if enabled)
         audit_report = None
@@ -797,8 +818,10 @@ async def reparse_document(
                 if_add_node_text=parse_config.get("if_add_node_text", True),
             )
 
-        # Convert to API format
-        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+        # Convert to API format (use original filename as root title)
+        import os as _os
+        reparse_doc_title = _os.path.splitext(doc.filename)[0] if doc.filename else None
+        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree, doc_title=reparse_doc_title)
 
         # Calculate statistics
         stats_dict = ParseService.calculate_tree_stats(api_tree)
@@ -1003,29 +1026,6 @@ async def update_node_title(
         """
         if node.get("id") == target_id:
             node["title"] = new_title
-
-            # Also update display_title if it exists
-            # display_title format is typically "{node_id} {title}"
-            # We need to preserve the node_id prefix and update the title
-            if "display_title" in node:
-                # First, try to use node_id if available
-                node_id = node.get("node_id", "")
-                if node_id:
-                    # Reconstruct display_title with the new title
-                    node["display_title"] = f"{node_id} {new_title}"
-                else:
-                    # Fallback: try to extract the prefix from old display_title
-                    # Format: "1 Title" or "1.1 Title" or "1.1.1 Title"
-                    old_display_title = node["display_title"]
-                    parts = old_display_title.split(" ", 1)
-                    if len(parts) > 1 and parts[0].replace(".", "").isdigit():
-                        # First part looks like a node_id (e.g., "1", "1.1", "1.1.1")
-                        node_id_prefix = parts[0]
-                        node["display_title"] = f"{node_id_prefix} {new_title}"
-                    else:
-                        # Can't determine pattern, just use the new title
-                        node["display_title"] = new_title
-
             return True
 
         # Search in children
@@ -1759,7 +1759,9 @@ async def audit_document_tree(
         )
         
         # Convert optimized tree back to API format
-        api_tree = ParseService.convert_page_index_to_api_format(optimized_tree)
+        import os as _os
+        audit_doc_title = _os.path.splitext(doc.filename)[0] if doc.filename else None
+        api_tree = ParseService.convert_page_index_to_api_format(optimized_tree, doc_title=audit_doc_title)
         
         # Save the audit report
         audit_path = storage.save_audit_report(document_id, audit_report)

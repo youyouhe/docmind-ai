@@ -9,6 +9,7 @@ Integrates all phases with 5 key advantages:
 """
 import os
 import sys
+import re
 import asyncio
 import json
 import logging
@@ -145,19 +146,29 @@ class PageIndexV2:
         self.log_progress("\n📄 [1/6] PDF Parsing - Initial pages...")
         if self.debug:
             print("\n📄 PHASE 1A: PDF Parsing (Initial Pages Only)")
-        parser = PDFParser(debug=self.debug)
-        
+        # Initialize OCR client (reads OCR_SERVICE_URL from env, no-op if not configured)
+        try:
+            from api.ocr_client import OCRClient
+            ocr_client = OCRClient()
+        except Exception:
+            ocr_client = None
+
+        parser = PDFParser(debug=self.debug, ocr_client=ocr_client)
+
         # Get total page count first
         import fitz
         doc = fitz.open(pdf_path)
         total_pages = len(doc)
         doc.close()
-        
+
         initial_parse_pages = 30  # Parse first 30 pages for TOC detection
         pages = await parser.parse(pdf_path, max_pages=initial_parse_pages)
-        
+
         if not pages:
-            raise ValueError("No pages extracted from PDF")
+            raise ValueError(
+                "No pages extracted from PDF. All text extraction tiers failed. "
+                "If this is a scanned PDF, ensure the OCR service is running (OCR_SERVICE_URL)."
+            )
         
         if self.debug:
             print(f"[PHASE 1A] Parsed {len(pages)}/{total_pages} pages initially")
@@ -552,13 +563,34 @@ class PageIndexV2:
         self.log_progress(f"\n🌳 [6/6] Tree Building... ({len(structure)} items)")
         if self.debug:
             print("\n🌳 PHASE 6: Tree Building")
-        builder = TreeBuilder(max_depth=self.opt.max_depth, debug=self.debug)
-        tree = builder.build_tree(verified, pages)
+        builder = TreeBuilder(max_depth=self.opt.max_depth, debug=self.debug, max_leaf_pages=self.opt.max_pages_per_node)
+        tree = builder.build_tree(verified, pages, total_pages=total_pages)
 
         # NOTE: Disabled add_preface_if_needed - we are parsing documents, not writing them.
         # If a document doesn't have a preface in its TOC, we shouldn't add one artificially.
         # tree = builder.add_preface_if_needed(tree, pages)
         
+        # Phase 6-post: Coverage check — parse remaining pages if coverage is low
+        parsed_coverage = len(pages) / total_pages * 100 if total_pages > 0 else 100
+        MIN_COVERAGE_THRESHOLD = 80  # If below this %, parse all remaining pages
+
+        if parsed_coverage < MIN_COVERAGE_THRESHOLD and len(pages) < total_pages:
+            if self.debug:
+                print(f"\n📄 PHASE 6-post: Low page parse coverage ({parsed_coverage:.0f}%)")
+                print(f"  Parsed: {len(pages)}/{total_pages} pages")
+                print(f"  Threshold: {MIN_COVERAGE_THRESHOLD}%")
+                print(f"  Parsing ALL remaining pages for Phase 6a/7...")
+
+            self.log_progress(f"\n📄 Parsing remaining pages ({len(pages)}/{total_pages} → full)...")
+
+            import time
+            parse_start = time.time()
+            pages = await parser.parse(pdf_path, max_pages=total_pages)
+            parse_time = time.time() - parse_start
+
+            if self.debug:
+                print(f"  ✓ Parsed all {len(pages)} pages in {parse_time:.1f}s")
+
         # Phase 6a: Recursive Large Node Processing
         if self.opt.enable_recursive_processing:
             self.log_progress(f"\n🔄 [6a/6] Recursive Large Node Processing...")
@@ -566,8 +598,25 @@ class PageIndexV2:
                 print("\n🔄 PHASE 6a: Recursive Large Node Processing")
                 print(f"[RECURSIVE] Checking {len(tree)} top-level nodes for large nodes")
             
+            # Collect all existing tree titles for sibling-aware peer filtering
+            # When a node's page range is too wide (due to OCR errors), recursive
+            # extraction may find peer chapters. Filtering by title match against
+            # existing tree nodes catches these leaks in a format-agnostic way.
+            all_tree_titles = set()
+            def _collect_tree_titles(n):
+                title = n.get('title', '')
+                if title:
+                    all_tree_titles.add(re.sub(r'\s+', '', title.strip()).lower())
+                for child in n.get('nodes', []):
+                    _collect_tree_titles(child)
+            for n in tree:
+                _collect_tree_titles(n)
+
+            if self.debug:
+                print(f"[RECURSIVE] Collected {len(all_tree_titles)} existing tree titles for peer filtering")
+
             tasks = [
-                self._process_large_node_recursively(node, pages)
+                self._process_large_node_recursively(node, pages, existing_tree_titles=all_tree_titles)
                 for node in tree
             ]
             tree = await asyncio.gather(*tasks)
@@ -645,22 +694,36 @@ class PageIndexV2:
         }
         
         # Phase 7: Gap Filling (Post-processing)
-        # TEMPORARILY DISABLED to prevent hanging
-        # if self.debug:
-        #     print("\n🔧 PHASE 7: Gap Filling (Post-processing)")
-        # self.log_progress(f"\n🔧 [7/8] Gap Filling... (Analyzing coverage)")
+        if self.debug:
+            print("\n🔧 PHASE 7: Gap Filling (Post-processing)")
+        self.log_progress(f"\n🔧 [7/8] Gap Filling... (Analyzing coverage)")
 
-        # from .utils.gap_filler import fill_structure_gaps
+        from .utils.gap_filler import fill_structure_gaps
 
-        # result = await fill_structure_gaps(
-        #     structure_data=result,
-        #     pdf_path=pdf_path,
-        #     llm=self.llm,
-        #     parser=parser,
-        #     debug=self.debug
-        # )
+        try:
+            result = await fill_structure_gaps(
+                structure_data=result,
+                pdf_path=pdf_path,
+                llm=self.llm,
+                parser=parser,
+                debug=self.debug,
+                existing_pages=pages
+            )
+        except Exception as e:
+            if self.debug:
+                print(f"[PHASE 7] ⚠ Gap filling failed (non-critical): {e}")
+                import traceback
+                traceback.print_exc()
+            # Initialize empty gap_fill_info on failure
+            if 'gap_fill_info' not in result:
+                result['gap_fill_info'] = {
+                    'gaps_found': 0,
+                    'gaps_filled': [],
+                    'original_coverage': f"{len(pages)}/{total_pages}",
+                    'coverage_percentage': 0.0
+                }
 
-        # Initialize empty gap_fill_info to prevent errors
+        # Ensure gap_fill_info exists
         if 'gap_fill_info' not in result:
             result['gap_fill_info'] = {
                 'gaps_found': 0,
@@ -930,12 +993,16 @@ class PageIndexV2:
         """
         
         try:
-            result = await self.llm.chat_json(prompt, system=system_prompt, max_tokens=4000)
+            result = await self.llm.chat_json(prompt, system=system_prompt, max_tokens=8000)
             structure = result.get("table_of_contents", [])
-            
+
             if self.debug:
                 print(f"  [LLM] Response received: {len(structure)} items")
-            
+            if not structure:
+                self.logger.warning(f"[EXTRACT] Empty structure from segment {segment_index} "
+                                  f"(pages {segment['start_page']}-{segment['end_page']}). "
+                                  f"Result keys: {list(result.keys())}")
+
             # Filter by max_depth
             filtered = []
             for item in structure:
@@ -945,15 +1012,16 @@ class PageIndexV2:
                     filtered.append(item)
                 elif self.debug:
                     print(f"  [FILTER] Skipping '{item.get('title', '')}' (depth {depth} > max {self.opt.max_depth})")
-            
+
             if self.debug and len(filtered) < len(structure):
                 print(f"  [FILTER] Filtered to {len(filtered)} items (removed {len(structure) - len(filtered)} too deep)")
-            
+
             return filtered
-            
+
         except Exception as e:
             if self.debug:
                 print(f"  [ERROR] Segment structure extraction failed: {e}")
+            self.logger.error(f"[EXTRACT] Segment {segment_index} extraction failed: {e}")
             return []
     
     def _merge_structure_items(self, existing: list, new_items: list) -> list:
@@ -997,10 +1065,14 @@ class PageIndexV2:
         level_counters = {}  # Track counter for each level
         filtered_count = 0
         chapter_counter = 0  # Track chapters separately
-        
+        seen_chapter_titles = set()  # For deduplication
+        dedup_count = 0
+        skip_until_next_chapter = False  # Skip sub-entries of duplicate chapters
+        duplicate_level = 0  # Level of the duplicate chapter being skipped
+
         for level, title, page in embedded_toc:
             title = title.strip()
-            
+
             # Quality filtering: skip invalid TOC titles
             if not self._is_valid_toc_title(title):
                 if self.debug:
@@ -1008,36 +1080,70 @@ class PageIndexV2:
                     print(f"  [FILTER] Skipping invalid TOC entry: '{preview}'")
                 filtered_count += 1
                 continue
-            
+
             # OPTIMIZATION 1: Smart chapter detection
             # Recognize common chapter patterns and force them to level 1
             is_chapter = self._is_chapter_title(title)
-            
+
+            # OPTIMIZATION 2: Deduplicate chapters with the same title
+            # When embedded TOC has the same chapter at different levels, both get
+            # promoted to level 1. Skip duplicate chapters and their sub-entries.
+            if is_chapter:
+                normalized = title.strip()
+                if normalized in seen_chapter_titles:
+                    # This is a duplicate chapter — skip it and its sub-entries
+                    if self.debug:
+                        print(f"  [DEDUP] Skipping duplicate chapter and sub-entries: '{normalized}'")
+                    dedup_count += 1
+                    skip_until_next_chapter = True
+                    duplicate_level = level
+                    continue
+                seen_chapter_titles.add(normalized)
+                # Stop skipping if we reach a new (non-duplicate) chapter
+                skip_until_next_chapter = False
+            elif skip_until_next_chapter:
+                # Skip sub-entries of the duplicate chapter
+                # Sub-entries have a deeper level than the duplicate chapter
+                if level > duplicate_level:
+                    if self.debug:
+                        print(f"  [DEDUP] Skipping sub-entry of duplicate: '{title[:40]}'")
+                    continue
+                else:
+                    # Same or shallower level — stop skipping
+                    skip_until_next_chapter = False
+
             if is_chapter:
                 # Force chapters to be level 1, regardless of embedded level
                 original_level = level
                 level = 1
                 chapter_counter += 1
-                
+
                 if self.debug and original_level != 1:
                     print(f"  [NORMALIZE] Promoted '{title}' from L{original_level} to L1 (chapter)")
-            
+            elif level == 1 and chapter_counter > 0 and self._is_appendix_title(title):
+                # OPTIMIZATION 3: Demote appendix-like entries to level 2
+                # "附件X", "投标函", "开标一览表" etc. at level 1 should be children
+                # of the preceding chapter, not siblings
+                level = 2
+                if self.debug:
+                    print(f"  [DEMOTE] Demoted appendix '{title[:40]}' from L1 to L2")
+
             # Update counters: increment current level, reset deeper levels
             if level not in level_counters:
                 level_counters[level] = 0
             level_counters[level] += 1
-            
+
             # Reset deeper level counters
             keys_to_delete = [k for k in level_counters if k > level]
             for k in keys_to_delete:
                 del level_counters[k]
-            
+
             # Build structure code (e.g., "1.2.3")
             structure_code_parts = []
             for lv in sorted([k for k in level_counters if k <= level]):
                 structure_code_parts.append(str(level_counters[lv]))
             structure_code = ".".join(structure_code_parts)
-            
+
             # Note: Use 'page' field for compatibility with PageMapper
             # Tree builder will convert 'page' to 'start_index'/'end_index'
             structure.append({
@@ -1047,13 +1153,15 @@ class PageIndexV2:
                 "level": level,  # Keep level for debugging
                 "is_chapter": is_chapter  # Mark chapters for post-processing
             })
-        
+
         if self.debug:
             if filtered_count > 0:
                 print(f"  [FILTER] Filtered out {filtered_count} invalid TOC entries")
+            if dedup_count > 0:
+                print(f"  [DEDUP] Removed {dedup_count} duplicate chapter(s)")
             if chapter_counter > 0:
                 print(f"  [CHAPTER] Detected {chapter_counter} chapter(s)")
-        
+
         return structure
     
     def _is_chapter_title(self, title: str) -> bool:
@@ -1096,9 +1204,43 @@ class PageIndexV2:
         # Pattern 5: "第X部分" / "第X节" (alternative main section markers)
         if re.match(r'^第[一二三四五六七八九十百0-9]+[部节]', title):
             return True
-        
+
         return False
-    
+
+    def _is_appendix_title(self, title: str) -> bool:
+        """
+        Detect if a title represents an appendix/attachment that should be
+        subordinate to a chapter, not at the same level.
+
+        Common patterns in Chinese tender documents:
+        - "附件1：xxx", "附件2：xxx"
+        - "附件1:xxx" (half-width colon)
+        - "投标函", "开标一览表"
+        - "技术、商务偏离表"
+        - "政府采购活动现场确认声明书"
+
+        Returns:
+            True if title is an appendix entry
+        """
+        import re
+
+        # Pattern 1: "附件" followed by number or colon
+        if re.match(r'^附件\s*[0-9０-９一二三四五六七八九十]', title):
+            return True
+
+        # Pattern 2: Common appendix names (not chapter-level content)
+        appendix_keywords = [
+            '投标函', '开标一览表', '报价明细表', '偏离表',
+            '声明书', '承诺书', '授权委托书', '证明书',
+            '自评表', '基本情况表', '业绩一览表', '情况表',
+            '清单', '一览表', '证书一览表',
+        ]
+        for kw in appendix_keywords:
+            if kw in title:
+                return True
+
+        return False
+
     def _is_valid_toc_title(self, title: str) -> bool:
         """
         Validate if a TOC title looks reasonable and not content fragments.
@@ -1164,14 +1306,27 @@ class PageIndexV2:
             # Exception: legitimate chapter formats like "A.附录"
             if not any(title[2:].strip().startswith(prefix) for prefix in ['附', '补', '表', '图']):
                 return False
-        
+
+        # 7. Filter table column headers (e.g., "序号 项目 内容", "名称 规格 数量 单价")
+        # These are short words separated by spaces, with no numbering prefix
+        words = title.split()
+        if len(words) >= 2 and all(len(w) <= 4 for w in words):
+            # All words are short (≤4 chars) and no numbering prefix — likely table headers
+            table_header_keywords = [
+                '序号', '项目', '内容', '名称', '规格', '数量', '单价', '合价',
+                '金额', '备注', '编号', '类别', '单位', '要求', '说明',
+            ]
+            if any(w in table_header_keywords for w in words):
+                return False
+
         return True
     
     async def _process_large_node_recursively(
         self,
         node: Dict,
         all_pages: List[PDFPage],
-        parent_level: int = 0
+        parent_level: int = 0,
+        existing_tree_titles: set = None
     ) -> Dict:
         """
         Recursively process large nodes by extracting sub-structure.
@@ -1200,8 +1355,9 @@ class PageIndexV2:
         
         # Check if node is large enough to warrant recursive processing
         # Use OR logic: trigger if EITHER condition is met
+        # Use >= for pages so nodes at exactly the threshold still get processed
         is_large = (
-            page_count > self.opt.max_pages_per_node or
+            page_count >= self.opt.max_pages_per_node or
             token_count > self.opt.max_tokens_per_node
         )
         
@@ -1211,7 +1367,7 @@ class PageIndexV2:
                 # Calculate current node's level for passing to children
                 current_level = node.get('level', parent_level + 1)
                 tasks = [
-                    self._process_large_node_recursively(child, all_pages, parent_level=current_level)
+                    self._process_large_node_recursively(child, all_pages, parent_level=current_level, existing_tree_titles=existing_tree_titles)
                     for child in node['nodes']
                 ]
                 node['nodes'] = await asyncio.gather(*tasks)
@@ -1220,51 +1376,148 @@ class PageIndexV2:
         # Node is large - extract sub-structure
         # Calculate current node's level
         current_level = node.get('level', parent_level + 1)
-        
+
         if self.debug:
             print(f"\n[RECURSIVE] Processing large node:")
             print(f"  Title: {node['title'][:60]}...")
             print(f"  Pages: {start}-{end} ({page_count} pages)")
             print(f"  Tokens: {token_count:,}")
             print(f"  Level context: current_level={current_level}, parent_level={parent_level}, max_depth={self.opt.max_depth}")
-        
+        self.logger.info(f"[RECURSIVE] Large node: '{node.get('title', '')[:50]}' p{start}-{end} ({page_count}pg, {token_count}tok)")
+
         # Extract sub-structure from this node's pages
         # Pass parent context WITH level constraints to prevent children from being extracted as L1
+        # Use node_id for structure since 'structure' field is popped by tree builder
+        parent_node_id = node.get('node_id', '')
         parent_context = {
-            'structure': node.get('structure', ''),
+            'structure': parent_node_id,
             'title': node.get('title', ''),
             'level': current_level,  # Current node's level
             'max_child_level': self.opt.max_depth - current_level  # How many levels can children go deep
         }
         sub_structure = await self._generate_structure_from_content(node_pages, parent_context=parent_context)
-        
+
         if not sub_structure:
             if self.debug:
                 print(f"  ⚠ No sub-structure extracted")
+            self.logger.info(f"[RECURSIVE] ⚠ No sub-structure extracted for '{node.get('title', '')[:50]}'")
             return node
-        
+
+        self.logger.info(f"[RECURSIVE] Extracted {len(sub_structure)} sub-items")
+        for i, item in enumerate(sub_structure[:10]):
+            self.logger.info(f"  [{i}] struct={item.get('structure')} title='{item.get('title', '')[:40]}' "
+                           f"physical_index={item.get('physical_index')}")
+
         # Map pages for sub-structure
         # The sub_structure has <physical_index_X> tags, need to convert to integers
         from .utils.helpers import convert_physical_index_to_int
         sub_structure = convert_physical_index_to_int(sub_structure)
-        
+
+        converted_count = sum(1 for item in sub_structure if isinstance(item.get('physical_index'), int))
         if self.debug:
-            converted_count = sum(1 for item in sub_structure if isinstance(item.get('physical_index'), int))
             print(f"  [RECURSIVE] Converted {converted_count}/{len(sub_structure)} physical_index tags to integers")
-        
+        self.logger.info(f"[RECURSIVE] physical_index conversion: {converted_count}/{len(sub_structure)} successful")
+
+        # === PEER FILTER A: Structure-code-based filtering ===
+        # When extracted items use struct codes prefixed with parent_node_id
+        # (e.g., "4.1", "4.2" for parent "4"), items with non-matching prefixes
+        # are peers that leaked in due to page range being too wide.
+        effective_end = end  # May be trimmed if peers found
+        if parent_node_id and sub_structure:
+            prefix = parent_node_id + '.'
+            # Check if at least some items have parent-prefixed struct codes
+            has_child_structs = any(
+                s.get('structure', '').startswith(prefix) or s.get('structure', '') == parent_node_id
+                for s in sub_structure
+            )
+            if has_child_structs:
+                original_count = len(sub_structure)
+                peer_start_page = None
+                filtered = []
+                for item in sub_structure:
+                    struct = item.get('structure', '')
+                    if struct == parent_node_id or struct.startswith(prefix):
+                        filtered.append(item)
+                    elif peer_start_page is None:
+                        # First non-child item — record its page for end trimming
+                        phys_idx = item.get('physical_index')
+                        if isinstance(phys_idx, int):
+                            peer_start_page = phys_idx
+                removed = original_count - len(filtered)
+                if removed > 0:
+                    sub_structure = filtered
+                    if self.debug:
+                        print(f"  [PEER-STRUCT] Filtered {removed} items with non-child struct codes "
+                              f"(kept prefix '{parent_node_id}')")
+                    self.logger.info(f"[RECURSIVE] PEER-STRUCT: filtered {removed} non-child items "
+                                   f"(prefix '{parent_node_id}')")
+                    if peer_start_page and peer_start_page > start:
+                        effective_end = peer_start_page - 1
+                        node['end_index'] = effective_end
+                        if self.debug:
+                            print(f"  [PEER-STRUCT] Trimmed node end: p{end} → p{effective_end}")
+                        self.logger.info(f"[RECURSIVE] PEER-STRUCT: trimmed end p{end} → p{effective_end}")
+
+        # === PEER FILTER B: Title-based sibling-aware filtering ===
+        # Cross-reference extracted items against all existing tree node titles.
+        # If an extracted item's title matches a node already in the tree (e.g.,
+        # "第五章..." matches root Ch5), it's a leaked peer, not a true child.
+        # This is format-agnostic — no title patterns needed.
+        if existing_tree_titles and sub_structure:
+            parent_norm = re.sub(r'\s+', '', node.get('title', '').strip()).lower()
+            original_count = len(sub_structure)
+            peer_start_page_title = None
+            filtered = []
+            removed_titles = []
+            for item in sub_structure:
+                item_norm = re.sub(r'\s+', '', item.get('title', '').strip()).lower()
+                if item_norm == parent_norm:
+                    # Same as parent — keep for dedup handling later
+                    filtered.append(item)
+                elif item_norm in existing_tree_titles:
+                    # Matches an existing tree node — leaked peer
+                    removed_titles.append(item.get('title', '')[:50])
+                    if peer_start_page_title is None:
+                        phys_idx = item.get('physical_index')
+                        if isinstance(phys_idx, int):
+                            peer_start_page_title = phys_idx
+                else:
+                    filtered.append(item)
+            removed = original_count - len(filtered)
+            if removed > 0:
+                sub_structure = filtered
+                if self.debug:
+                    print(f"  [PEER-TITLE] Filtered {removed} items matching existing tree titles:")
+                    for t in removed_titles[:5]:
+                        print(f"    - '{t}'")
+                self.logger.info(f"[RECURSIVE] PEER-TITLE: filtered {removed} items matching existing titles: "
+                               f"{removed_titles[:5]}")
+                if peer_start_page_title and peer_start_page_title > start and peer_start_page_title - 1 < effective_end:
+                    effective_end = peer_start_page_title - 1
+                    node['end_index'] = effective_end
+                    if self.debug:
+                        print(f"  [PEER-TITLE] Trimmed node end: p{end} → p{effective_end}")
+                    self.logger.info(f"[RECURSIVE] PEER-TITLE: trimmed end p{end} → p{effective_end}")
+
+        if not sub_structure:
+            if self.debug:
+                print(f"  ⚠ No sub-structure after filtering")
+            return node
+
         # Verify sub-structure (limited to this node's pages)
         if self.debug:
             print(f"  [RECURSIVE] Verifying {len(sub_structure)} sub-items...")
-        
+
         # Calculate page offset: node_pages is a subset starting at global page 'start'
         page_offset = start - 1  # start is 1-indexed, offset is for 0-indexed array
-        
+
         verifier = Verifier(self.llm, debug=self.debug)  # Use same debug setting
         verified_sub, accuracy = await verifier.verify_structure(sub_structure, node_pages, page_offset)
-        
+
         if self.debug:
             print(f"  [RECURSIVE] Verification accuracy: {accuracy:.1%}")
-        
+        self.logger.info(f"[RECURSIVE] Verification accuracy: {accuracy:.1%}")
+
         # Fix incorrect items if needed
         if accuracy < 0.8:
             incorrect = [v for v in verified_sub if not v.get('verification_passed')]
@@ -1273,50 +1526,75 @@ class PageIndexV2:
                     print(f"  [RECURSIVE] Fixing {len(incorrect)} incorrect sub-items...")
                 fixed = await verifier.fix_incorrect_items(verified_sub, incorrect, node_pages, page_offset=page_offset)
                 verified_sub = fixed
-        
+
         # Build tree for sub-structure
+        # Use effective_end (possibly trimmed) for proper end_index calculation
         builder = TreeBuilder(debug=self.debug)  # Use same debug setting
-        sub_tree = builder.build_tree(verified_sub, node_pages)
-        
+        sub_tree = builder.build_tree(verified_sub, node_pages, total_pages=effective_end)
+
         if self.debug:
             print(f"  ✓ Extracted {len(sub_tree)} child nodes")
-        
-        # Handle title duplication: if first child has same title as parent, skip it
-        # This happens when LLM extracts the parent's title page as a separate child node
+        self.logger.info(f"[RECURSIVE] Built sub-tree: {len(sub_tree)} child nodes")
+        for i, child in enumerate(sub_tree[:10]):
+            self.logger.info(f"  child[{i}] '{child.get('title', '')[:40]}' "
+                           f"p{child.get('start_index')}-{child.get('end_index')}")
+
+        # === DEDUP: Handle title duplication with fuzzy matching ===
+        # When LLM extracts parent's title page as a separate child node,
+        # the first child matches the parent. We normalize titles (strip all
+        # whitespace) for fuzzy comparison to catch "第二章供应商须知" vs "第二章 供应商须知".
         if sub_tree and len(sub_tree) > 0:
-            parent_title = node.get('title', '').strip().lower()
-            first_child_title = sub_tree[0].get('title', '').strip().lower()
-            
-            # Case insensitive comparison for better matching
-            if parent_title and first_child_title and parent_title == first_child_title:
+            def _normalize_title_for_dedup(t):
+                return re.sub(r'\s+', '', t.strip()).lower()
+
+            parent_norm = _normalize_title_for_dedup(node.get('title', ''))
+            first_child_norm = _normalize_title_for_dedup(sub_tree[0].get('title', ''))
+
+            if parent_norm and first_child_norm and parent_norm == first_child_norm:
+                first_child = sub_tree[0]
+                grandchildren = first_child.get('nodes', [])
+
+                if grandchildren:
+                    # Promote grandchildren: the matching child's sub-structure
+                    # IS the parent's internal structure. Promote them.
+                    if self.debug:
+                        print(f"  [DEDUP] First child matches parent, promoting {len(grandchildren)} grandchildren")
+                    self.logger.info(f"[RECURSIVE] DEDUP: promoting {len(grandchildren)} grandchildren "
+                                   f"from matching first child '{first_child.get('title', '')[:40]}'")
+                    sub_tree = grandchildren + sub_tree[1:]
+                else:
+                    if self.debug:
+                        print(f"  [DEDUP] Removing duplicate child (no grandchildren): "
+                              f"'{first_child.get('title', '')[:50]}'")
+                    self.logger.info(f"[RECURSIVE] DEDUP: removing first child (matches parent title)")
+                    sub_tree = sub_tree[1:]
+
                 if self.debug:
-                    print(f"  [DEDUP] Removing duplicate child with same title as parent: '{sub_tree[0].get('title', '')[:50]}...'")
-                # Skip first child and use only remaining children
-                sub_tree = sub_tree[1:]
-                if self.debug:
-                    print(f"  [DEDUP] Remaining children: {len(sub_tree)}")
-        
-        # If no children remain after deduplication, don't attach empty list
+                    print(f"  [DEDUP] Children after dedup: {len(sub_tree)}")
+                self.logger.info(f"[RECURSIVE] DEDUP: {len(sub_tree)} children remain")
+
+        # If no children remain after dedup, keep as leaf
         if not sub_tree:
             if self.debug:
-                print(f"  [DEDUP] No children remain after deduplication, keeping node as leaf")
+                print(f"  [RESULT] No children remain, keeping node as leaf")
+            self.logger.info(f"[RECURSIVE] ⚠ No children remain, keeping '{node.get('title', '')[:50]}' as leaf")
             return node
-        
+
         # Attach sub-tree as children
         node['nodes'] = sub_tree
-        
+
         # Recursively process children with correct level context
         tasks = [
-            self._process_large_node_recursively(child, all_pages, parent_level=current_level)
+            self._process_large_node_recursively(child, all_pages, parent_level=current_level, existing_tree_titles=existing_tree_titles)
             for child in node['nodes']
         ]
         node['nodes'] = await asyncio.gather(*tasks)
-        
+
         # Update node's end_index to last child's end (parent contains all children)
         # Do this AFTER recursive processing, as children may have updated their end_index
         if node['nodes'] and node['nodes'][-1].get('end_index'):
             node['end_index'] = node['nodes'][-1]['end_index']
-        
+
         return node
 
 

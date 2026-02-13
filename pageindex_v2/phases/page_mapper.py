@@ -98,27 +98,93 @@ class PageMapper:
     ) -> List[Dict]:
         """
         Map when TOC has explicit page numbers
-        
-        Strategy: Smart validation with fallback
+
+        Strategy: Smart validation with offset detection
         1. Try direct mapping (TOC page = physical page)
         2. Validate: check if title appears on that page
-        3. If not found, search nearby pages (±1)
-        4. This handles both accurate TOCs and TOCs with offset
+        3. If validation rate is low (<50%), detect page offset by searching
+           for titles across all pages
+        4. Re-map with corrected offset
         """
         if self.debug:
             print(f"[MAP] TOC has page numbers, using smart validation")
-        
+
+        # First pass: try direct mapping
+        mapped, validated, not_found = self._validate_page_mapping(structure, pages, offset=0)
+
+        validation_rate = validated / len(structure) if structure else 0
+
+        if self.debug:
+            print(f"[MAP] Direct mapping validation: {validated}/{len(structure)} ({validation_rate*100:.1f}%)")
+
+        # If validation rate is low, try to detect page offset
+        if validation_rate < 0.5 and len(structure) > 0:
+            if self.debug:
+                print(f"[MAP] Low validation rate ({validation_rate*100:.0f}%), attempting offset detection...")
+
+            detected_offset = self._detect_page_offset(structure, pages)
+
+            if detected_offset != 0:
+                if self.debug:
+                    print(f"[MAP] Detected page offset: {detected_offset:+d}")
+                    print(f"[MAP] Re-mapping with offset correction...")
+
+                # Re-map with detected offset
+                new_mapped, new_validated, new_not_found = self._validate_page_mapping(
+                    structure, pages, offset=detected_offset
+                )
+
+                new_rate = new_validated / len(structure) if structure else 0
+                if self.debug:
+                    print(f"[MAP] After offset correction: {new_validated}/{len(structure)} ({new_rate*100:.1f}%)")
+
+                # Only apply offset if it actually improves validation rate
+                if new_validated > validated:
+                    mapped = new_mapped
+                    validated = new_validated
+                    not_found = new_not_found
+                    if self.debug:
+                        print(f"[MAP] Offset improved validation, applying offset {detected_offset:+d}")
+                else:
+                    if self.debug:
+                        print(f"[MAP] Offset did NOT improve validation ({new_validated} vs {validated}), keeping direct mapping")
+            else:
+                if self.debug:
+                    print(f"[MAP] Could not detect page offset")
+
+        if self.debug:
+            print(f"[MAP] Final validation results:")
+            print(f"  ✓ Validated: {validated}/{len(structure)} items ({validated/len(structure)*100:.1f}%)")
+            print(f"  ✗ Failed: {not_found} items ({not_found/len(structure)*100:.1f}%)")
+
+        return mapped
+
+    def _validate_page_mapping(
+        self,
+        structure: List[Dict],
+        pages: List,
+        offset: int = 0
+    ) -> tuple:
+        """
+        Validate TOC page numbers against physical pages with optional offset.
+
+        Args:
+            structure: TOC items with 'page' field
+            pages: PDFPage objects
+            offset: Page offset (physical_page = toc_page + offset)
+
+        Returns:
+            (mapped_items, validated_count, not_found_count)
+        """
         mapped = []
         validated = 0
-        corrected = 0
         not_found = 0
-        
+
         for item in structure:
             title = item.get('title', '').strip()
             toc_page = item.get('page')
-            
-            if not toc_page or toc_page < 1 or toc_page > len(pages):
-                # Invalid page number, use as-is
+
+            if not toc_page:
                 mapped.append({
                     'structure': item.get('structure'),
                     'title': title,
@@ -128,21 +194,43 @@ class PageMapper:
                 })
                 not_found += 1
                 continue
-            
-            # Try to find the title on the claimed page
-            page_text = pages[toc_page - 1].text if toc_page <= len(pages) else ""
-            
-            if title in page_text:
-                # Found on the claimed page!
+
+            physical_page = toc_page + offset
+
+            if physical_page < 1:
+                mapped.append({
+                    'structure': item.get('structure'),
+                    'title': title,
+                    'page': toc_page,
+                    'physical_index': None,
+                    'validation_passed': False
+                })
+                not_found += 1
+                continue
+
+            if physical_page > len(pages):
+                # Page beyond loaded range — still assign physical_index
+                # (will be verified later when remaining pages are loaded)
+                mapped.append({
+                    'structure': item.get('structure'),
+                    'title': title,
+                    'page': toc_page,
+                    'physical_index': f"<physical_index_{physical_page}>",
+                    'validation_passed': False
+                })
+                not_found += 1
+                continue
+
+            page_text = pages[physical_page - 1].text
+
+            # Use fuzzy matching: check if title (or significant substring) is in page
+            if self._title_in_page(title, page_text):
                 validated += 1
-                physical_page = toc_page
                 validation_passed = True
             else:
-                # Not found, mark as failed
-                physical_page = toc_page  # Still use TOC page
                 not_found += 1
                 validation_passed = False
-            
+
             mapped.append({
                 'structure': item.get('structure'),
                 'title': title,
@@ -150,13 +238,111 @@ class PageMapper:
                 'physical_index': f"<physical_index_{physical_page}>" if physical_page else None,
                 'validation_passed': validation_passed
             })
-        
+
+        return mapped, validated, not_found
+
+    def _title_in_page(self, title: str, page_text: str) -> bool:
+        """
+        Check if a title appears in page text with fuzzy matching.
+        Handles OCR artifacts like extra spaces, different whitespace, etc.
+        """
+        if not title or not page_text:
+            return False
+
+        # Direct match
+        if title in page_text:
+            return True
+
+        # Normalize whitespace for comparison (OCR often adds extra spaces)
+        import re
+        normalized_title = re.sub(r'\s+', '', title)
+        normalized_page = re.sub(r'\s+', '', page_text)
+
+        if normalized_title in normalized_page:
+            return True
+
+        # Try first 2000 chars of page with whitespace-insensitive comparison
+        page_start = page_text[:2000]
+        normalized_start = re.sub(r'\s+', '', page_start)
+
+        if normalized_title in normalized_start:
+            return True
+
+        return False
+
+    def _detect_page_offset(self, structure: List[Dict], pages: List) -> int:
+        """
+        Detect page offset by searching for TOC titles across all pages.
+
+        Strategy:
+        1. Identify TOC listing pages (pages that match 3+ titles) and skip them
+        2. For each title, find the content page where it appears as a heading
+        3. Calculate offset = found_physical_page - toc_page
+        4. Return most common offset (consensus)
+        """
+        import re
+        from collections import Counter
+
+        sample_items = structure[:min(5, len(structure))]
+        sample_titles = []
+        for item in sample_items:
+            title = item.get('title', '').strip()
+            if title:
+                sample_titles.append(re.sub(r'\s+', '', title))
+
+        if not sample_titles:
+            return 0
+
+        # Step 1: Identify TOC listing pages (pages matching 3+ sample titles)
+        # These are pages that list many titles (like a table of contents)
+        toc_pages = set()
+        for page_idx, page in enumerate(pages):
+            normalized_text = re.sub(r'\s+', '', page.text[:5000])
+            match_count = sum(1 for t in sample_titles if t in normalized_text)
+            if match_count >= 3:
+                toc_pages.add(page_idx)
+                if self.debug:
+                    print(f"  [OFFSET] Skipping page {page_idx + 1} (TOC listing page, "
+                          f"matches {match_count}/{len(sample_titles)} titles)")
+
+        # Step 2: Search for each title, skipping TOC listing pages
+        offsets = []
+        for item in sample_items:
+            title = item.get('title', '').strip()
+            toc_page = item.get('page')
+
+            if not title or not toc_page:
+                continue
+
+            normalized_title = re.sub(r'\s+', '', title)
+
+            for page_idx, page in enumerate(pages):
+                if page_idx in toc_pages:
+                    continue  # Skip TOC listing pages
+
+                physical_page = page_idx + 1
+                normalized_text = re.sub(r'\s+', '', page.text[:3000])
+
+                if normalized_title in normalized_text:
+                    offset = physical_page - toc_page
+                    offsets.append(offset)
+                    if self.debug:
+                        print(f"  [OFFSET] '{title[:30]}' found on page {physical_page} "
+                              f"(TOC page {toc_page}, offset={offset:+d})")
+                    break  # Found, move to next item
+
+        if not offsets:
+            return 0
+
+        # Step 3: Return most common offset (consensus)
+        counter = Counter(offsets)
+        best_offset, count = counter.most_common(1)[0]
+
         if self.debug:
-            print(f"[MAP] Validation results:")
-            print(f"  ✓ Validated: {validated}/{len(structure)} items ({validated/len(structure)*100:.1f}%)")
-            print(f"  ✗ Failed: {not_found} items ({not_found/len(structure)*100:.1f}%)")
-        
-        return mapped
+            print(f"  [OFFSET] Consensus offset: {best_offset:+d} "
+                  f"({count}/{len(offsets)} matches)")
+
+        return best_offset
     
     async def _map_without_page_numbers(
         self,

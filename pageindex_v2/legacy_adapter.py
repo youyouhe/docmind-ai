@@ -186,7 +186,7 @@ def _convert_old_opt_to_v2(opt: SimpleNamespace):
         model=model,
         max_depth=4,  # 新算法固定为4层
         toc_check_pages=getattr(opt, 'toc_check_page_num', 20),
-        debug=False,  # 关闭调试输出，避免干扰老系统日志
+        debug=getattr(opt, 'debug', False),  # 由调用方控制调试输出
         progress=True,  # 保持进度输出
         output_dir="./results",
         enable_recursive_processing=True,
@@ -420,55 +420,194 @@ def _add_node_ids(structure: list, node_id: int = 0, use_hierarchical: bool = Tr
         return node_id
 
 
+def _find_title_in_text(text: str, title: str) -> int:
+    """
+    在页面文本中查找标题位置，支持多种匹配策略。
+
+    策略优先级：
+    1. 精确匹配
+    2. 去除空白差异后匹配
+    3. 去除编号前缀后匹配核心内容
+    4. 标题前缀匹配（前8个有效字符）
+
+    Args:
+        text: 页面文本
+        title: 节点标题
+
+    Returns:
+        标题在文本中的起始位置，未找到返回 -1
+    """
+    import re
+
+    if not text or not title:
+        return -1
+
+    title = title.strip()
+
+    # 策略1：精确匹配
+    pos = text.find(title)
+    if pos >= 0:
+        return pos
+
+    # 策略2：规范化空白后匹配（将连续空白替换为单空格）
+    normalized_title = re.sub(r'\s+', ' ', title).strip()
+    if normalized_title != title:
+        pos = text.find(normalized_title)
+        if pos >= 0:
+            return pos
+
+    # 策略3：去除常见编号前缀后匹配核心内容
+    # 匹配：（一）、（二）、(1)、(2)、1.、1、第X章、第X节 等
+    core_patterns = [
+        r'^[（(]\s*[一二三四五六七八九十百零\d]+\s*[）)]\s*',  # （一）、(1)
+        r'^第[一二三四五六七八九十百零\d]+[章节部分条款]\s*',    # 第一章、第1节
+        r'^[一二三四五六七八九十]+\s*[、．.]\s*',              # 一、二、
+        r'^\d+\s*[、．.]\s*',                                 # 1、2.
+        r'^\d+(\.\d+)*\s+',                                   # 1.1 、1.1.1
+        r'^[A-Z]\s*[、．.]\s*',                                # A、B.
+    ]
+
+    for pattern in core_patterns:
+        core = re.sub(pattern, '', title).strip()
+        if core and len(core) >= 2 and core != title:
+            pos = text.find(core)
+            if pos >= 0:
+                # 回退查找：在 core 之前可能有编号前缀，向前搜索一行
+                line_start = text.rfind('\n', max(0, pos - 50), pos)
+                if line_start >= 0:
+                    return line_start + 1  # +1 跳过 \n
+                return max(0, pos - 30)  # 粗略回退到可能的行首
+
+    # 策略4：标题前缀匹配（取前8个有效字符）
+    if len(title) > 4:
+        prefix = title[:min(8, len(title))]
+        pos = text.find(prefix)
+        if pos >= 0:
+            return pos
+
+    return -1
+
+
+def _extract_section_text(
+    node_title: str,
+    next_sibling_title: str,
+    start_page: int,
+    end_page: int,
+    get_page_fn,
+    max_chars: int = 2000
+) -> str:
+    """
+    提取节点的段落级文本，在共享页面上根据标题位置切分。
+
+    Args:
+        node_title: 当前节点标题
+        next_sibling_title: 下一个兄弟节点标题（用于确定结束边界），可为 None
+        start_page: 起始页码（1-indexed）
+        end_page: 结束页码（1-indexed）
+        get_page_fn: 获取页面文本的函数 (page_num) -> str
+        max_chars: 最大字符数限制
+
+    Returns:
+        提取的文本内容
+    """
+    text_parts = []
+
+    for page_num in range(start_page, end_page + 1):
+        page_text = get_page_fn(page_num)
+        if not page_text:
+            continue
+
+        # 在起始页：从当前标题位置开始
+        if page_num == start_page and node_title:
+            title_pos = _find_title_in_text(page_text, node_title)
+            if title_pos > 0:
+                page_text = page_text[title_pos:]
+
+        # 在结束页：在下一个兄弟标题位置截断
+        if page_num == end_page and next_sibling_title:
+            next_pos = _find_title_in_text(page_text, next_sibling_title)
+            if next_pos > 0:
+                page_text = page_text[:next_pos]
+
+        stripped = page_text.strip()
+        if stripped:
+            text_parts.append(stripped)
+
+    full_text = "\n".join(text_parts)
+
+    # 截断到 max_chars
+    if len(full_text) > max_chars:
+        full_text = full_text[:max_chars]
+
+    return full_text
+
+
 def _add_node_text(structure: list, pdf_path: str):
     """
-    添加节点文本内容
-    
-    策略：
-    - 叶子节点：添加截断的内容（前500字符）
+    添加节点文本内容（段落级切分版本）
+
+    改进策略：
+    - 同页多节点：根据标题位置在页面文本内切分，每个节点只拿到自己的段落
+    - 跨页节点：起始页从标题处开始，结束页在下一节标题处截断
     - 父节点：不添加内容（使用 summary 替代）
-    
+    - 文本上限提升到 2000 字符
+
     Args:
         structure: 树结构
         pdf_path: PDF文件路径
     """
     import fitz  # PyMuPDF
-    
-    # 打开PDF
+
     doc = fitz.open(pdf_path)
-    
-    def extract_text_from_pages(start: int, end: int) -> str:
-        """提取指定页面范围的文本"""
-        text_parts = []
-        for page_num in range(start - 1, min(end, len(doc))):
-            if page_num >= 0:
-                page = doc[page_num]
-                text_parts.append(page.get_text())
-        return "\n".join(text_parts)
-    
-    def add_text_recursive(node):
-        """递归添加文本"""
-        has_children = 'nodes' in node and node['nodes']
-        
-        if not has_children:
-            # 叶子节点：添加文本
-            start = node.get('start_index', 1)
-            end = node.get('end_index', 1)
-            full_text = extract_text_from_pages(start, end)
-            # 截断到500字符
-            node['text'] = full_text[:500] if len(full_text) > 500 else full_text
-        else:
-            # 父节点：空文本
-            node['text'] = ""
-            
-            # 递归处理子节点
-            for child in node['nodes']:
-                add_text_recursive(child)
-    
-    # 处理所有根节点
-    for root in structure:
-        add_text_recursive(root)
-    
+
+    # 缓存页面文本，避免重复提取
+    page_cache = {}
+
+    def get_page_text(page_num: int) -> str:
+        """获取指定页码的文本（带缓存，1-indexed）"""
+        if page_num not in page_cache:
+            idx = page_num - 1
+            if 0 <= idx < len(doc):
+                page_cache[page_num] = doc[idx].get_text()
+            else:
+                page_cache[page_num] = ""
+        return page_cache[page_num]
+
+    def process_siblings(siblings: list):
+        """处理一组兄弟节点，利用兄弟信息做段落级切分"""
+        for i, node in enumerate(siblings):
+            has_children = 'nodes' in node and node['nodes']
+
+            if has_children:
+                # 父节点：空文本，递归处理子节点
+                node['text'] = ""
+                process_siblings(node['nodes'])
+            else:
+                # 叶子节点：提取段落级文本
+                start = node.get('start_index', 1)
+                end = node.get('end_index', start)
+
+                # 确定下一个兄弟节点的标题（用于结束边界检测）
+                next_sibling_title = None
+                if i + 1 < len(siblings):
+                    next_sib = siblings[i + 1]
+                    next_sib_start = next_sib.get('start_index', end + 1)
+                    # 只有当下一个兄弟的起始页在当前节点的结束页范围内时才需要切分
+                    if next_sib_start <= end:
+                        next_sibling_title = next_sib.get('title', '')
+
+                node['text'] = _extract_section_text(
+                    node_title=node.get('title', ''),
+                    next_sibling_title=next_sibling_title,
+                    start_page=start,
+                    end_page=end,
+                    get_page_fn=get_page_text,
+                    max_chars=2000
+                )
+
+    # 根节点本身就是一组兄弟
+    process_siblings(structure)
+
     doc.close()
 
 
@@ -499,19 +638,53 @@ async def _add_node_summaries(structure: list, model: str):
 
     llm = LLMClient(provider=provider, model=model, debug=False)
     
+    def _detect_language(text: str) -> str:
+        """检测文本主要语言：'zh' 或 'en'"""
+        import re
+        chinese_chars = len(re.findall(r'[\u4e00-\u9fff]', text[:500]))
+        total_alpha = len(re.findall(r'[a-zA-Z]', text[:500]))
+        return 'zh' if chinese_chars > total_alpha else 'en'
+
+    # 检测文档语言（取第一个有文本的叶子节点）
+    doc_lang = 'en'
+    def _find_first_text(nodes):
+        for n in nodes:
+            t = n.get('text', '')
+            if t and len(t.strip()) > 20:
+                return t
+            children = n.get('nodes', [])
+            if children:
+                result = _find_first_text(children)
+                if result:
+                    return result
+        return None
+
+    sample_text = _find_first_text(structure)
+    if sample_text:
+        doc_lang = _detect_language(sample_text)
+
     async def generate_summary(node):
         """为单个节点生成摘要"""
         text = node.get('text', '')
         title = node.get('title', '')
-        
+
         if not text or len(text.strip()) < 10:
             node['summary'] = ""
             return
-        
-        # 截断文本（避免token超限）
+
         truncated_text = text[:3000]
-        
-        prompt = f"""Summarize the following section from a document in 1-2 sentences.
+
+        if doc_lang == 'zh':
+            prompt = f"""请用1-2句中文概括以下章节的核心内容。
+
+章节标题：{title}
+
+内容：
+{truncated_text}
+
+请直接给出摘要，不要添加前缀。"""
+        else:
+            prompt = f"""Summarize the following section in 1-2 sentences.
 
 Section Title: {title}
 
@@ -519,7 +692,7 @@ Content:
 {truncated_text}
 
 Provide a concise summary that captures the main points."""
-        
+
         try:
             summary = await llm.chat(prompt)
             node['summary'] = summary.strip() if summary else ""

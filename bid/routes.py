@@ -8,17 +8,25 @@ Provides endpoints for:
 - Text rewriting
 """
 
+import asyncio
+import io
+import logging
 import os
+import sys
 import uuid
 import json
 from typing import List, Optional
 from datetime import datetime
 
 from fastapi import APIRouter, HTTPException, Depends
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 from api.database import get_db, DatabaseManager
 from api.services import LLMProvider
+from api.websocket_manager import manager
+
+logger = logging.getLogger(__name__)
 
 
 router = APIRouter(
@@ -88,112 +96,368 @@ class AutoSaveRequest(BaseModel):
     content: str
 
 
+class ExportRequest(BaseModel):
+    """Request to export a project as Word/PDF."""
+    format: str = "word"  # word or pdf
+    include_outline: bool = True
+    include_requirements: bool = False
+
+
+class GenerateOutlineRequest(BaseModel):
+    """Request to generate outline via multi-agent pipeline."""
+    tender_document_id: str
+    tender_document_tree: dict
+    title: str = "新投标项目"
+    user_requirements: Optional[str] = None
+    attachment_names: Optional[List[str]] = None
+
+
+class WriteContentRequest(BaseModel):
+    """Request to write section content via agents."""
+    section_ids: Optional[List[str]] = None  # None = all pending sections
+
+
+class ReviewRequest(BaseModel):
+    """Request to review bid document via agents."""
+    pass
+
+
 # =============================================================================
-# Storage
+# Agent-based Outline Generation
 # =============================================================================
 
-PROJECTS_DIR = os.path.join("data", "projects")
-os.makedirs(PROJECTS_DIR, exist_ok=True)
+@router.post("/outline/generate")
+async def generate_outline_via_agents(request: GenerateOutlineRequest) -> dict:
+    """Start the multi-agent outline generation pipeline.
 
-
-# =============================================================================
-# Project Endpoints
-# =============================================================================
-
-@router.post("/projects")
-async def create_project(
-    request: CreateProjectRequest,
-    db: DatabaseManager = Depends(get_db)
-) -> TenderProject:
-    """Create a new bid writing project."""
+    Creates a draft project, launches format-extractor → outline-planner
+    in the background, and returns immediately with the project ID.
+    The frontend should subscribe to WebSocket ``audit_progress`` and
+    ``status_update`` messages using the returned project ID.
+    """
+    db = get_db()
     project_id = f"project-{uuid.uuid4()}"
-    now = int(datetime.now().timestamp() * 1000)
 
-    project = TenderProject(
-        id=project_id,
+    # Create draft project (empty sections — agents will fill them)
+    db.create_bid_project(
+        project_id=project_id,
         title=request.title,
         tender_document_id=request.tender_document_id,
         tender_document_tree=request.tender_document_tree,
-        sections=request.sections,
-        status="draft",
-        version=1,
-        created_at=now,
-        updated_at=now
+        sections=[],
     )
 
-    # Save to file
-    project_path = os.path.join(PROJECTS_DIR, f"{project_id}.json")
-    with open(project_path, 'w', encoding='utf-8') as f:
-        json.dump(project.model_dump(), f, indent=2, ensure_ascii=False)
+    # Launch pipeline in background
+    asyncio.create_task(
+        _run_outline_pipeline_task(
+            project_id=project_id,
+            tender_document_id=request.tender_document_id,
+            tender_document_tree=request.tender_document_tree,
+            title=request.title,
+            user_requirements=request.user_requirements,
+            attachment_names=request.attachment_names,
+        )
+    )
 
-    return project
+    return {"project_id": project_id, "status": "started"}
+
+
+async def _run_outline_pipeline_task(
+    project_id: str,
+    tender_document_id: str,
+    tender_document_tree: dict,
+    title: str,
+    user_requirements: Optional[str] = None,
+    attachment_names: Optional[List[str]] = None,
+) -> None:
+    """Background task: run the agent pipeline and broadcast results via WS."""
+    # Ensure bid_agents is importable (repo root may not be on sys.path)
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    from bid_agents.outline_pipeline import run_outline_pipeline
+    logger.info("Outline pipeline task started for project %s", project_id)
+
+    api_url = f"http://localhost:{os.getenv('PORT', '8003')}"
+
+    async def progress_callback(phase: str, message: str) -> None:
+        phase_map = {"format_extraction": (1, 2), "outline_planning": (2, 2)}
+        phase_number, total_phases = phase_map.get(phase, (1, 2))
+        progress = (phase_number - 1) / total_phases * 100
+        await manager.broadcast_audit_progress(
+            document_id=project_id,
+            phase=phase,
+            phase_number=phase_number,
+            total_phases=total_phases,
+            message=message,
+            progress=progress,
+        )
+
+    try:
+        logger.info("[outline-task] Calling run_outline_pipeline for %s", project_id)
+        sections = await asyncio.wait_for(
+            run_outline_pipeline(
+                project_id=project_id,
+                api_url=api_url,
+                user_requirements=user_requirements,
+                attachment_names=attachment_names,
+                progress_callback=progress_callback,
+            ),
+            timeout=600,  # 10 min — each RAG query takes ~30s
+        )
+        logger.info("[outline-task] Pipeline complete! %d sections for %s", len(sections), project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="completed",
+            metadata={"outline": sections},
+        )
+    except asyncio.TimeoutError:
+        logger.error("[outline-task] Timed out for project %s", project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message="大纲生成超时（600秒）",
+        )
+    except Exception as e:
+        logger.exception("[outline-task] FAILED for project %s: %s", project_id, e)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+# =============================================================================
+# Agent-based Content Writing
+# =============================================================================
+
+@router.post("/projects/{project_id}/content/write")
+async def write_content_via_agents(project_id: str, request: WriteContentRequest) -> dict:
+    """Start the multi-agent content writing pipeline.
+
+    Launches writer agents (commercial / technical / pricing) in the background
+    to write section content.  Broadcasts progress via WebSocket.
+    """
+    db = get_db()
+    project = db.get_bid_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+    asyncio.create_task(
+        _run_content_pipeline_task(
+            project_id=project_id,
+            section_ids=request.section_ids,
+        )
+    )
+
+    return {"project_id": project_id, "status": "started"}
+
+
+async def _run_content_pipeline_task(
+    project_id: str,
+    section_ids: Optional[List[str]] = None,
+) -> None:
+    """Background task: run the content writing pipeline."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    from bid_agents.content_pipeline import run_content_pipeline
+
+    api_url = f"http://localhost:{os.getenv('PORT', '8003')}"
+
+    async def progress_callback(phase: str, message: str, current: int, total: int) -> None:
+        progress = current / total * 100 if total > 0 else 0
+        await manager.broadcast_audit_progress(
+            document_id=project_id,
+            phase=phase,
+            phase_number=current,
+            total_phases=total,
+            message=message,
+            progress=progress,
+        )
+
+    try:
+        result = await asyncio.wait_for(
+            run_content_pipeline(
+                project_id=project_id,
+                api_url=api_url,
+                section_ids=section_ids,
+                progress_callback=progress_callback,
+            ),
+            timeout=600,  # 10 min for writing multiple sections
+        )
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="completed",
+            metadata={
+                "pipeline": "content",
+                "written": result["written"],
+                "failed": result["failed"],
+                "sections": result["sections"],
+            },
+        )
+    except asyncio.TimeoutError:
+        logger.error("Content pipeline timed out for project %s", project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message="内容编写超时（600秒）",
+        )
+    except Exception as e:
+        logger.exception("Content pipeline failed for project %s", project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+# =============================================================================
+# Agent-based Review
+# =============================================================================
+
+@router.post("/projects/{project_id}/review")
+async def review_via_agents(project_id: str, request: ReviewRequest) -> dict:
+    """Start the review + compliance check pipeline.
+
+    Launches review-agent → compliance-checker in the background.
+    Broadcasts progress via WebSocket.
+    """
+    db = get_db()
+    project = db.get_bid_project(project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
+
+    asyncio.create_task(
+        _run_review_pipeline_task(project_id=project_id)
+    )
+
+    return {"project_id": project_id, "status": "started"}
+
+
+async def _run_review_pipeline_task(project_id: str) -> None:
+    """Background task: run the review pipeline."""
+    repo_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+
+    from bid_agents.review_pipeline import run_review_pipeline
+
+    api_url = f"http://localhost:{os.getenv('PORT', '8003')}"
+
+    async def progress_callback(phase: str, message: str) -> None:
+        phase_map = {"quality_review": (1, 2), "compliance_check": (2, 2)}
+        phase_number, total_phases = phase_map.get(phase, (1, 2))
+        progress = (phase_number - 1) / total_phases * 100
+        await manager.broadcast_audit_progress(
+            document_id=project_id,
+            phase=phase,
+            phase_number=phase_number,
+            total_phases=total_phases,
+            message=message,
+            progress=progress,
+        )
+
+    try:
+        result = await asyncio.wait_for(
+            run_review_pipeline(
+                project_id=project_id,
+                api_url=api_url,
+                progress_callback=progress_callback,
+            ),
+            timeout=300,  # 5 min for review
+        )
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="completed",
+            metadata={
+                "pipeline": "review",
+                "review_feedback": result["review_feedback"],
+                "compliance_matrix": result["compliance_matrix"],
+                "summary": result["summary"],
+            },
+        )
+    except asyncio.TimeoutError:
+        logger.error("Review pipeline timed out for project %s", project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message="审核超时（300秒）",
+        )
+    except Exception as e:
+        logger.exception("Review pipeline failed for project %s", project_id)
+        await manager.broadcast_status_update(
+            document_id=project_id,
+            status="failed",
+            error_message=str(e),
+        )
+
+
+# =============================================================================
+# Project Endpoints (Database-backed)
+# =============================================================================
+
+@router.post("/projects")
+async def create_project(request: CreateProjectRequest) -> dict:
+    """Create a new bid writing project."""
+    db = get_db()
+    project_id = f"project-{uuid.uuid4()}"
+
+    sections = [s.model_dump() for s in request.sections]
+    result = db.create_bid_project(
+        project_id=project_id,
+        title=request.title,
+        tender_document_id=request.tender_document_id,
+        tender_document_tree=request.tender_document_tree,
+        sections=sections,
+    )
+    return result
 
 
 @router.get("/projects")
-async def list_projects() -> List[TenderProject]:
+async def list_projects() -> list:
     """List all bid writing projects."""
-    projects = []
-
-    for filename in os.listdir(PROJECTS_DIR):
-        if filename.endswith(".json"):
-            project_path = os.path.join(PROJECTS_DIR, filename)
-            try:
-                with open(project_path, 'r', encoding='utf-8') as f:
-                    project_data = json.load(f)
-                    projects.append(TenderProject(**project_data))
-            except Exception as e:
-                print(f"Error loading project {filename}: {e}")
-
-    # Sort by updated_at descending
-    projects.sort(key=lambda p: p.updated_at, reverse=True)
-    return projects
+    db = get_db()
+    return db.list_bid_projects()
 
 
 @router.get("/projects/{project_id}")
-async def get_project(project_id: str) -> TenderProject:
+async def get_project(project_id: str) -> dict:
     """Get a specific bid writing project."""
-    project_path = os.path.join(PROJECTS_DIR, f"{project_id}.json")
-
-    if not os.path.exists(project_path):
+    db = get_db()
+    project = db.get_bid_project(project_id)
+    if not project:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
-
-    with open(project_path, 'r', encoding='utf-8') as f:
-        project_data = json.load(f)
-        return TenderProject(**project_data)
+    return project
 
 
 @router.put("/projects/{project_id}")
-async def update_project(project_id: str, request: TenderProject) -> TenderProject:
+async def update_project(project_id: str, request: TenderProject) -> dict:
     """Update a bid writing project."""
-    project_path = os.path.join(PROJECTS_DIR, f"{project_id}.json")
-
-    if not os.path.exists(project_path):
+    db = get_db()
+    sections = [s.model_dump() for s in request.sections]
+    result = db.update_bid_project(
+        project_id=project_id,
+        title=request.title,
+        status=request.status,
+        sections=sections,
+        tender_document_tree=request.tender_document_tree,
+    )
+    if not result:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
-
-    # Update timestamp
-    request.updated_at = int(datetime.now().timestamp() * 1000)
-
-    # Save to file
-    with open(project_path, 'w', encoding='utf-8') as f:
-        json.dump(request.model_dump(), f, indent=2, ensure_ascii=False)
-
-    return request
+    return result
 
 
 @router.delete("/projects/{project_id}")
 async def delete_project(project_id: str) -> dict:
     """Delete a bid writing project."""
-    project_path = os.path.join(PROJECTS_DIR, f"{project_id}.json")
-
-    if not os.path.exists(project_path):
+    db = get_db()
+    deleted = db.delete_bid_project(project_id)
+    if not deleted:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
-
-    os.remove(project_path)
-
-    return {
-        "id": project_id,
-        "deleted": True
-    }
+    return {"id": project_id, "deleted": True}
 
 
 @router.post("/projects/{project_id}/sections/{section_id}/auto-save")
@@ -203,39 +467,134 @@ async def auto_save_section(
     request: AutoSaveRequest
 ) -> dict:
     """Auto-save a section's content."""
-    project_path = os.path.join(PROJECTS_DIR, f"{project_id}.json")
+    db = get_db()
+    updated_at = db.auto_save_bid_section(project_id, section_id, request.content)
+    if updated_at is None:
+        raise HTTPException(status_code=404, detail=f"Project or section not found")
+    return {"success": True, "saved_at": updated_at}
 
-    if not os.path.exists(project_path):
+
+# =============================================================================
+# Export Endpoint
+# =============================================================================
+
+@router.post("/projects/{project_id}/export")
+async def export_project(project_id: str, request: ExportRequest):
+    """Export a bid writing project as Word document."""
+    db = get_db()
+    project_data = db.get_bid_project(project_id)
+    if not project_data:
         raise HTTPException(status_code=404, detail=f"Project not found: {project_id}")
 
-    # Load project
-    with open(project_path, 'r', encoding='utf-8') as f:
-        project_data = json.load(f)
-        project = TenderProject(**project_data)
+    project = TenderProject(**project_data)
 
-    # Find and update section
-    section_found = False
-    for section in project.sections:
-        if section.id == section_id:
-            section.content = request.content
-            section.word_count = len(request.content)
-            section_found = True
-            break
+    if request.format == "word":
+        return _export_to_word(project, request)
+    else:
+        raise HTTPException(status_code=400, detail=f"Unsupported export format: {request.format}. Currently only 'word' is supported.")
 
-    if not section_found:
-        raise HTTPException(status_code=404, detail=f"Section not found: {section_id}")
 
-    # Update project timestamp
-    project.updated_at = int(datetime.now().timestamp() * 1000)
+def _export_to_word(project: TenderProject, request: ExportRequest) -> StreamingResponse:
+    """Generate a Word document from the project."""
+    from docx import Document
+    from docx.shared import Pt, Cm, RGBColor
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
 
-    # Save to file
-    with open(project_path, 'w', encoding='utf-8') as f:
-        json.dump(project.model_dump(), f, indent=2, ensure_ascii=False)
+    doc = Document()
 
-    return {
-        "success": True,
-        "saved_at": project.updated_at
-    }
+    # Page margins
+    for section in doc.sections:
+        section.top_margin = Cm(2.5)
+        section.bottom_margin = Cm(2.5)
+        section.left_margin = Cm(3)
+        section.right_margin = Cm(2.5)
+
+    # Title page
+    doc.add_paragraph()  # spacing
+    doc.add_paragraph()
+    title = doc.add_paragraph()
+    title.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = title.add_run(project.title)
+    run.font.size = Pt(22)
+    run.font.bold = True
+    run.font.color.rgb = RGBColor(0, 0, 0)
+
+    # Subtitle with date
+    subtitle = doc.add_paragraph()
+    subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = subtitle.add_run(datetime.fromtimestamp(project.created_at / 1000).strftime('%Y年%m月%d日'))
+    run.font.size = Pt(12)
+    run.font.color.rgb = RGBColor(128, 128, 128)
+
+    doc.add_page_break()
+
+    # Table of Contents (outline)
+    if request.include_outline:
+        toc_heading = doc.add_heading('目录', level=1)
+        toc_heading.runs[0].font.size = Pt(16)
+
+        for i, section in enumerate(sorted(project.sections, key=lambda s: s.order)):
+            toc_para = doc.add_paragraph()
+            toc_para.paragraph_format.space_after = Pt(4)
+            run = toc_para.add_run(f"{i + 1}. {section.title}")
+            run.font.size = Pt(11)
+            if section.status == "completed":
+                run.font.color.rgb = RGBColor(0, 0, 0)
+            else:
+                run.font.color.rgb = RGBColor(180, 180, 180)
+
+        doc.add_page_break()
+
+    # Section content
+    for i, section in enumerate(sorted(project.sections, key=lambda s: s.order)):
+        # Section heading
+        heading = doc.add_heading(f"{i + 1}. {section.title}", level=1)
+        heading.runs[0].font.size = Pt(16)
+
+        # Requirement references
+        if request.include_requirements and section.summary:
+            req_para = doc.add_paragraph()
+            req_para.paragraph_format.space_after = Pt(8)
+            run = req_para.add_run(f"【招标要求摘要】{section.summary}")
+            run.font.size = Pt(9)
+            run.font.italic = True
+            run.font.color.rgb = RGBColor(100, 100, 100)
+
+        # Section body
+        if section.content.strip():
+            for paragraph_text in section.content.split('\n'):
+                if not paragraph_text.strip():
+                    doc.add_paragraph()
+                    continue
+
+                # Handle markdown-like headers in content
+                if paragraph_text.startswith('### '):
+                    h = doc.add_heading(paragraph_text[4:], level=3)
+                    h.runs[0].font.size = Pt(12)
+                elif paragraph_text.startswith('## '):
+                    h = doc.add_heading(paragraph_text[3:], level=2)
+                    h.runs[0].font.size = Pt(14)
+                else:
+                    p = doc.add_paragraph(paragraph_text)
+                    p.paragraph_format.line_spacing = Pt(22)
+                    for run in p.runs:
+                        run.font.size = Pt(11)
+        else:
+            p = doc.add_paragraph('（此章节尚未编写）')
+            p.runs[0].font.color.rgb = RGBColor(180, 180, 180)
+            p.runs[0].font.italic = True
+
+    # Save to buffer
+    buffer = io.BytesIO()
+    doc.save(buffer)
+    buffer.seek(0)
+
+    filename = f"{project.title}.docx"
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"}
+    )
 
 
 # =============================================================================

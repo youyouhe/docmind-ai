@@ -379,6 +379,24 @@ class StorageService:
     # File Download
     # -------------------------------------------------------------------------
 
+    def _safe_resolve(self, relative_path: str) -> Path:
+        """
+        Resolve a relative path safely, preventing path traversal attacks.
+
+        Args:
+            relative_path: Relative path from data directory
+
+        Returns:
+            Resolved absolute file path
+
+        Raises:
+            ValueError: If path traversal is detected
+        """
+        full_path = (self.data_dir / relative_path).resolve()
+        if not str(full_path).startswith(str(self.data_dir.resolve())):
+            raise ValueError(f"Path traversal detected: {relative_path}")
+        return full_path
+
     def get_upload_path(self, relative_path: str) -> Path:
         """
         Get absolute path for uploaded file.
@@ -388,8 +406,11 @@ class StorageService:
 
         Returns:
             Absolute file path
+
+        Raises:
+            ValueError: If path traversal is detected
         """
-        return self.data_dir / relative_path
+        return self._safe_resolve(relative_path)
 
     def file_exists(self, relative_path: str) -> bool:
         """
@@ -401,11 +422,15 @@ class StorageService:
         Returns:
             True if file exists
         """
-        return (self.data_dir / relative_path).exists()
+        try:
+            return self._safe_resolve(relative_path).exists()
+        except ValueError:
+            return False
 
     def get_pdf_pages(self, file_path: str, page_start: int, page_end: int) -> list:
         """
         Extract text content from specific pages of a PDF file.
+        Falls back to OCR cache for scanned pages with little/no text.
 
         Args:
             file_path: Path to the PDF file
@@ -423,10 +448,28 @@ class StorageService:
         for page_num in range(page_start - 1, min(page_end, len(doc))):
             page = doc[page_num]
             page_text = page.get_text("text")
+
+            # For scanned pages with little text, try OCR cache
+            if len(page_text.strip()) < 50:
+                ocr_text = self._get_ocr_cached_text(file_path, page_num + 1)
+                if ocr_text:
+                    page_text = ocr_text
+
             pages.append((page_num + 1, page_text))
 
         doc.close()
         return pages
+
+    def _get_ocr_cached_text(self, file_path: str, page_number: int):
+        """Try to load OCR cached text for a page. Returns None if not cached."""
+        try:
+            from api.ocr_client import OCRClient
+            client = OCRClient()
+            if client.has_cached_ocr(file_path):
+                return client._get_cached_page(file_path, page_number)
+        except Exception:
+            pass
+        return None
 
     # -------------------------------------------------------------------------
     # Cleanup
@@ -469,5 +512,17 @@ class StorageService:
             debug_log_path.unlink()
             results["debug_log_deleted"] = True
             logger.info(f"Deleted debug log file: {debug_log_path.name}")
+
+        # Delete OCR cache for the document's PDF
+        try:
+            from api.ocr_client import OCRClient
+            for ext in [".pdf"]:
+                pdf_path = self.uploads_dir / f"{document_id}{ext}"
+                if pdf_path.exists():
+                    client = OCRClient()
+                    client.clear_cache(str(pdf_path))
+                    logger.info(f"Cleared OCR cache for: {pdf_path.name}")
+        except Exception:
+            pass
 
         return results

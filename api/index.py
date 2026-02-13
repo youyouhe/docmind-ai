@@ -69,6 +69,9 @@ from api.database import init_database, get_db
 from api.storage import StorageService
 from api.document_routes import router as document_router, initialize_services
 from api.audit_routes import router as audit_router
+from api.timeline_routes import router as timeline_router
+from api.ocr_routes import router as ocr_router
+from api.document_set_routes import router as document_set_router
 
 # Initialize global storage service
 storage_service = StorageService()
@@ -175,9 +178,13 @@ class RequestDebugMiddleware(BaseHTTPMiddleware):
 
 
 # CORS middleware
+_allowed_origins = os.getenv("ALLOWED_ORIGINS", "").strip()
+_cors_origins = [o.strip() for o in _allowed_origins.split(",") if o.strip()] if _allowed_origins else ["*"]
+logger.info(f"CORS allowed origins: {_cors_origins}")
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all origins in development
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -194,6 +201,15 @@ app.include_router(audit_router)
 
 # Include WebSocket router for real-time status updates
 app.include_router(websocket_router)
+
+# Include timeline management router
+app.include_router(timeline_router)
+
+# Include OCR extraction router
+app.include_router(ocr_router)
+
+# Include document set management router
+app.include_router(document_set_router)
 
 # Include bid writing extension (if available)
 if BID_EXTENSION_AVAILABLE:
@@ -459,8 +475,10 @@ async def parse_markdown(
             llm_provider=llm_provider,
         )
 
-        # Convert to API format
-        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+        # Convert to API format (use original filename as root title)
+        import os as _os
+        md_doc_title = _os.path.splitext(file.filename)[0] if file.filename else None
+        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree, doc_title=md_doc_title)
 
         # Calculate statistics
         stats_dict = ParseService.calculate_tree_stats(api_tree)
@@ -557,8 +575,10 @@ async def parse_pdf(
             llm_provider=llm_provider,
         )
 
-        # Convert to API format
-        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree)
+        # Convert to API format (use original filename as root title)
+        import os as _os
+        pdf_doc_title = _os.path.splitext(file.filename)[0] if file.filename else None
+        api_tree = ParseService.convert_page_index_to_api_format(page_index_tree, doc_title=pdf_doc_title)
 
         # Calculate statistics
         stats_dict = ParseService.calculate_tree_stats(api_tree)
@@ -632,6 +652,7 @@ async def chat(request: ChatRequest) -> ChatResponse:
             tree=tree_dict,
             history=history_dict,
             max_source_nodes=8,
+            document_id=request.document_id,
         )
 
         return ChatResponse(**result)

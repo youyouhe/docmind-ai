@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, List, Dict, Any
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, Column, String, Integer, Text, DateTime, ForeignKey, JSON, Boolean
+from sqlalchemy import create_engine, Column, String, Integer, Float, Text, DateTime, ForeignKey, JSON, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
@@ -387,6 +387,166 @@ class AuditBackup(Base):
         }
 
 
+class ProjectTimeline(Base):
+    """
+    Project timeline table - stores timeline entries extracted from documents.
+    Each entry represents a project/document with key dates for Gantt visualization.
+    """
+    __tablename__ = "project_timelines"
+
+    id = Column(String, primary_key=True)  # UUID v4
+    document_id = Column(String, ForeignKey("documents.id", ondelete="CASCADE"), nullable=False)
+    project_name = Column(String, nullable=False)
+    start_date = Column(String, nullable=True)  # ISO date string YYYY-MM-DD
+    end_date = Column(String, nullable=True)  # ISO date string YYYY-MM-DD
+    milestones = Column(Text, nullable=True)  # JSON: list of {name, date, type}
+    budget = Column(Float, nullable=True)  # Budget/price in yuan (万元)
+    budget_unit = Column(String, nullable=True, default="万元")  # Budget unit
+    notes = Column(Text, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    # Relationship
+    document = relationship("Document")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        milestones_list = []
+        if self.milestones:
+            try:
+                milestones_list = json.loads(self.milestones)
+            except:
+                milestones_list = []
+        return {
+            "id": self.id,
+            "document_id": self.document_id,
+            "project_name": self.project_name,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "milestones": milestones_list,
+            "budget": self.budget,
+            "budget_unit": self.budget_unit or "万元",
+            "notes": self.notes,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
+class BidProject(Base):
+    """
+    Bid writing project table - stores tender bid document projects.
+    """
+    __tablename__ = "bid_projects"
+
+    id = Column(String, primary_key=True)  # project-{uuid}
+    title = Column(String, nullable=False)
+    tender_document_id = Column(String, nullable=False)  # Associated document ID
+    tender_document_tree = Column(Text, nullable=True)  # JSON: full tree structure
+    status = Column(String, nullable=False, default="draft")  # draft/review/completed
+    version = Column(Integer, nullable=False, default=1)
+    created_at = Column(Integer, nullable=False)  # Millisecond timestamp
+    updated_at = Column(Integer, nullable=False)  # Millisecond timestamp
+
+    # Relationship
+    sections = relationship("BidSection", back_populates="project", cascade="all, delete-orphan")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        tree = None
+        if self.tender_document_tree:
+            try:
+                tree = json.loads(self.tender_document_tree)
+            except Exception:
+                tree = {}
+        return {
+            "id": self.id,
+            "title": self.title,
+            "tender_document_id": self.tender_document_id,
+            "tender_document_tree": tree or {},
+            "sections": [s.to_dict() for s in self.sections] if self.sections else [],
+            "status": self.status,
+            "version": self.version,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+class BidSection(Base):
+    """
+    Bid section table - stores individual sections of a bid project.
+    """
+    __tablename__ = "bid_sections"
+
+    id = Column(String, primary_key=True)  # section-{uuid}
+    project_id = Column(String, ForeignKey("bid_projects.id", ondelete="CASCADE"), nullable=False)
+    title = Column(String, nullable=False)
+    content = Column(Text, nullable=True, default="")
+    summary = Column(Text, nullable=True, default="")
+    requirement_references = Column(Text, nullable=True)  # JSON: list of strings
+    status = Column(String, nullable=False, default="pending")  # pending/in_progress/completed
+    order = Column(Integer, nullable=False, default=0)
+    word_count = Column(Integer, nullable=False, default=0)
+
+    # Relationship
+    project = relationship("BidProject", back_populates="sections")
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        refs = []
+        if self.requirement_references:
+            try:
+                refs = json.loads(self.requirement_references)
+            except Exception:
+                refs = []
+        return {
+            "id": self.id,
+            "title": self.title,
+            "content": self.content or "",
+            "summary": self.summary or "",
+            "requirement_references": refs,
+            "status": self.status,
+            "order": self.order,
+            "word_count": self.word_count,
+        }
+
+
+class DocumentSet(Base):
+    """
+    Document set table - stores document collections for cross-document operations.
+    """
+    __tablename__ = "document_sets"
+
+    id = Column(String, primary_key=True)  # UUID v4
+    name = Column(String, nullable=False)
+    description = Column(Text, nullable=True)
+    project_id = Column(String, nullable=True)  # Optional associated project ID
+    items = Column(Text, nullable=False, default="[]")  # JSON: list of DocumentSetItem
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert model to dictionary."""
+        import json
+        items_list = []
+        if self.items:
+            try:
+                items_list = json.loads(self.items)
+            except:
+                items_list = []
+        return {
+            "id": self.id,
+            "name": self.name,
+            "description": self.description,
+            "project_id": self.project_id,
+            "items": items_list,
+            "created_at": self.created_at.isoformat() if self.created_at else None,
+            "updated_at": self.updated_at.isoformat() if self.updated_at else None,
+        }
+
+
 # =============================================================================
 # Database Manager
 # =============================================================================
@@ -537,6 +697,93 @@ class DatabaseManager:
                 """))
                 conn.commit()
                 print("[Migration] Done: audit_backups table created")
+
+            # Migration 7: Create project_timelines table if missing
+            if 'project_timelines' not in tables:
+                print("[Migration] Creating project_timelines table...")
+                conn.execute(text("""
+                    CREATE TABLE project_timelines (
+                        id VARCHAR PRIMARY KEY,
+                        document_id VARCHAR NOT NULL,
+                        project_name VARCHAR NOT NULL,
+                        start_date VARCHAR,
+                        end_date VARCHAR,
+                        milestones TEXT,
+                        budget FLOAT,
+                        budget_unit VARCHAR DEFAULT '万元',
+                        notes TEXT,
+                        created_at TIMESTAMP NOT NULL,
+                        updated_at TIMESTAMP NOT NULL,
+                        FOREIGN KEY (document_id) REFERENCES documents(id) ON DELETE CASCADE
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: project_timelines table created")
+            else:
+                # Migration 7b: Add budget columns to project_timelines if missing
+                result = conn.execute(text("PRAGMA table_info(project_timelines)"))
+                columns = [row[1] for row in result.fetchall()]
+                if 'budget' not in columns:
+                    print("[Migration] Adding budget columns to project_timelines...")
+                    conn.execute(text("ALTER TABLE project_timelines ADD COLUMN budget FLOAT"))
+                    conn.execute(text("ALTER TABLE project_timelines ADD COLUMN budget_unit VARCHAR DEFAULT '万元'"))
+                    conn.commit()
+                    print("[Migration] Done: budget columns added")
+
+            # Migration 8: Create bid_projects table if missing
+            if 'bid_projects' not in tables:
+                print("[Migration] Creating bid_projects table...")
+                conn.execute(text("""
+                    CREATE TABLE bid_projects (
+                        id VARCHAR PRIMARY KEY,
+                        title VARCHAR NOT NULL,
+                        tender_document_id VARCHAR NOT NULL,
+                        tender_document_tree TEXT,
+                        status VARCHAR NOT NULL DEFAULT 'draft',
+                        version INTEGER NOT NULL DEFAULT 1,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: bid_projects table created")
+
+            # Migration 9: Create bid_sections table if missing
+            if 'bid_sections' not in tables:
+                print("[Migration] Creating bid_sections table...")
+                conn.execute(text("""
+                    CREATE TABLE bid_sections (
+                        id VARCHAR PRIMARY KEY,
+                        project_id VARCHAR NOT NULL,
+                        title VARCHAR NOT NULL,
+                        content TEXT DEFAULT '',
+                        summary TEXT DEFAULT '',
+                        requirement_references TEXT,
+                        status VARCHAR NOT NULL DEFAULT 'pending',
+                        "order" INTEGER NOT NULL DEFAULT 0,
+                        word_count INTEGER NOT NULL DEFAULT 0,
+                        FOREIGN KEY (project_id) REFERENCES bid_projects(id) ON DELETE CASCADE
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: bid_sections table created")
+
+            # Migration 10: Create document_sets table if missing
+            if 'document_sets' not in tables:
+                print("[Migration] Creating document_sets table...")
+                conn.execute(text("""
+                    CREATE TABLE document_sets (
+                        id VARCHAR PRIMARY KEY,
+                        name VARCHAR NOT NULL,
+                        description TEXT,
+                        project_id VARCHAR,
+                        items TEXT NOT NULL DEFAULT '[]',
+                        created_at TIMESTAMP NOT NULL,
+                        updated_at TIMESTAMP NOT NULL
+                    )
+                """))
+                conn.commit()
+                print("[Migration] Done: document_sets table created")
 
     def drop_all(self):
         """Drop all tables (use with caution!)."""
@@ -1629,13 +1876,13 @@ class DatabaseManager:
     def delete_audit_backups_by_document(self, doc_id: str) -> int:
         """
         Delete all audit backup records for a document.
-        
+
         NOTE: This only deletes database records. Files should be deleted separately
         via storage.delete_all_document_data().
-        
+
         Args:
             doc_id: Document ID
-            
+
         Returns:
             Number of backup records deleted
         """
@@ -1646,6 +1893,573 @@ class DatabaseManager:
             session.commit()
             logger.info(f"Deleted {count} audit backup records for document {doc_id}")
             return count
+
+    # -------------------------------------------------------------------------
+    # Project Timeline Operations
+    # -------------------------------------------------------------------------
+
+    def create_timeline_entry(
+        self,
+        entry_id: str,
+        document_id: str,
+        project_name: str,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None,
+        milestones: Optional[List[Dict[str, Any]]] = None,
+        budget: Optional[float] = None,
+        budget_unit: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a new project timeline entry.
+
+        Args:
+            entry_id: Unique entry ID (UUID)
+            document_id: Associated document ID
+            project_name: Project name
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD)
+            milestones: List of milestone dicts {name, date, type}
+            budget: Budget amount
+            budget_unit: Budget unit (default: 万元)
+            notes: Optional notes
+
+        Returns:
+            Timeline entry as dictionary
+        """
+        import json
+
+        with self.get_session() as session:
+            entry = ProjectTimeline(
+                id=entry_id,
+                document_id=document_id,
+                project_name=project_name,
+                start_date=start_date,
+                end_date=end_date,
+                milestones=json.dumps(milestones, ensure_ascii=False) if milestones else None,
+                budget=budget,
+                budget_unit=budget_unit or "万元",
+                notes=notes,
+            )
+            session.add(entry)
+            session.commit()
+            session.refresh(entry)
+            return entry.to_dict()
+
+    def get_timeline_entry(self, entry_id: str) -> Optional[Dict[str, Any]]:
+        """Get a timeline entry by ID."""
+        with self.get_session() as session:
+            entry = session.query(ProjectTimeline).filter(
+                ProjectTimeline.id == entry_id
+            ).first()
+            return entry.to_dict() if entry else None
+
+    def get_timeline_entries(self, document_id: Optional[str] = None) -> List[Dict[str, Any]]:
+        """
+        Get all timeline entries, optionally filtered by document.
+
+        Args:
+            document_id: Optional document ID filter
+
+        Returns:
+            List of timeline entry dictionaries
+        """
+        with self.get_session() as session:
+            query = session.query(ProjectTimeline)
+            if document_id:
+                query = query.filter(ProjectTimeline.document_id == document_id)
+            entries = query.order_by(ProjectTimeline.start_date.asc()).all()
+            return [e.to_dict() for e in entries]
+
+    def update_timeline_entry(self, entry_id: str, **kwargs) -> Optional[Dict[str, Any]]:
+        """
+        Update a timeline entry.
+
+        Args:
+            entry_id: Entry ID
+            **kwargs: Fields to update (project_name, start_date, end_date, milestones, notes)
+
+        Returns:
+            Updated entry as dictionary or None if not found
+        """
+        import json
+
+        with self.get_session() as session:
+            entry = session.query(ProjectTimeline).filter(
+                ProjectTimeline.id == entry_id
+            ).first()
+            if not entry:
+                return None
+            for key, value in kwargs.items():
+                if key == 'milestones' and isinstance(value, list):
+                    setattr(entry, key, json.dumps(value, ensure_ascii=False))
+                elif hasattr(entry, key):
+                    setattr(entry, key, value)
+            entry.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(entry)
+            return entry.to_dict()
+
+    def delete_timeline_entry(self, entry_id: str) -> bool:
+        """
+        Delete a timeline entry.
+
+        Args:
+            entry_id: Entry ID
+
+        Returns:
+            True if deleted, False if not found
+        """
+        with self.get_session() as session:
+            entry = session.query(ProjectTimeline).filter(
+                ProjectTimeline.id == entry_id
+            ).first()
+            if not entry:
+                return False
+            session.delete(entry)
+            session.commit()
+            return True
+
+    # -------------------------------------------------------------------------
+    # Bid Project Operations
+    # -------------------------------------------------------------------------
+
+    def create_bid_project(
+        self,
+        project_id: str,
+        title: str,
+        tender_document_id: str,
+        tender_document_tree: Optional[Dict[str, Any]] = None,
+        sections: Optional[List[Dict[str, Any]]] = None,
+        status: str = "draft",
+        created_at: Optional[int] = None,
+        updated_at: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Create a new bid writing project with sections."""
+        import json
+        from datetime import datetime as dt
+
+        now = created_at or int(dt.now().timestamp() * 1000)
+
+        with self.get_session() as session:
+            project = BidProject(
+                id=project_id,
+                title=title,
+                tender_document_id=tender_document_id,
+                tender_document_tree=json.dumps(tender_document_tree, ensure_ascii=False) if tender_document_tree else None,
+                status=status,
+                version=1,
+                created_at=now,
+                updated_at=updated_at or now,
+            )
+            session.add(project)
+            session.flush()
+
+            # Add sections
+            if sections:
+                for s in sections:
+                    section = BidSection(
+                        id=s["id"],
+                        project_id=project_id,
+                        title=s["title"],
+                        content=s.get("content", ""),
+                        summary=s.get("summary", ""),
+                        requirement_references=json.dumps(s.get("requirement_references", []), ensure_ascii=False),
+                        status=s.get("status", "pending"),
+                        order=s.get("order", 0),
+                        word_count=s.get("word_count", len(s.get("content", ""))),
+                    )
+                    session.add(section)
+
+            session.commit()
+            session.refresh(project)
+            return project.to_dict()
+
+    def get_bid_project(self, project_id: str) -> Optional[Dict[str, Any]]:
+        """Get a bid project by ID."""
+        with self.get_session() as session:
+            project = session.query(BidProject).filter(
+                BidProject.id == project_id
+            ).first()
+            return project.to_dict() if project else None
+
+    def list_bid_projects(self) -> List[Dict[str, Any]]:
+        """List all bid projects, sorted by updated_at descending."""
+        with self.get_session() as session:
+            projects = session.query(BidProject).order_by(
+                BidProject.updated_at.desc()
+            ).all()
+            return [p.to_dict() for p in projects]
+
+    def update_bid_project(
+        self,
+        project_id: str,
+        title: Optional[str] = None,
+        status: Optional[str] = None,
+        sections: Optional[List[Dict[str, Any]]] = None,
+        tender_document_tree: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Update a bid project and optionally replace all sections."""
+        import json
+        from datetime import datetime as dt
+
+        with self.get_session() as session:
+            project = session.query(BidProject).filter(
+                BidProject.id == project_id
+            ).first()
+            if not project:
+                return None
+
+            if title is not None:
+                project.title = title
+            if status is not None:
+                project.status = status
+            if tender_document_tree is not None:
+                project.tender_document_tree = json.dumps(tender_document_tree, ensure_ascii=False)
+            project.updated_at = int(dt.now().timestamp() * 1000)
+
+            # Replace sections if provided
+            if sections is not None:
+                # Delete existing sections
+                session.query(BidSection).filter(
+                    BidSection.project_id == project_id
+                ).delete()
+
+                for s in sections:
+                    section = BidSection(
+                        id=s["id"],
+                        project_id=project_id,
+                        title=s["title"],
+                        content=s.get("content", ""),
+                        summary=s.get("summary", ""),
+                        requirement_references=json.dumps(s.get("requirement_references", []), ensure_ascii=False),
+                        status=s.get("status", "pending"),
+                        order=s.get("order", 0),
+                        word_count=s.get("word_count", len(s.get("content", ""))),
+                    )
+                    session.add(section)
+
+            session.commit()
+            session.refresh(project)
+            return project.to_dict()
+
+    def delete_bid_project(self, project_id: str) -> bool:
+        """Delete a bid project and all its sections."""
+        with self.get_session() as session:
+            project = session.query(BidProject).filter(
+                BidProject.id == project_id
+            ).first()
+            if not project:
+                return False
+            session.delete(project)
+            session.commit()
+            return True
+
+    def auto_save_bid_section(
+        self,
+        project_id: str,
+        section_id: str,
+        content: str,
+    ) -> Optional[int]:
+        """Auto-save a section's content. Returns updated_at timestamp or None if not found."""
+        from datetime import datetime as dt
+
+        with self.get_session() as session:
+            section = session.query(BidSection).filter(
+                BidSection.id == section_id,
+                BidSection.project_id == project_id,
+            ).first()
+            if not section:
+                return None
+
+            section.content = content
+            section.word_count = len(content)
+
+            # Update project timestamp
+            project = session.query(BidProject).filter(
+                BidProject.id == project_id
+            ).first()
+            if project:
+                project.updated_at = int(dt.now().timestamp() * 1000)
+
+            session.commit()
+            return project.updated_at if project else int(dt.now().timestamp() * 1000)
+
+    # -------------------------------------------------------------------------
+    # Document Set Operations
+    # -------------------------------------------------------------------------
+
+    def create_document_set(
+        self,
+        set_id: str,
+        name: str,
+        description: Optional[str] = None,
+        project_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Create a new document set.
+
+        Args:
+            set_id: Unique set ID (UUID)
+            name: Document set name
+            description: Optional description
+            project_id: Optional associated project ID
+
+        Returns:
+            Document set as dictionary
+        """
+        import json
+
+        with self.get_session() as session:
+            doc_set = DocumentSet(
+                id=set_id,
+                name=name,
+                description=description,
+                project_id=project_id,
+                items=json.dumps([], ensure_ascii=False),
+            )
+            session.add(doc_set)
+            session.commit()
+            session.refresh(doc_set)
+            return doc_set.to_dict()
+
+    def get_document_set(self, set_id: str) -> Optional[Dict[str, Any]]:
+        """Get a document set by ID."""
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            return doc_set.to_dict() if doc_set else None
+
+    def list_document_sets(
+        self,
+        project_id: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        List document sets with optional filtering.
+
+        Args:
+            project_id: Optional project ID filter
+            limit: Maximum number of results
+            offset: Offset for pagination
+
+        Returns:
+            List of document set dictionaries
+        """
+        with self.get_session() as session:
+            query = session.query(DocumentSet)
+            if project_id:
+                query = query.filter(DocumentSet.project_id == project_id)
+            results = query.order_by(DocumentSet.created_at.desc()).limit(limit).offset(offset).all()
+            return [ds.to_dict() for ds in results]
+
+    def update_document_set(
+        self,
+        set_id: str,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        items_json: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Update a document set.
+
+        Args:
+            set_id: Document set ID
+            name: Optional new name
+            description: Optional new description
+            items_json: Optional JSON string of items
+
+        Returns:
+            Updated document set as dictionary or None if not found
+        """
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            if not doc_set:
+                return None
+            if name is not None:
+                doc_set.name = name
+            if description is not None:
+                doc_set.description = description
+            if items_json is not None:
+                doc_set.items = items_json
+            doc_set.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(doc_set)
+            return doc_set.to_dict()
+
+    def delete_document_set(self, set_id: str) -> bool:
+        """
+        Delete a document set.
+
+        Args:
+            set_id: Document set ID
+
+        Returns:
+            True if deleted, False if not found
+        """
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            if not doc_set:
+                return False
+            session.delete(doc_set)
+            session.commit()
+            return True
+
+    def add_document_to_set(
+        self,
+        set_id: str,
+        document_id: str,
+        name: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Add a document to a set.
+
+        Args:
+            set_id: Document set ID
+            document_id: Document ID to add
+            name: Display name in the set
+
+        Returns:
+            Updated document set as dictionary or None if not found
+        """
+        import json
+        from datetime import datetime as dt
+
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            if not doc_set:
+                return None
+
+            items = []
+            if doc_set.items:
+                try:
+                    items = json.loads(doc_set.items)
+                except:
+                    items = []
+
+            # Check if document already exists in set
+            for item in items:
+                if item.get("document_id") == document_id:
+                    raise ValueError(f"Document {document_id} already exists in set")
+
+            # Add new item
+            items.append({
+                "document_id": document_id,
+                "name": name,
+                "is_primary": len(items) == 0,  # First document is primary by default
+                "added_at": dt.now().isoformat(),
+            })
+
+            doc_set.items = json.dumps(items, ensure_ascii=False)
+            doc_set.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(doc_set)
+            return doc_set.to_dict()
+
+    def remove_document_from_set(
+        self,
+        set_id: str,
+        document_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Remove a document from a set.
+
+        Args:
+            set_id: Document set ID
+            document_id: Document ID to remove
+
+        Returns:
+            Updated document set as dictionary or None if not found
+        """
+        import json
+
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            if not doc_set:
+                return None
+
+            items = []
+            if doc_set.items:
+                try:
+                    items = json.loads(doc_set.items)
+                except:
+                    items = []
+
+            # Find and remove the document
+            original_len = len(items)
+            items = [item for item in items if item.get("document_id") != document_id]
+
+            if len(items) == original_len:
+                raise ValueError(f"Document {document_id} not found in set")
+
+            # If we removed the primary document, set the first remaining as primary
+            if items and not any(item.get("is_primary") for item in items):
+                items[0]["is_primary"] = True
+
+            doc_set.items = json.dumps(items, ensure_ascii=False)
+            doc_set.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(doc_set)
+            return doc_set.to_dict()
+
+    def set_primary_document(
+        self,
+        set_id: str,
+        document_id: str,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Set a document as the primary document in a set.
+
+        Args:
+            set_id: Document set ID
+            document_id: Document ID to set as primary
+
+        Returns:
+            Updated document set as dictionary or None if not found
+        """
+        import json
+
+        with self.get_session() as session:
+            doc_set = session.query(DocumentSet).filter(
+                DocumentSet.id == set_id
+            ).first()
+            if not doc_set:
+                return None
+
+            items = []
+            if doc_set.items:
+                try:
+                    items = json.loads(doc_set.items)
+                except:
+                    items = []
+
+            # Find the document and set it as primary
+            found = False
+            for item in items:
+                if item.get("document_id") == document_id:
+                    item["is_primary"] = True
+                    found = True
+                else:
+                    item["is_primary"] = False
+
+            if not found:
+                raise ValueError(f"Document {document_id} not found in set")
+
+            doc_set.items = json.dumps(items, ensure_ascii=False)
+            doc_set.updated_at = datetime.utcnow()
+            session.commit()
+            session.refresh(doc_set)
+            return doc_set.to_dict()
 
 
 # =============================================================================

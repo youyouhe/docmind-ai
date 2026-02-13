@@ -296,14 +296,63 @@ class LLMClient:
             if content.endswith("```"):
                 content = content[:-3]
             content = content.strip()
-            
+
             return json.loads(content)
         except json.JSONDecodeError as e:
+            # Try to recover truncated JSON (common when max_tokens cuts off the response)
+            recovered = self._recover_truncated_json(content)
+            if recovered is not None:
+                print(f"[JSON RECOVERY] Recovered truncated JSON ({len(content)} chars)")
+                return recovered
+
             print(f"[JSON ERROR] Failed to parse: {e}")
-            print(f"[RAW CONTENT] {content}")
+            print(f"[RAW CONTENT] {content[:500]}...")
             print(f"[INFO] Full response length: {len(content)} chars")
             print(f"[INFO] This may indicate the response was truncated. Consider increasing max_tokens.")
             return {}
+
+    @staticmethod
+    def _recover_truncated_json(content: str) -> Optional[Dict]:
+        """
+        Attempt to recover a truncated JSON response.
+        Common case: max_tokens cuts off the response mid-JSON, resulting in
+        incomplete arrays/objects. Try to close them and parse.
+        """
+        import re
+
+        if not content or not content.startswith('{'):
+            return None
+
+        # Strategy 1: Find the last complete item in "table_of_contents" array
+        # Look for the pattern: array of objects that was cut off
+        toc_match = re.search(r'"table_of_contents"\s*:\s*\[', content)
+        if toc_match:
+            # Find the last complete object (ending with "}")
+            last_complete = content.rfind('}')
+            if last_complete > toc_match.end():
+                # Close the array and root object
+                truncated = content[:last_complete + 1] + ']}'
+                try:
+                    return json.loads(truncated)
+                except json.JSONDecodeError:
+                    pass
+
+        # Strategy 2: Generic - try closing brackets progressively
+        open_braces = content.count('{') - content.count('}')
+        open_brackets = content.count('[') - content.count(']')
+
+        if open_braces > 0 or open_brackets > 0:
+            # Find last complete value (after a comma or colon)
+            last_complete = max(content.rfind('},'), content.rfind('}]'))
+            if last_complete > 0:
+                attempt = content[:last_complete + 1]
+                attempt += ']' * open_brackets + '}' * open_braces
+                try:
+                    return json.loads(attempt)
+                except json.JSONDecodeError:
+                    pass
+
+        return None
 
 
 # Batch processing helper

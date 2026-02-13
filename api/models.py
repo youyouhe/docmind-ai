@@ -46,17 +46,13 @@ class APIInfo(BaseModel):
 # =============================================================================
 
 class TreeNode(BaseModel):
-    """Tree node model representing a section in the document."""
+    """Tree node model representing a section in the document (optimized for size)."""
 
     id: str = Field(..., description="Unique node identifier")
-    title: str = Field(..., description="Section title (original, for search/indexing)")
-    level: int = Field(..., description="Nesting level (root=0)")
-    content: Optional[str] = Field(None, description="Full text content of the section")
+    title: str = Field(..., description="Section title")
     summary: Optional[str] = Field(None, description="LLM-generated section summary")
-    display_title: Optional[str] = Field(None, description="Cleaned title for UI display")
-    is_noise: Optional[bool] = Field(None, description="Whether this is an invalid entry (header/footer/metadata)")
-    page_start: Optional[int] = Field(None, description="PDF starting page (1-based)")
-    page_end: Optional[int] = Field(None, description="PDF ending page (1-based)")
+    ps: Optional[int] = Field(None, description="PDF starting page (1-based)")
+    pe: Optional[int] = Field(None, description="PDF ending page (1-based)")
     line_start: Optional[int] = Field(None, description="Markdown starting line (1-based)")
     children: List["TreeNode"] = Field(default_factory=list, description="Child sections")
 
@@ -66,13 +62,9 @@ class TreeNode(BaseModel):
             "example": {
                 "id": "1",
                 "title": "1 / 前言",
-                "level": 1,
-                "display_title": "前言",
-                "is_noise": False,
-                "content": "Full text content...",
                 "summary": "Chapter summary...",
-                "page_start": 1,
-                "page_end": 10,
+                "ps": 1,
+                "pe": 10,
                 "children": []
             }
         }
@@ -146,7 +138,6 @@ class ChatRequest(BaseModel):
                 "tree": {
                     "id": "root",
                     "title": "Document",
-                    "level": 0,
                     "children": []
                 },
                 "history": [
@@ -177,6 +168,7 @@ class ChatResponse(BaseModel):
     debug_path: List[str] = Field(default_factory=list, description="Debug search path")
     provider: str = Field(..., description="LLM provider used")
     model: str = Field(..., description="Model used for generation")
+    tool_call: Optional[Dict[str, Any]] = Field(None, description="Tool call result if triggered")
 
     class Config:
         json_schema_extra = {
@@ -504,7 +496,221 @@ class AuditHistoryItem(BaseModel):
 
 class AuditHistoryResponse(BaseModel):
     """Response model for audit history."""
-    
+
     doc_id: str = Field(..., description="Document ID")
     audits: List[AuditHistoryItem] = Field(..., description="List of audits")
+
+
+# =============================================================================
+# Timeline Models
+# =============================================================================
+
+class TimelineMilestone(BaseModel):
+    """A single milestone on a project timeline."""
+    name: str = Field(..., description="Milestone name (e.g., '投标截止日')")
+    date: str = Field(..., description="Date in YYYY-MM-DD format")
+    type: str = Field(
+        "custom",
+        description=(
+            "Milestone type for bidding lifecycle: "
+            "publish(公告发布), doc_deadline(文件获取截止), qa_deadline(答疑截止), "
+            "bid_deadline(投标截止), opening(开标), evaluation(评标), "
+            "award_notice(中标公示), contract_sign(合同签订), delivery(交货), "
+            "acceptance(验收), warranty_start(质保开始), warranty_end(质保结束), "
+            "payment(付款), custom(自定义). "
+            "Legacy types deadline/contract_start/contract_end still accepted."
+        ),
+    )
+
+
+class TimelineEntryCreate(BaseModel):
+    """Request to create a timeline entry."""
+    document_id: str = Field(..., description="Associated document ID")
+    project_name: str = Field(..., description="Project name")
+    start_date: Optional[str] = Field(None, description="Start date YYYY-MM-DD")
+    end_date: Optional[str] = Field(None, description="End date YYYY-MM-DD")
+    milestones: List[TimelineMilestone] = Field(default_factory=list)
+    budget: Optional[float] = Field(None, description="Budget/price amount")
+    budget_unit: Optional[str] = Field("万元", description="Budget unit")
+    notes: Optional[str] = Field(None, description="Notes/description")
+
+
+class TimelineEntryUpdate(BaseModel):
+    """Request to update a timeline entry."""
+    project_name: Optional[str] = None
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    milestones: Optional[List[TimelineMilestone]] = None
+    budget: Optional[float] = None
+    budget_unit: Optional[str] = None
+    notes: Optional[str] = None
+
+
+class TimelineEntryResponse(BaseModel):
+    """Response model for a single timeline entry."""
+    id: str
+    document_id: str
+    project_name: str
+    start_date: Optional[str] = None
+    end_date: Optional[str] = None
+    milestones: List[TimelineMilestone] = Field(default_factory=list)
+    budget: Optional[float] = None
+    budget_unit: str = Field("万元", description="Budget unit")
+    notes: Optional[str] = None
+    status: str = Field("active", description="Computed: active, expiring_soon, expired, future")
+    created_at: str
+    updated_at: str
+
+
+class TimelineListResponse(BaseModel):
+    """Response model for timeline listing."""
+    items: List[TimelineEntryResponse]
+    count: int
+    expiring_count: int = Field(0, description="Count of entries expiring within 30 days")
+    expired_count: int = Field(0, description="Count of expired entries")
+
+
+# =============================================================================
+# Document Set Models
+# =============================================================================
+
+class DocumentSetItem(BaseModel):
+    """A document item within a document set."""
+    document_id: str = Field(..., description="Document ID")
+    name: str = Field(..., description="Display name in the set")
+    is_primary: bool = Field(False, description="Whether this is the primary document")
+    added_at: str = Field(..., description="When the document was added (ISO 8601)")
+
+
+class DocumentSet(BaseModel):
+    """Document set model."""
+    id: str = Field(..., description="Document set ID (UUID)")
+    name: str = Field(..., description="Document set name")
+    description: Optional[str] = Field(None, description="Document set description")
+    project_id: Optional[str] = Field(None, description="Associated project ID")
+    items: List[DocumentSetItem] = Field(default_factory=list, description="Documents in the set")
+    created_at: str = Field(..., description="Creation timestamp (ISO 8601)")
+    updated_at: str = Field(..., description="Last update timestamp (ISO 8601)")
+
+
+class DocumentSetListResponse(BaseModel):
+    """Response model for listing document sets."""
+    items: List[DocumentSet] = Field(..., description="List of document sets")
+    count: int = Field(..., description="Number of document sets")
+
+
+class CreateDocumentSetRequest(BaseModel):
+    """Request to create a document set."""
+    name: str = Field(..., description="Document set name", min_length=1, max_length=200)
+    description: Optional[str] = Field(None, description="Document set description", max_length=1000)
+    project_id: Optional[str] = Field(None, description="Associated project ID")
+    primary_doc_id: Optional[str] = Field(None, description="Primary document ID (the tender document)")
+    primaryDocId: Optional[str] = Field(None, description="Primary document ID (camelCase)")
+    auxiliary_docs: Optional[List[Dict[str, Any]]] = Field(None, description="List of auxiliary documents to add")
+    auxiliaryDocs: Optional[List[Dict[str, Any]]] = Field(None, description="List of auxiliary documents (camelCase)")
+    
+    class Config:
+        populate_by_name = True
+
+
+class AuxiliaryDocInput(BaseModel):
+    """Auxiliary document input."""
+    doc_id: str
+    name: str
+    doc_type: str
+
+
+class UpdateDocumentSetRequest(BaseModel):
+    """Request to update a document set."""
+    name: Optional[str] = Field(None, description="Document set name", min_length=1, max_length=200)
+    description: Optional[str] = Field(None, description="Document set description", max_length=1000)
+
+
+class AddDocumentToSetRequest(BaseModel):
+    """Request to add a document to a set."""
+    document_id: str = Field(..., description="Document ID to add")
+    name: Optional[str] = Field(None, description="Custom display name (defaults to filename)")
+
+
+class SetPrimaryDocumentRequest(BaseModel):
+    """Request to set the primary document in a set."""
+    document_id: str = Field(..., description="Document ID to set as primary")
+
+
+class DocumentSetQueryRequest(BaseModel):
+    """Request to query across documents in a set."""
+    query: str = Field(..., description="Query text", min_length=1)
+    include_summaries: bool = Field(True, description="Whether to include node summaries in search")
+    max_results: int = Field(10, description="Maximum number of results per document", ge=1, le=50)
+
+
+class QueryResultNode(BaseModel):
+    """A single node result from a document query."""
+    document_id: str = Field(..., description="Document ID")
+    document_name: str = Field(..., description="Document name in the set")
+    node_id: str = Field(..., description="Node ID")
+    node_title: str = Field(..., description="Node title")
+    node_summary: Optional[str] = Field(None, description="Node summary")
+    relevance: float = Field(..., description="Relevance score (0-1)")
+    ps: Optional[int] = Field(None, description="Starting page number")
+    pe: Optional[int] = Field(None, description="Ending page number")
+
+
+class DocumentSetQueryResponse(BaseModel):
+    """Response model for document set query."""
+    query: str = Field(..., description="Original query")
+    results: List[QueryResultNode] = Field(default_factory=list, description="Query results")
+    total_results: int = Field(..., description="Total number of results")
+    documents_searched: int = Field(..., description="Number of documents searched")
+
+
+class MergedTreeNode(BaseModel):
+    """A node in the merged tree structure."""
+    id: str = Field(..., description="Node ID (prefixed with document_id)")
+    title: str = Field(..., description="Node title")
+    document_id: str = Field(..., description="Source document ID")
+    document_name: str = Field(..., description="Source document name")
+    summary: Optional[str] = Field(None, description="Node summary")
+    ps: Optional[int] = Field(None, description="Starting page number")
+    pe: Optional[int] = Field(None, description="Ending page number")
+    children: List["MergedTreeNode"] = Field(default_factory=list, description="Child nodes")
+
+
+class MergedTreeResponse(BaseModel):
+    """Response model for merged tree."""
+    set_id: str = Field(..., description="Document set ID")
+    documents: List[Dict[str, Any]] = Field(..., description="List of documents in the tree")
+    tree: List[MergedTreeNode] = Field(..., description="Merged tree structure")
+    total_nodes: int = Field(..., description="Total number of nodes")
+
+
+class DocumentComparisonSection(BaseModel):
+    """A comparable section between two documents."""
+    section_id: str = Field(..., description="Section identifier")
+    title: str = Field(..., description="Section title")
+    doc1_node_id: Optional[str] = Field(None, description="Node ID in first document")
+    doc2_node_id: Optional[str] = Field(None, description="Node ID in second document")
+    doc1_summary: Optional[str] = Field(None, description="Summary from first document")
+    doc2_summary: Optional[str] = Field(None, description="Summary from second document")
+    similarity: Optional[float] = Field(None, description="Similarity score (0-1)")
+    differences: Optional[List[str]] = Field(None, description="List of key differences")
+
+
+class DocumentComparisonRequest(BaseModel):
+    """Request to compare two documents in a set."""
+    doc1_id: str = Field(..., description="First document ID")
+    doc2_id: str = Field(..., description="Second document ID")
+    focus_areas: Optional[List[str]] = Field(None, description="Optional focus areas for comparison")
+
+
+class DocumentComparisonResponse(BaseModel):
+    """Response model for document comparison."""
+    set_id: str = Field(..., description="Document set ID")
+    doc1_id: str = Field(..., description="First document ID")
+    doc2_id: str = Field(..., description="Second document ID")
+    doc1_name: str = Field(..., description="First document name")
+    doc2_name: str = Field(..., description="Second document name")
+    overall_similarity: Optional[float] = Field(None, description="Overall similarity score (0-1)")
+    sections: List[DocumentComparisonSection] = Field(default_factory=list, description="Comparable sections")
+    summary: str = Field(..., description="Comparison summary")
 

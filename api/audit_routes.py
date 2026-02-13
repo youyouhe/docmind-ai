@@ -10,6 +10,7 @@ Provides endpoints for:
 
 import os
 import json
+import re
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
@@ -18,6 +19,19 @@ from datetime import datetime
 from fastapi import APIRouter, HTTPException, Query
 
 from .database import get_db
+
+
+# UUID v4 pattern (also accepts hex-only IDs used by some upload flows)
+_DOC_ID_PATTERN = re.compile(r'^[0-9a-fA-F\-]{8,64}$')
+
+
+def validate_doc_id(doc_id: str) -> None:
+    """Validate that doc_id looks like a safe identifier (UUID or hex string).
+
+    Raises HTTPException 400 if the format is invalid.
+    """
+    if not _DOC_ID_PATTERN.match(doc_id):
+        raise HTTPException(status_code=400, detail=f"Invalid document ID format: {doc_id}")
 from .models import (
     AuditReportResponse,
     SuggestionInfo,
@@ -47,6 +61,7 @@ def get_data_dir() -> Path:
 
 def load_audit_report_from_file(doc_id: str) -> Optional[Dict[str, Any]]:
     """Load audit report JSON from filesystem."""
+    validate_doc_id(doc_id)
     data_dir = get_data_dir()
     audit_path = data_dir / "parsed" / f"{doc_id}_audit_report.json"
     
@@ -59,6 +74,7 @@ def load_audit_report_from_file(doc_id: str) -> Optional[Dict[str, Any]]:
 
 def load_tree_from_file(doc_id: str) -> Optional[Dict[str, Any]]:
     """Load tree JSON from filesystem."""
+    validate_doc_id(doc_id)
     data_dir = get_data_dir()
     tree_path = data_dir / "parsed" / f"{doc_id}_tree.json"
     
@@ -71,6 +87,7 @@ def load_tree_from_file(doc_id: str) -> Optional[Dict[str, Any]]:
 
 def save_tree_to_file(doc_id: str, tree_data: Dict[str, Any]) -> None:
     """Save tree JSON to filesystem."""
+    validate_doc_id(doc_id)
     data_dir = get_data_dir()
     tree_path = data_dir / "parsed" / f"{doc_id}_tree.json"
     
@@ -428,13 +445,13 @@ async def apply_suggestions(
         try:
             # Parse page range: "1-5" or "10"
             if "-" in page_range_str:
-                page_start, page_end = page_range_str.split("-", 1)
-                node["page_start"] = int(page_start.strip())
-                node["page_end"] = int(page_end.strip())
+                ps, pe = page_range_str.split("-", 1)
+                node["ps"] = int(ps.strip())
+                node["pe"] = int(pe.strip())
             else:
                 page = int(page_range_str.strip())
-                node["page_start"] = page
-                node["page_end"] = page
+                node["ps"] = page
+                node["pe"] = page
             return True
         except (ValueError, AttributeError):
             return False
@@ -504,9 +521,13 @@ async def apply_suggestions(
                 
                 # Add page info if available
                 if "page_start" in node_info:
-                    new_node["page_start"] = node_info["page_start"]
+                    new_node["ps"] = node_info["page_start"]
+                elif "ps" in node_info:
+                    new_node["ps"] = node_info["ps"]
                 if "page_end" in node_info:
-                    new_node["page_end"] = node_info["page_end"]
+                    new_node["pe"] = node_info["page_end"]
+                elif "pe" in node_info:
+                    new_node["pe"] = node_info["pe"]
                 
                 if add_node(parent_id, new_node, position):
                     applied_count += 1

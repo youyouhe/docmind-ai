@@ -4,322 +4,470 @@ Gap Filler - Post-processing utility to fill missing pages in tree structure
 This module analyzes the generated tree structure and identifies page gaps.
 For any missing pages, it generates a supplementary TOC using LLM and appends
 it to the tree structure as a "patch".
+
+V2 improvements:
+- Accepts pre-parsed pages to avoid re-parsing PDF
+- Segments large gaps to prevent LLM timeouts
+- Adds timeout protection on LLM calls
+- Inserts gap patches at correct position (not append+sort)
 """
 
 import asyncio
-from typing import List, Dict, Any, Set, Tuple
+from typing import List, Dict, Any, Optional, Tuple
 from ..core.llm_client import LLMClient
-from ..core.pdf_parser import PDFParser
+from ..core.pdf_parser import PDFParser, PDFPage
 
 
 class GapFiller:
     """Post-processor to fill missing pages in tree structure"""
-    
+
+    # Gaps smaller than this are ignored (likely cover pages, blank pages etc.)
+    MIN_GAP_PAGES = 3
+    # Maximum pages to send to LLM in a single call
+    MAX_PAGES_PER_LLM_CALL = 20
+    # Maximum content chars per LLM call
+    MAX_CHARS_PER_CALL = 30000
+    # Timeout per LLM call (seconds)
+    LLM_TIMEOUT = 60
+
     def __init__(self, llm: LLMClient, debug: bool = False):
         self.llm = llm
         self.debug = debug
-    
+
     def analyze_coverage(self, tree_structure: List[Dict], total_pages: int) -> Dict[str, Any]:
         """
         Analyze page coverage in tree structure and identify gaps.
-        
-        Args:
-            tree_structure: The generated tree structure
-            total_pages: Total number of pages in PDF
-            
+
         Returns:
-            Dict with coverage analysis:
-            - covered_pages: Set of pages covered in tree
-            - missing_pages: Set of pages not covered
-            - gaps: List of continuous page ranges that are missing
+            Dict with covered_pages, missing_pages, gaps, coverage_percentage
         """
         covered_pages = set()
-        
-        def collect_pages(nodes):
-            """Recursively collect all page references"""
+
+        def collect_leaf_ranges(nodes):
             for node in nodes:
-                # Collect start_index and end_index
-                if 'start_index' in node:
-                    covered_pages.add(node['start_index'])
-                if 'end_index' in node:
-                    covered_pages.add(node['end_index'])
-                
-                # Also check for 'page' field (used in some structures)
-                if 'page' in node:
-                    covered_pages.add(node['page'])
-                
-                # Collect pages from all indices in range
-                if 'start_index' in node and 'end_index' in node:
-                    start = node['start_index']
-                    end = node['end_index']
+                if 'nodes' in node and node['nodes']:
+                    collect_leaf_ranges(node['nodes'])
+                else:
+                    start = node.get('start_index', 0)
+                    end = node.get('end_index', start)
                     for p in range(start, end + 1):
                         covered_pages.add(p)
-                
-                # Recurse into children
-                if 'nodes' in node and node['nodes']:
-                    collect_pages(node['nodes'])
-                if 'children' in node and node['children']:
-                    collect_pages(node['children'])
-        
-        # Collect all covered pages
-        collect_pages(tree_structure)
-        
-        # Find missing pages
+
+        collect_leaf_ranges(tree_structure)
+
         all_pages = set(range(1, total_pages + 1))
         missing_pages = all_pages - covered_pages
-        
-        # Group missing pages into continuous ranges (gaps)
+
+        # Group missing pages into continuous ranges
         gaps = []
         if missing_pages:
             sorted_missing = sorted(missing_pages)
             gap_start = sorted_missing[0]
             gap_end = sorted_missing[0]
-            
+
             for page in sorted_missing[1:]:
                 if page == gap_end + 1:
-                    # Continue current gap
                     gap_end = page
                 else:
-                    # Save current gap and start new one
                     gaps.append((gap_start, gap_end))
                     gap_start = page
                     gap_end = page
-            
-            # Don't forget the last gap
             gaps.append((gap_start, gap_end))
-        
+
         return {
             'covered_pages': covered_pages,
             'missing_pages': missing_pages,
             'gaps': gaps,
             'coverage_percentage': len(covered_pages) / total_pages * 100 if total_pages > 0 else 0
         }
-    
-    async def generate_gap_toc(
-        self, 
-        pdf_path: str, 
-        gap_start: int, 
+
+    async def _ensure_pages_parsed(
+        self,
+        gap_start: int,
         gap_end: int,
+        existing_pages: List[PDFPage],
+        pdf_path: str,
         parser: PDFParser
-    ) -> List[Dict[str, Any]]:
+    ) -> List[PDFPage]:
         """
-        Generate TOC for a gap in page coverage using LLM.
-        
-        Args:
-            pdf_path: Path to PDF file
-            gap_start: First page of gap (1-indexed)
-            gap_end: Last page of gap (1-indexed)
-            parser: PDF parser instance
-            
+        Ensure pages for a gap range are parsed. Reuse existing pages where possible,
+        only parse additional pages if needed.
+
         Returns:
-            List of TOC items for this gap
+            List of PDFPage objects for the gap range
         """
+        # Check which gap pages we already have
+        existing_page_nums = {p.page_number for p in existing_pages}
+        needed_max = gap_end
+
+        if needed_max <= len(existing_pages):
+            # All gap pages already parsed
+            return [existing_pages[i - 1] for i in range(gap_start, gap_end + 1)
+                    if i <= len(existing_pages)]
+
+        # Need to parse more pages
         if self.debug:
-            print(f"\n[GAP FILLER] Generating TOC for pages {gap_start}-{gap_end}")
-        
-        # Parse the gap pages
-        pages = await parser.parse(pdf_path, max_pages=gap_end)
-        gap_pages = pages[gap_start - 1:gap_end]  # Convert to 0-indexed
-        
-        if not gap_pages:
-            if self.debug:
-                print(f"[GAP FILLER] ⚠ No content found in gap pages {gap_start}-{gap_end}")
-            return []
-        
-        # Combine page content
-        gap_content = "\n\n".join([
-            f"=== Page {gap_start + i} ===\n{page.text}"
-            for i, page in enumerate(gap_pages)
-        ])
-        
-        # Limit content size (to avoid token limits)
-        max_chars = 50000
-        if len(gap_content) > max_chars:
-            gap_content = gap_content[:max_chars] + "\n\n[Content truncated...]"
-        
-        # Generate TOC using LLM
-        prompt = f"""Analyze the following content from pages {gap_start} to {gap_end} of a PDF document.
+            print(f"  [GAP FILLER] Parsing pages up to {needed_max} for gap coverage")
 
-Generate a table of contents (TOC) for this section. For each entry:
-1. Identify main topics, sections, or headings
-2. Assign a page number where the topic appears
-3. Create a hierarchical structure if subsections exist
+        all_pages = await parser.parse(pdf_path, max_pages=needed_max)
 
-Content:
-{gap_content}
+        # Return only the gap range
+        return [all_pages[i - 1] for i in range(gap_start, gap_end + 1)
+                if i <= len(all_pages)]
 
-Respond with a JSON array of TOC items. Each item should have:
-- "title": The section/topic title
-- "page": The page number where it appears ({gap_start} to {gap_end})
-- "level": Hierarchy level (1 for main topics, 2 for subtopics, etc.)
-
-Example format:
-[
-  {{"title": "Main Topic", "page": {gap_start}, "level": 1}},
-  {{"title": "Subtopic", "page": {gap_start + 1}, "level": 2}}
-]
-
-If no clear structure is found, create at least one entry representing the page range.
-Please respond in JSON format."""
-        
-        try:
-            response = await self.llm.chat_json(
-                prompt=prompt,
-                temperature=0.3
-            )
-            
-            if isinstance(response, list):
-                toc_items = response
-            elif isinstance(response, dict) and 'items' in response:
-                toc_items = response['items']
-            elif isinstance(response, dict) and 'toc' in response:
-                toc_items = response['toc']
-            else:
-                toc_items = []
-            
-            if self.debug:
-                print(f"[GAP FILLER] ✓ Generated {len(toc_items)} TOC items for gap")
-            
-            return toc_items
-        
-        except Exception as e:
-            if self.debug:
-                print(f"[GAP FILLER] ✗ Error generating TOC for gap: {e}")
-            
-            # Fallback: Create a simple entry for the gap
-            return [{
-                "title": f"Pages {gap_start}-{gap_end} (Uncategorized)",
-                "page": gap_start,
-                "level": 1
-            }]
-    
-    def convert_gap_toc_to_structure(
-        self, 
-        gap_toc: List[Dict[str, Any]], 
+    async def generate_gap_toc(
+        self,
+        gap_pages: List[PDFPage],
         gap_start: int,
         gap_end: int
     ) -> List[Dict[str, Any]]:
         """
-        Convert gap TOC items to tree structure format.
-        
+        Generate TOC for a gap using LLM. Segments large gaps into chunks.
+
         Args:
-            gap_toc: TOC items from LLM
-            gap_start: First page of gap
-            gap_end: Last page of gap
-            
+            gap_pages: Pre-parsed PDFPage objects for the gap
+            gap_start: First page of gap (1-indexed)
+            gap_end: Last page of gap (1-indexed)
+
         Returns:
-            List of tree nodes in standard format
+            List of TOC items for this gap
         """
-        nodes = []
-        
-        # Build hierarchy
-        for i, item in enumerate(gap_toc):
-            title = item.get('title', f'Section (Page {item.get("page", gap_start)})')
-            page = item.get('page', gap_start)
-            level = item.get('level', 1)
-            
-            # Determine end page (next item's page - 1, or gap_end)
-            if i + 1 < len(gap_toc):
-                end_page = gap_toc[i + 1].get('page', gap_end) - 1
-            else:
-                end_page = gap_end
-            
-            # Ensure valid range
-            if end_page < page:
-                end_page = page
-            
-            node = {
-                "title": title,
-                "start_index": page,
-                "end_index": end_page,
-                "nodes": [],
-                "node_id": f"gap_{gap_start}_{i:04d}",
-                "is_gap_fill": True  # Mark as gap-filled content
-            }
-            
-            # Handle hierarchy (simple approach: nest level 2+ under level 1)
-            if level == 1:
-                nodes.append(node)
-            elif nodes and level > 1:
-                # Add as child of last level-1 node
-                nodes[-1]['nodes'].append(node)
-            else:
-                # Fallback: add as root
-                nodes.append(node)
-        
-        # If no items were generated, create a default entry
-        if not nodes:
-            nodes.append({
-                "title": f"Pages {gap_start}-{gap_end} (Supplementary Content)",
+        if self.debug:
+            print(f"\n[GAP FILLER] Generating TOC for pages {gap_start}-{gap_end} "
+                  f"({gap_end - gap_start + 1} pages)")
+
+        if not gap_pages:
+            if self.debug:
+                print(f"  [GAP FILLER] ⚠ No content for gap pages {gap_start}-{gap_end}")
+            return []
+
+        # Segment large gaps into chunks
+        all_toc_items = []
+        chunk_size = self.MAX_PAGES_PER_LLM_CALL
+
+        for chunk_start_idx in range(0, len(gap_pages), chunk_size):
+            chunk_pages = gap_pages[chunk_start_idx:chunk_start_idx + chunk_size]
+            if not chunk_pages:
+                break
+
+            chunk_page_start = chunk_pages[0].page_number
+            chunk_page_end = chunk_pages[-1].page_number
+
+            # Build labeled content
+            gap_content = "\n\n".join([
+                f"<physical_index_{page.page_number}>\n{page.text}"
+                for page in chunk_pages
+            ])
+
+            # Truncate if needed
+            if len(gap_content) > self.MAX_CHARS_PER_CALL:
+                gap_content = gap_content[:self.MAX_CHARS_PER_CALL] + "\n\n[Content truncated...]"
+
+            prompt = f"""从以下文档内容中提取章节标题。每页内容以 <physical_index_N> 标记开头，N 是该页的物理页码。
+
+任务：找出这些页面中的章节/小节标题，构建层级目录。
+
+页码规则：使用 <physical_index_N> 中的 N 作为页码，不要使用文档正文中印刷的页码（如"第X页共Y页"）。
+
+内容：
+{gap_content}
+
+提取规则：
+- 只提取真正的章节标题，如："第三章 评标办法"、"（一）甲方的权利和义务"、"附件1：投标函"
+- 不要提取以下内容：
+  * 目录条目（带省略号连接页码的行，如"第一章 招标公告......1"）
+  * 页眉页脚（如"第31页共78页"）
+  * 表单字段（如"项目编号：""电话：""日期："）
+  * 占位符或空白模板项（如"2．......"、"3．......"、"______"）
+  * 普通段落文本或表格内容
+- 标题原文照抄，不要翻译或修改
+- 页码必须在 {chunk_page_start} 到 {chunk_page_end} 之间
+- level: 1=章, 2=节, 3=小节
+
+示例 - 正确提取:
+✓ {{"title": "第三章 评标办法及评分标准", "page": 23, "level": 1}}
+✓ {{"title": "（一）甲方的权利和义务", "page": 32, "level": 2}}
+✓ {{"title": "附件1：投标函", "page": 58, "level": 1}}
+
+示例 - 不应提取:
+✗ "2．......"（占位符）
+✗ "第31页共78页"（页脚）
+✗ "项目编号：0724-2410SZ968133"（表单字段）
+✗ "第一章 招标公告......1"（目录条目，不是正文标题）
+
+输出 JSON 格式：
+{{
+  "table_of_contents": [
+    {{"title": "章节标题", "page": {chunk_page_start}, "level": 1}},
+    {{"title": "小节标题", "page": {chunk_page_start + 1}, "level": 2}}
+  ]
+}}
+
+如果没有找到章节标题，返回空数组。"""
+
+            try:
+                response = await asyncio.wait_for(
+                    self.llm.chat_json(prompt, max_tokens=2000),
+                    timeout=self.LLM_TIMEOUT
+                )
+
+                if isinstance(response, dict):
+                    toc_items = response.get('table_of_contents',
+                                  response.get('toc',
+                                  response.get('items', [])))
+                elif isinstance(response, list):
+                    toc_items = response
+                else:
+                    toc_items = []
+
+                # Filter items: page must be within the gap range
+                valid_items = []
+                filtered_out = 0
+                for item in toc_items:
+                    page = item.get('page', 0)
+                    if isinstance(page, int) and gap_start <= page <= gap_end:
+                        valid_items.append(item)
+                    else:
+                        filtered_out += 1
+
+                if self.debug:
+                    print(f"  [GAP FILLER] Chunk p{chunk_page_start}-{chunk_page_end}: "
+                          f"{len(valid_items)} items extracted"
+                          f"{f' ({filtered_out} filtered: outside gap range)' if filtered_out else ''}")
+
+                all_toc_items.extend(valid_items)
+
+            except asyncio.TimeoutError:
+                if self.debug:
+                    print(f"  [GAP FILLER] ⚠ LLM timeout for chunk "
+                          f"p{chunk_page_start}-{chunk_page_end}, using fallback")
+                all_toc_items.append({
+                    "title": f"Pages {chunk_page_start}-{chunk_page_end}",
+                    "page": chunk_page_start,
+                    "level": 1
+                })
+            except Exception as e:
+                if self.debug:
+                    print(f"  [GAP FILLER] ⚠ Error for chunk "
+                          f"p{chunk_page_start}-{chunk_page_end}: {e}")
+                all_toc_items.append({
+                    "title": f"Pages {chunk_page_start}-{chunk_page_end}",
+                    "page": chunk_page_start,
+                    "level": 1
+                })
+
+        if self.debug:
+            print(f"  [GAP FILLER] Total: {len(all_toc_items)} items for gap")
+
+        return all_toc_items
+
+    def convert_gap_toc_to_tree(
+        self,
+        gap_toc: List[Dict[str, Any]],
+        gap_start: int,
+        gap_end: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Convert gap TOC items to tree nodes.
+        """
+        if not gap_toc:
+            # No items: create a placeholder node
+            return [{
+                "title": f"Pages {gap_start}-{gap_end}",
                 "start_index": gap_start,
                 "end_index": gap_end,
                 "nodes": [],
                 "node_id": f"gap_{gap_start}_0000",
                 "is_gap_fill": True
-            })
-        
-        return nodes
-    
+            }]
+
+        # Sort by page number
+        sorted_items = sorted(gap_toc, key=lambda x: x.get('page', gap_start))
+
+        # Build hierarchy: level 1 nodes are roots, level 2+ are children
+        roots = []
+        for i, item in enumerate(sorted_items):
+            title = item.get('title', f'Page {item.get("page", gap_start)}')
+            page = item.get('page', gap_start)
+            level = item.get('level', 1)
+
+            # Determine end page
+            if i + 1 < len(sorted_items):
+                next_page = sorted_items[i + 1].get('page', gap_end)
+                next_level = sorted_items[i + 1].get('level', 1)
+                # If next item is at same or higher level, end before it
+                if next_level <= level:
+                    end_page = next_page - 1
+                else:
+                    # Next item is a child, find the next same-level-or-above item
+                    end_page = gap_end
+                    for j in range(i + 1, len(sorted_items)):
+                        if sorted_items[j].get('level', 1) <= level:
+                            end_page = sorted_items[j].get('page', gap_end) - 1
+                            break
+            else:
+                end_page = gap_end
+
+            # Clamp end_page to gap boundaries
+            end_page = min(end_page, gap_end)
+            end_page = max(end_page, page)
+
+            node = {
+                "title": title,
+                "start_index": max(page, gap_start),
+                "end_index": end_page,
+                "nodes": [],
+                "node_id": f"gap_{gap_start}_{i:04d}",
+                "is_gap_fill": True
+            }
+
+            if level == 1:
+                roots.append(node)
+            elif roots and level > 1:
+                roots[-1]['nodes'].append(node)
+            else:
+                roots.append(node)
+
+        return roots
+
+    def _insert_gap_nodes(
+        self,
+        tree_structure: List[Dict],
+        gap_nodes: List[Dict]
+    ) -> List[Dict]:
+        """
+        Insert gap nodes at the correct position in the root-level tree
+        by start_index order, instead of append+sort which breaks hierarchy.
+        """
+        if not gap_nodes:
+            return tree_structure
+
+        result = list(tree_structure)
+
+        for gap_node in gap_nodes:
+            gap_start = gap_node.get('start_index', 0)
+            # Find insertion point: after the last node whose start_index < gap_start
+            insert_idx = len(result)
+            for i, existing in enumerate(result):
+                if existing.get('start_index', 0) > gap_start:
+                    insert_idx = i
+                    break
+            result.insert(insert_idx, gap_node)
+
+        return result
+
     async def fill_gaps(
-        self, 
-        tree_structure: List[Dict], 
+        self,
+        tree_structure: List[Dict],
         pdf_path: str,
         total_pages: int,
-        parser: PDFParser
+        parser: PDFParser,
+        existing_pages: Optional[List[PDFPage]] = None
     ) -> Tuple[List[Dict], Dict[str, Any]]:
         """
         Main function to analyze and fill gaps in tree structure.
-        
+
         Args:
             tree_structure: Original tree structure
             pdf_path: Path to PDF file
             total_pages: Total pages in PDF
             parser: PDF parser instance
-            
+            existing_pages: Pre-parsed pages to reuse (avoids re-parsing)
+
         Returns:
             Tuple of (updated_structure, gap_info)
         """
+        if existing_pages is None:
+            existing_pages = []
+
         # Analyze coverage
         analysis = self.analyze_coverage(tree_structure, total_pages)
-        
+
+        # Filter out small gaps (likely cover pages, blanks, etc.)
+        significant_gaps = [
+            (gs, ge) for gs, ge in analysis['gaps']
+            if ge - gs + 1 >= self.MIN_GAP_PAGES
+        ]
+
         if self.debug:
             print(f"\n[GAP FILLER] Coverage Analysis:")
             print(f"  Total pages: {total_pages}")
-            print(f"  Covered pages: {len(analysis['covered_pages'])}")
-            print(f"  Missing pages: {len(analysis['missing_pages'])}")
-            print(f"  Coverage: {analysis['coverage_percentage']:.1f}%")
-            print(f"  Gaps found: {len(analysis['gaps'])}")
-            if analysis['gaps']:
-                for gap_start, gap_end in analysis['gaps']:
-                    gap_size = gap_end - gap_start + 1
-                    print(f"    - Pages {gap_start}-{gap_end} ({gap_size} pages)")
-        
-        # If no gaps, return original structure
-        if not analysis['gaps']:
+            print(f"  Covered: {len(analysis['covered_pages'])} pages "
+                  f"({analysis['coverage_percentage']:.1f}%)")
+            print(f"  Total gaps: {len(analysis['gaps'])}")
+            print(f"  Significant gaps (≥{self.MIN_GAP_PAGES} pages): {len(significant_gaps)}")
+            for gs, ge in significant_gaps:
+                print(f"    - Pages {gs}-{ge} ({ge - gs + 1} pages)")
+
+        if not significant_gaps:
             if self.debug:
-                print(f"[GAP FILLER] ✓ No gaps found, structure is complete")
+                print(f"[GAP FILLER] ✓ No significant gaps to fill")
             return tree_structure, analysis
-        
-        # Generate TOC for each gap
-        gap_patches = []
-        for gap_start, gap_end in analysis['gaps']:
-            gap_toc = await self.generate_gap_toc(pdf_path, gap_start, gap_end, parser)
-            gap_nodes = self.convert_gap_toc_to_structure(gap_toc, gap_start, gap_end)
-            gap_patches.extend(gap_nodes)
-        
-        # Append gap patches to original structure
-        updated_structure = tree_structure + gap_patches
-        
-        # CRITICAL FIX: Sort by start_index to maintain page order
-        # Gap patches may have earlier page numbers than some original nodes
-        updated_structure.sort(key=lambda node: node.get('start_index', 0))
-        
+
+        # Fill each significant gap
+        all_gap_nodes = []
+        for gap_start, gap_end in significant_gaps:
+            # Ensure pages are parsed
+            gap_pages = await self._ensure_pages_parsed(
+                gap_start, gap_end, existing_pages, pdf_path, parser
+            )
+
+            # Generate TOC for this gap
+            gap_toc = await self.generate_gap_toc(gap_pages, gap_start, gap_end)
+
+            # Convert to tree nodes
+            gap_nodes = self.convert_gap_toc_to_tree(gap_toc, gap_start, gap_end)
+            all_gap_nodes.extend(gap_nodes)
+
+        # Filter out gap nodes that overlap with already-covered pages
+        covered = analysis['covered_pages']
+        filtered_gap_nodes = []
+        removed_overlap = 0
+
+        for node in all_gap_nodes:
+            node_start = node.get('start_index', 0)
+            node_end = node.get('end_index', node_start)
+            node_pages = set(range(node_start, node_end + 1))
+            overlap = node_pages & covered
+            overlap_ratio = len(overlap) / len(node_pages) if node_pages else 0
+
+            if overlap_ratio < 0.5:
+                # Less than 50% overlap — keep this gap node
+                # Also filter children that overlap
+                if 'nodes' in node and node['nodes']:
+                    filtered_children = []
+                    for child in node['nodes']:
+                        child_start = child.get('start_index', 0)
+                        child_end = child.get('end_index', child_start)
+                        child_pages = set(range(child_start, child_end + 1))
+                        child_overlap = child_pages & covered
+                        child_overlap_ratio = len(child_overlap) / len(child_pages) if child_pages else 0
+                        if child_overlap_ratio < 0.5:
+                            filtered_children.append(child)
+                    node['nodes'] = filtered_children
+                filtered_gap_nodes.append(node)
+            else:
+                removed_overlap += 1
+                if self.debug:
+                    print(f"  [GAP FILLER] Removed overlapping node: "
+                          f"'{node.get('title', '')[:40]}' "
+                          f"(p{node_start}-{node_end}, {overlap_ratio:.0%} overlap)")
+
+        if self.debug and removed_overlap:
+            print(f"  [GAP FILLER] Removed {removed_overlap} nodes due to overlap with existing coverage")
+
+        # Insert gap nodes at correct positions
+        updated_structure = self._insert_gap_nodes(tree_structure, filtered_gap_nodes)
+
         if self.debug:
-            print(f"[GAP FILLER] ✓ Added {len(gap_patches)} patch nodes to structure")
-            print(f"[GAP FILLER] Original nodes: {len(tree_structure)}")
-            print(f"[GAP FILLER] Updated nodes: {len(updated_structure)}")
-            print(f"[GAP FILLER] ✓ Sorted nodes by start_index (ascending page order)")
-        
+            print(f"\n[GAP FILLER] ✓ Added {len(filtered_gap_nodes)} gap-fill nodes"
+                  f"{f' (filtered {removed_overlap} overlapping)' if removed_overlap else ''}")
+            print(f"  Original root nodes: {len(tree_structure)}")
+            print(f"  Updated root nodes: {len(updated_structure)}")
+
+        # Update analysis with gap fill info
+        analysis['gaps_filled'] = significant_gaps
+
         return updated_structure, analysis
 
 
@@ -328,38 +476,39 @@ async def fill_structure_gaps(
     pdf_path: str,
     llm: LLMClient,
     parser: PDFParser,
-    debug: bool = False
+    debug: bool = False,
+    existing_pages: Optional[List[PDFPage]] = None
 ) -> Dict[str, Any]:
     """
     Convenience function to fill gaps in a complete structure data dict.
-    
+
     Args:
         structure_data: Complete structure dict with 'structure' key
         pdf_path: Path to PDF file
         llm: LLM client instance
         parser: PDF parser instance
         debug: Enable debug logging
-        
+        existing_pages: Pre-parsed pages to reuse
+
     Returns:
         Updated structure_data with gaps filled
     """
     filler = GapFiller(llm, debug=debug)
-    
+
     tree_structure = structure_data.get('structure', [])
     total_pages = structure_data.get('total_pages', 0)
-    
-    # Fill gaps
+
     updated_structure, gap_info = await filler.fill_gaps(
-        tree_structure, pdf_path, total_pages, parser
+        tree_structure, pdf_path, total_pages, parser,
+        existing_pages=existing_pages
     )
-    
-    # Update structure data
+
     structure_data['structure'] = updated_structure
     structure_data['gap_fill_info'] = {
-        'gaps_found': len(gap_info['gaps']),
-        'gaps_filled': gap_info['gaps'],
+        'gaps_found': len(gap_info.get('gaps_filled', [])),
+        'gaps_filled': gap_info.get('gaps_filled', []),
         'original_coverage': f"{len(gap_info['covered_pages'])}/{total_pages}",
         'coverage_percentage': gap_info['coverage_percentage']
     }
-    
+
     return structure_data
