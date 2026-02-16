@@ -1,0 +1,26 @@
+services:
+  ocr-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: deepseek-ocr
+    ports:
+      - "${OCR_PORT:-8010}:8010"
+    volumes:
+      - huggingface_cache:/data/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    environment:
+      - OCR_MODEL=${OCR_MODEL:-deepseek-ai/DeepSeek-OCR-2}
+      - OCR_PORT=8010
+      - OCR_BASE_SIZE=${OCR_BASE_SIZE:-1024}
+      - OCR_IMAGE_SIZE=${OCR_IMAGE_SIZE:-768}
+    restart: unless-stopped
+
+volumes:
+  huggingface_cache:
